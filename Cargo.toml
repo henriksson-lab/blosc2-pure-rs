@@ -1,0 +1,53 @@
+[package]
+name = "blosc2-pure-rs"
+version = "0.2.0"
+edition = "2021"
+description = "Rust implementation of the Blosc2 high-performance compression library"
+license = "BSD-3-Clause"
+repository = "https://github.com/henriksson-lab/blosc2-rs"
+homepage = "https://github.com/henriksson-lab/blosc2-rs"
+documentation = "https://docs.rs/blosc2-pure-rs"
+readme = "README.md"
+keywords = ["compression", "blosc", "lz4", "zstd", "shuffle"]
+categories = ["compression", "encoding"]
+include = [
+    "/src/**/*.rs",
+    "/build.rs",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE.txt",
+]
+
+[lib]
+name = "blosc2_pure_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "blosc2"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = []
+cli = ["dep:clap"]
+# Internal feature for development testing against C-Blosc2.
+# Not part of the public API. Requires c-blosc2 source in c-blosc2/.
+_ffi = ["dep:cmake", "dep:bindgen"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"], optional = true }
+rayon = "1"
+lz4_flex = "0.11"
+flate2 = "1"
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[build-dependencies]
+cmake = { version = "0.1", optional = true }
+bindgen = { version = "0.71", optional = true }
