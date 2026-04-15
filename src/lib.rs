@@ -1,3 +1,4 @@
+pub mod b2nd;
 pub mod codecs;
 pub mod compress;
 pub mod constants;

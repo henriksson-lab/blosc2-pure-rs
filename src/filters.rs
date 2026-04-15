@@ -1,4 +1,51 @@
 use crate::constants::*;
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+
+pub type FilterForwardFn =
+    fn(meta: u8, typesize: usize, block_offset: usize, src: &[u8], dest: &mut [u8]);
+pub type FilterBackwardFn =
+    fn(meta: u8, typesize: usize, block_offset: usize, src: &[u8], dest: &mut [u8]);
+
+#[derive(Clone, Copy)]
+struct UserFilter {
+    forward: FilterForwardFn,
+    backward: FilterBackwardFn,
+}
+
+static USER_FILTERS: OnceLock<RwLock<HashMap<u8, UserFilter>>> = OnceLock::new();
+
+fn user_filters() -> &'static RwLock<HashMap<u8, UserFilter>> {
+    USER_FILTERS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub fn register_filter(
+    filter_id: u8,
+    forward: FilterForwardFn,
+    backward: FilterBackwardFn,
+) -> Result<(), &'static str> {
+    if filter_id < BLOSC2_USER_DEFINED_FILTERS_START {
+        return Err("User-defined filter IDs must be >= 32");
+    }
+    user_filters()
+        .write()
+        .map_err(|_| "Filter registry poisoned")?
+        .insert(filter_id, UserFilter { forward, backward });
+    Ok(())
+}
+
+pub fn is_registered_filter(filter_id: u8) -> bool {
+    user_filters()
+        .read()
+        .is_ok_and(|filters| filters.contains_key(&filter_id))
+}
+
+fn registered_filter(filter_id: u8) -> Option<UserFilter> {
+    user_filters()
+        .read()
+        .ok()
+        .and_then(|filters| filters.get(&filter_id).copied())
+}
 
 /// Apply byte-wise shuffle (transpose bytes within elements).
 ///
@@ -11,6 +58,9 @@ pub fn shuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
     }
     if typesize <= 1 || blocksize == 0 {
         dest[..blocksize].copy_from_slice(&src[..blocksize]);
+        return;
+    }
+    if simd::try_shuffle(typesize, src, dest) {
         return;
     }
 
@@ -40,6 +90,9 @@ pub fn unshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
         dest[..blocksize].copy_from_slice(&src[..blocksize]);
         return;
     }
+    if simd::try_unshuffle(typesize, src, dest) {
+        return;
+    }
 
     let neblock_quot = blocksize / typesize;
     let neblock_rem = blocksize % typesize;
@@ -55,6 +108,316 @@ pub fn unshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
         let start = blocksize - neblock_rem;
         dest[start..blocksize].copy_from_slice(&src[start..blocksize]);
     }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod simd {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86 as arch;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64 as arch;
+
+    pub fn try_shuffle(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
+        if matches!(typesize, 4 | 8) && try_shuffle_avx2(typesize, src, dest) {
+            return true;
+        }
+        if typesize != 4 || src.len() < 64 || dest.len() < src.len() {
+            return false;
+        }
+        if !std::arch::is_x86_feature_detected!("sse2") {
+            return false;
+        }
+
+        // SAFETY: The wrapper checks that src/dest cover src.len(), that the
+        // element width matches this implementation, and that SSE2 is present.
+        unsafe {
+            shuffle4_sse2(src, dest);
+        }
+        true
+    }
+
+    pub fn try_unshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
+        if matches!(typesize, 4 | 8) && try_unshuffle_avx2(typesize, src, dest) {
+            return true;
+        }
+        if typesize != 4 || src.len() < 64 || dest.len() < src.len() {
+            return false;
+        }
+        if !std::arch::is_x86_feature_detected!("sse2") {
+            return false;
+        }
+
+        // SAFETY: The wrapper checks that src/dest cover src.len(), that the
+        // element width matches this implementation, and that SSE2 is present.
+        unsafe {
+            unshuffle4_sse2(src, dest);
+        }
+        true
+    }
+
+    fn try_shuffle_avx2(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
+        if src.len() < 128 || dest.len() < src.len() || !src.len().is_multiple_of(typesize) {
+            return false;
+        }
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return false;
+        }
+
+        // SAFETY: The wrapper checks destination length, supported element
+        // widths, full-element input, and AVX2 availability.
+        unsafe {
+            shuffle_avx2(typesize, src, dest);
+        }
+        true
+    }
+
+    fn try_unshuffle_avx2(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
+        if src.len() < 128 || dest.len() < src.len() || !src.len().is_multiple_of(typesize) {
+            return false;
+        }
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return false;
+        }
+
+        // SAFETY: The wrapper checks destination length, supported element
+        // widths, full-element input, and AVX2 availability.
+        unsafe {
+            unshuffle_avx2(typesize, src, dest);
+        }
+        true
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn shuffle_avx2(typesize: usize, src: &[u8], dest: &mut [u8]) {
+        let blocksize = src.len();
+        let nelements = blocksize / typesize;
+        let elements_per_vec = 32 / typesize;
+        let simd_elements = nelements - (nelements % elements_per_vec);
+
+        for group in 0..(simd_elements / elements_per_vec) {
+            let src_base = group * 32;
+            let vec = unsafe {
+                arch::_mm256_loadu_si256(src.as_ptr().add(src_base) as *const arch::__m256i)
+            };
+            let mut bytes = [0u8; 32];
+            unsafe {
+                arch::_mm256_storeu_si256(bytes.as_mut_ptr() as *mut arch::__m256i, vec);
+            }
+            let elem_base = group * elements_per_vec;
+            for lane in 0..elements_per_vec {
+                for byte_idx in 0..typesize {
+                    dest[byte_idx * nelements + elem_base + lane] =
+                        bytes[lane * typesize + byte_idx];
+                }
+            }
+        }
+
+        for element in simd_elements..nelements {
+            let src_base = element * typesize;
+            for byte_idx in 0..typesize {
+                dest[byte_idx * nelements + element] = src[src_base + byte_idx];
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn unshuffle_avx2(typesize: usize, src: &[u8], dest: &mut [u8]) {
+        let blocksize = src.len();
+        let nelements = blocksize / typesize;
+        let elements_per_vec = 32 / typesize;
+        let simd_elements = nelements - (nelements % elements_per_vec);
+
+        for group in 0..(simd_elements / elements_per_vec) {
+            let elem_base = group * elements_per_vec;
+            let mut bytes = [0u8; 32];
+            for lane in 0..elements_per_vec {
+                for byte_idx in 0..typesize {
+                    bytes[lane * typesize + byte_idx] =
+                        src[byte_idx * nelements + elem_base + lane];
+                }
+            }
+            let vec = unsafe { arch::_mm256_loadu_si256(bytes.as_ptr() as *const arch::__m256i) };
+            unsafe {
+                arch::_mm256_storeu_si256(
+                    dest.as_mut_ptr().add(group * 32) as *mut arch::__m256i,
+                    vec,
+                );
+            }
+        }
+
+        for element in simd_elements..nelements {
+            let dest_base = element * typesize;
+            for byte_idx in 0..typesize {
+                dest[dest_base + byte_idx] = src[byte_idx * nelements + element];
+            }
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    unsafe fn shuffle4_sse2(src: &[u8], dest: &mut [u8]) {
+        let blocksize = src.len();
+        let nelements = blocksize / 4;
+        let simd_elements = nelements - (nelements % 4);
+
+        for group in 0..(simd_elements / 4) {
+            let src_base = group * 16;
+            let vec = unsafe {
+                arch::_mm_loadu_si128(src.as_ptr().add(src_base) as *const arch::__m128i)
+            };
+            let mut bytes = [0u8; 16];
+            unsafe {
+                arch::_mm_storeu_si128(bytes.as_mut_ptr() as *mut arch::__m128i, vec);
+            }
+            let elem_base = group * 4;
+            for lane in 0..4 {
+                dest[elem_base + lane] = bytes[lane * 4];
+                dest[nelements + elem_base + lane] = bytes[lane * 4 + 1];
+                dest[nelements * 2 + elem_base + lane] = bytes[lane * 4 + 2];
+                dest[nelements * 3 + elem_base + lane] = bytes[lane * 4 + 3];
+            }
+        }
+
+        for element in simd_elements..nelements {
+            let src_base = element * 4;
+            dest[element] = src[src_base];
+            dest[nelements + element] = src[src_base + 1];
+            dest[nelements * 2 + element] = src[src_base + 2];
+            dest[nelements * 3 + element] = src[src_base + 3];
+        }
+
+        let tail_start = nelements * 4;
+        if tail_start < blocksize {
+            dest[tail_start..blocksize].copy_from_slice(&src[tail_start..blocksize]);
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    unsafe fn unshuffle4_sse2(src: &[u8], dest: &mut [u8]) {
+        let blocksize = src.len();
+        let nelements = blocksize / 4;
+        let simd_elements = nelements - (nelements % 4);
+
+        for group in 0..(simd_elements / 4) {
+            let elem_base = group * 4;
+            let mut bytes = [0u8; 16];
+            for lane in 0..4 {
+                bytes[lane * 4] = src[elem_base + lane];
+                bytes[lane * 4 + 1] = src[nelements + elem_base + lane];
+                bytes[lane * 4 + 2] = src[nelements * 2 + elem_base + lane];
+                bytes[lane * 4 + 3] = src[nelements * 3 + elem_base + lane];
+            }
+            let vec = unsafe { arch::_mm_loadu_si128(bytes.as_ptr() as *const arch::__m128i) };
+            unsafe {
+                arch::_mm_storeu_si128(
+                    dest.as_mut_ptr().add(group * 16) as *mut arch::__m128i,
+                    vec,
+                );
+            }
+        }
+
+        for element in simd_elements..nelements {
+            let dest_base = element * 4;
+            dest[dest_base] = src[element];
+            dest[dest_base + 1] = src[nelements + element];
+            dest[dest_base + 2] = src[nelements * 2 + element];
+            dest[dest_base + 3] = src[nelements * 3 + element];
+        }
+
+        let tail_start = nelements * 4;
+        if tail_start < blocksize {
+            dest[tail_start..blocksize].copy_from_slice(&src[tail_start..blocksize]);
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+mod simd {
+    pub fn try_shuffle(_typesize: usize, _src: &[u8], _dest: &mut [u8]) -> bool {
+        false
+    }
+
+    pub fn try_unshuffle(_typesize: usize, _src: &[u8], _dest: &mut [u8]) -> bool {
+        false
+    }
+}
+
+#[cfg(test)]
+fn bitshuffle_scalar_with_scratch(
+    typesize: usize,
+    src: &[u8],
+    dest: &mut [u8],
+    scratch: Option<&mut [u8]>,
+) -> i64 {
+    let blocksize = src.len();
+    if typesize == 0 || blocksize == 0 || dest.len() < blocksize {
+        return 0;
+    }
+
+    let size = blocksize / typesize;
+    let size8 = size - (size % 8);
+    let nbyte8 = size8 * typesize;
+
+    if size8 > 0 {
+        let mut owned_tmp;
+        let tmp = if let Some(s) = scratch {
+            if s.len() < nbyte8 {
+                return 0;
+            }
+            &mut s[..nbyte8]
+        } else {
+            owned_tmp = vec![0u8; nbyte8];
+            &mut owned_tmp[..]
+        };
+
+        trans_byte_elem(&src[..nbyte8], dest, size8, typesize);
+        trans_bit_byte(&dest[..nbyte8], tmp, size8, typesize);
+        trans_bitrow_eight(&tmp[..nbyte8], dest, size8, typesize);
+    }
+
+    if nbyte8 < blocksize {
+        dest[nbyte8..blocksize].copy_from_slice(&src[nbyte8..blocksize]);
+    }
+
+    blocksize as i64
+}
+
+#[cfg(test)]
+fn bitunshuffle_scalar_with_scratch(
+    typesize: usize,
+    src: &[u8],
+    dest: &mut [u8],
+    scratch: Option<&mut [u8]>,
+) -> i64 {
+    let blocksize = src.len();
+    if typesize == 0 || blocksize == 0 || dest.len() < blocksize {
+        return 0;
+    }
+
+    let size = blocksize / typesize;
+    let size8 = size - (size % 8);
+    let nbyte8 = size8 * typesize;
+
+    if size8 > 0 {
+        let mut owned_tmp;
+        let tmp = if let Some(s) = scratch {
+            if s.len() < nbyte8 {
+                return 0;
+            }
+            &mut s[..nbyte8]
+        } else {
+            owned_tmp = vec![0u8; nbyte8];
+            &mut owned_tmp[..]
+        };
+
+        trans_byte_bitrow(&src[..nbyte8], tmp, size8, typesize);
+        shuffle_bit_eightelem(&tmp[..nbyte8], dest, size8, typesize);
+    }
+
+    if nbyte8 < blocksize {
+        dest[nbyte8..blocksize].copy_from_slice(&src[nbyte8..blocksize]);
+    }
+
+    blocksize as i64
 }
 
 /// Transpose bytes within elements (step 1 of bitshuffle).
@@ -146,7 +509,6 @@ pub fn bitshuffle_with_scratch(
     let nbyte8 = size8 * typesize;
 
     if size8 > 0 {
-        // Use provided scratch or allocate
         let mut owned_tmp;
         let tmp = if let Some(s) = scratch {
             if s.len() < nbyte8 {
@@ -158,9 +520,11 @@ pub fn bitshuffle_with_scratch(
             &mut owned_tmp[..]
         };
 
-        trans_byte_elem(&src[..nbyte8], dest, size8, typesize);
-        trans_bit_byte(&dest[..nbyte8], tmp, size8, typesize);
-        trans_bitrow_eight(&tmp[..nbyte8], dest, size8, typesize);
+        if !bitshuffle_simd::try_bitshuffle(typesize, &src[..nbyte8], dest, tmp, size8) {
+            trans_byte_elem(&src[..nbyte8], dest, size8, typesize);
+            trans_bit_byte(&dest[..nbyte8], tmp, size8, typesize);
+            trans_bitrow_eight(&tmp[..nbyte8], dest, size8, typesize);
+        }
     }
 
     if nbyte8 < blocksize {
@@ -204,6 +568,131 @@ fn shuffle_bit_eightelem(src: &[u8], dest: &mut [u8], size: usize, elem_size: us
     }
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod bitshuffle_simd {
+    use super::{trans_bit_8x8, trans_bitrow_eight, trans_byte_bitrow, trans_byte_elem};
+
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86 as arch;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64 as arch;
+
+    pub fn try_bitshuffle(
+        typesize: usize,
+        src: &[u8],
+        dest: &mut [u8],
+        scratch: &mut [u8],
+        size8: usize,
+    ) -> bool {
+        let nbyte8 = size8 * typesize;
+        if nbyte8 < 128 || dest.len() < nbyte8 || scratch.len() < nbyte8 {
+            return false;
+        }
+        if !std::arch::is_x86_feature_detected!("sse2") {
+            return false;
+        }
+
+        trans_byte_elem(src, dest, size8, typesize);
+        // SAFETY: The wrapper checks that SSE2 is present and that the source
+        // and destination ranges cover the exact nbyte8 bytes processed.
+        unsafe {
+            trans_bit_byte_sse2(&dest[..nbyte8], scratch, nbyte8);
+        }
+        trans_bitrow_eight(&scratch[..nbyte8], dest, size8, typesize);
+        true
+    }
+
+    pub fn try_bitunshuffle(
+        typesize: usize,
+        src: &[u8],
+        dest: &mut [u8],
+        scratch: &mut [u8],
+        size8: usize,
+    ) -> bool {
+        let nbyte8 = size8 * typesize;
+        if nbyte8 < 128 || dest.len() < nbyte8 || scratch.len() < nbyte8 {
+            return false;
+        }
+        if !std::arch::is_x86_feature_detected!("sse2") {
+            return false;
+        }
+
+        trans_byte_bitrow(src, scratch, size8, typesize);
+        // SAFETY: The wrapper checks that SSE2 is present and that the source
+        // and destination ranges cover the exact nbyte8 bytes processed.
+        unsafe {
+            shuffle_bit_eightelem_sse2(&scratch[..nbyte8], dest, size8, typesize);
+        }
+        true
+    }
+
+    #[target_feature(enable = "sse2")]
+    unsafe fn trans_bit_byte_sse2(src: &[u8], dest: &mut [u8], nbyte: usize) {
+        let nbyte_bitrow = nbyte / 8;
+        for ii in 0..nbyte_bitrow {
+            let x = unsafe { load_u64_sse2(src.as_ptr().add(ii * 8)) };
+            let mut transposed = trans_bit_8x8(x);
+            for kk in 0..8usize {
+                dest[kk * nbyte_bitrow + ii] = (transposed & 0xFF) as u8;
+                transposed >>= 8;
+            }
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    unsafe fn shuffle_bit_eightelem_sse2(
+        src: &[u8],
+        dest: &mut [u8],
+        size: usize,
+        elem_size: usize,
+    ) {
+        let nbyte = elem_size * size;
+        for jj in (0..8 * elem_size).step_by(8) {
+            let mut ii = 0;
+            while ii + 8 * elem_size - 1 < nbyte {
+                let x = unsafe { load_u64_sse2(src.as_ptr().add(ii + jj)) };
+                let mut transposed = trans_bit_8x8(x);
+
+                for kk in 0..8usize {
+                    let out_index = ii + jj / 8 + kk * elem_size;
+                    dest[out_index] = (transposed & 0xFF) as u8;
+                    transposed >>= 8;
+                }
+                ii += 8 * elem_size;
+            }
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    unsafe fn load_u64_sse2(ptr: *const u8) -> u64 {
+        let vec = unsafe { arch::_mm_loadl_epi64(ptr as *const arch::__m128i) };
+        arch::_mm_cvtsi128_si64(vec) as u64
+    }
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+mod bitshuffle_simd {
+    pub fn try_bitshuffle(
+        _typesize: usize,
+        _src: &[u8],
+        _dest: &mut [u8],
+        _scratch: &mut [u8],
+        _size8: usize,
+    ) -> bool {
+        false
+    }
+
+    pub fn try_bitunshuffle(
+        _typesize: usize,
+        _src: &[u8],
+        _dest: &mut [u8],
+        _scratch: &mut [u8],
+        _size8: usize,
+    ) -> bool {
+        false
+    }
+}
+
 /// Reverse bit-wise shuffle (bitunshuffle). Returns number of bytes processed.
 pub fn bitunshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) -> i64 {
     bitunshuffle_with_scratch(typesize, src, dest, None)
@@ -237,8 +726,10 @@ pub fn bitunshuffle_with_scratch(
             &mut owned_tmp[..]
         };
 
-        trans_byte_bitrow(&src[..nbyte8], tmp, size8, typesize);
-        shuffle_bit_eightelem(&tmp[..nbyte8], dest, size8, typesize);
+        if !bitshuffle_simd::try_bitunshuffle(typesize, &src[..nbyte8], dest, tmp, size8) {
+            trans_byte_bitrow(&src[..nbyte8], tmp, size8, typesize);
+            shuffle_bit_eightelem(&tmp[..nbyte8], dest, size8, typesize);
+        }
     }
 
     if nbyte8 < blocksize {
@@ -379,7 +870,11 @@ pub fn pipeline_forward(
                 trunc_prec_forward(inp, out, typesize, prec);
             }
             _ => {
-                out.copy_from_slice(inp);
+                if let Some(filter) = registered_filter(filter) {
+                    (filter.forward)(filters_meta[i], typesize, block_offset, inp, out);
+                } else {
+                    out.copy_from_slice(inp);
+                }
             }
         }
 
@@ -453,7 +948,11 @@ pub fn pipeline_backward(
                 out.copy_from_slice(inp);
             }
             _ => {
-                out.copy_from_slice(inp);
+                if let Some(filter_fn) = registered_filter(filter) {
+                    (filter_fn.backward)(filters_meta[i], typesize, block_offset, inp, out);
+                } else {
+                    out.copy_from_slice(inp);
+                }
             }
         }
 
@@ -506,6 +1005,38 @@ fn trunc_prec_forward(src: &[u8], dest: &mut [u8], typesize: usize, prec_bits: u
 mod tests {
     use super::*;
 
+    fn scalar_shuffle_for_test(typesize: usize, src: &[u8], dest: &mut [u8]) {
+        let blocksize = src.len();
+        if typesize <= 1 || blocksize == 0 {
+            dest[..blocksize].copy_from_slice(src);
+            return;
+        }
+        let nelements = blocksize / typesize;
+        let tail_start = nelements * typesize;
+        for byte_idx in 0..typesize {
+            for element in 0..nelements {
+                dest[byte_idx * nelements + element] = src[element * typesize + byte_idx];
+            }
+        }
+        dest[tail_start..blocksize].copy_from_slice(&src[tail_start..blocksize]);
+    }
+
+    fn scalar_unshuffle_for_test(typesize: usize, src: &[u8], dest: &mut [u8]) {
+        let blocksize = src.len();
+        if typesize <= 1 || blocksize == 0 {
+            dest[..blocksize].copy_from_slice(src);
+            return;
+        }
+        let nelements = blocksize / typesize;
+        let tail_start = nelements * typesize;
+        for element in 0..nelements {
+            for byte_idx in 0..typesize {
+                dest[element * typesize + byte_idx] = src[byte_idx * nelements + element];
+            }
+        }
+        dest[tail_start..blocksize].copy_from_slice(&src[tail_start..blocksize]);
+    }
+
     #[test]
     fn test_shuffle_unshuffle_roundtrip() {
         let data: Vec<u8> = (0..32).collect();
@@ -516,6 +1047,37 @@ mod tests {
         assert_ne!(data, shuffled);
         unshuffle(4, &shuffled, &mut restored);
         assert_eq!(data, restored);
+    }
+
+    #[test]
+    fn test_shuffle_dispatch_matches_scalar_for_simd_widths_and_leftovers() {
+        for typesize in [4, 8] {
+            for extra_bytes in [0, 1, 3, 5, 7] {
+                let len = 256 + extra_bytes;
+                let data: Vec<u8> = (0..len)
+                    .map(|i: usize| (i.wrapping_mul(29).wrapping_add(typesize)) as u8)
+                    .collect();
+                let mut expected = vec![0u8; len];
+                let mut actual = vec![0u8; len];
+                let mut restored = vec![0u8; len];
+                let mut scalar_restored = vec![0u8; len];
+
+                scalar_shuffle_for_test(typesize, &data, &mut expected);
+                shuffle(typesize, &data, &mut actual);
+                assert_eq!(
+                    actual, expected,
+                    "shuffle dispatch diverged from scalar for typesize={typesize} extra_bytes={extra_bytes}"
+                );
+
+                scalar_unshuffle_for_test(typesize, &expected, &mut scalar_restored);
+                unshuffle(typesize, &actual, &mut restored);
+                assert_eq!(
+                    restored, scalar_restored,
+                    "unshuffle dispatch diverged from scalar for typesize={typesize} extra_bytes={extra_bytes}"
+                );
+                assert_eq!(restored, data);
+            }
+        }
     }
 
     #[test]
@@ -536,6 +1098,19 @@ mod tests {
 
         unshuffle(4, &data, &mut dest);
         assert_eq!(dest, vec![0xA5; 15]);
+    }
+
+    #[test]
+    fn test_shuffle_unshuffle_typesize4_large_roundtrip() {
+        let data: Vec<u8> = (0..1027usize)
+            .map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8)
+            .collect();
+        let mut shuffled = vec![0u8; data.len()];
+        let mut restored = vec![0u8; data.len()];
+
+        shuffle(4, &data, &mut shuffled);
+        unshuffle(4, &shuffled, &mut restored);
+        assert_eq!(data, restored);
     }
 
     #[test]
@@ -567,6 +1142,71 @@ mod tests {
                     data, restored,
                     "bitshuffle leftover roundtrip failed for typesize={typesize} extra_elements={extra_elements}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn test_bitshuffle_dispatch_matches_scalar_for_typesizes_and_leftovers() {
+        for typesize in [1usize, 2, 3, 4, 8, 16] {
+            for extra_elements in 0..8 {
+                let len = (40 + extra_elements) * typesize + (typesize / 2);
+                let data: Vec<u8> = (0..len)
+                    .map(|i: usize| (i.wrapping_mul(37) ^ (i >> 3).wrapping_mul(11)) as u8)
+                    .collect();
+
+                let mut dispatched = vec![0u8; len];
+                let mut scalar = vec![0u8; len];
+                let mut dispatch_scratch = vec![0u8; len];
+                let mut scalar_scratch = vec![0u8; len];
+                assert_eq!(
+                    bitshuffle_with_scratch(
+                        typesize,
+                        &data,
+                        &mut dispatched,
+                        Some(&mut dispatch_scratch)
+                    ),
+                    len as i64
+                );
+                assert_eq!(
+                    bitshuffle_scalar_with_scratch(
+                        typesize,
+                        &data,
+                        &mut scalar,
+                        Some(&mut scalar_scratch)
+                    ),
+                    len as i64
+                );
+                assert_eq!(
+                    dispatched, scalar,
+                    "bitshuffle dispatch mismatch for typesize={typesize} extra_elements={extra_elements}"
+                );
+
+                let mut dispatched_restored = vec![0u8; len];
+                let mut scalar_restored = vec![0u8; len];
+                assert_eq!(
+                    bitunshuffle_with_scratch(
+                        typesize,
+                        &dispatched,
+                        &mut dispatched_restored,
+                        Some(&mut dispatch_scratch)
+                    ),
+                    len as i64
+                );
+                assert_eq!(
+                    bitunshuffle_scalar_with_scratch(
+                        typesize,
+                        &scalar,
+                        &mut scalar_restored,
+                        Some(&mut scalar_scratch)
+                    ),
+                    len as i64
+                );
+                assert_eq!(
+                    dispatched_restored, scalar_restored,
+                    "bitunshuffle dispatch mismatch for typesize={typesize} extra_elements={extra_elements}"
+                );
+                assert_eq!(dispatched_restored, data);
             }
         }
     }

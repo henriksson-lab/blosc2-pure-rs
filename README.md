@@ -20,7 +20,10 @@ Compressing is currently slower than C. This will be fixed in the future
 - **5 codecs**: BloscLZ (ported from C), LZ4, LZ4HC, Zlib, Zstd
 - **4 filters**: Shuffle, Bitshuffle, Delta, Truncated Precision
 - **Frame format**: Compatible with C-Blosc2 `.b2frame` files (read and write)
-- **Multi-threaded**: Block-parallel compression and decompression via rayon
+- **Lazy frame reads**: File-backed `LazySchunk` loads compressed chunks on demand
+- **VL-block chunks**: Pure-Rust variable-length block chunks with split/block decompression
+- **Multi-threaded**: Bounded per-call Rayon scheduling for block-level and super-chunk chunk-level work
+- **Zstd dictionaries**: Per-chunk dictionary training with C/Rust-compatible dictionary chunks
 - **CLI**: Compress and decompress files (optional `cli` feature)
 - **Library API**: In-memory compression with `Schunk` container
 - **Mostly Rust runtime**: LZ4HC temporarily uses `lz4-sys`; pure-Rust LZ4HC is out of scope for now
@@ -152,6 +155,10 @@ schunk.to_file("data.b2frame").unwrap();
 // Read back
 let schunk2 = Schunk::open("data.b2frame").unwrap();
 let restored = schunk2.decompress_chunk(0).unwrap();
+
+// Or keep chunks on disk and read only what is needed
+let lazy = Schunk::open_lazy("data.b2frame").unwrap();
+let tail = lazy.get_slice(1024, 256).unwrap();
 ```
 
 ### In-memory frames and slices
@@ -181,27 +188,33 @@ assert_eq!(restored, data);
 
 ## Benchmarks
 
-10 MB float32 sensor data with noise, single-threaded, compiled with `-C target-cpu=native`.
-All comparisons are 1 thread vs 1 thread against C-Blosc2 3.0.0.
+10 MiB deterministic float32 signal data with noise, single-threaded, compiled with
+`-C target-cpu=native`. All comparisons are 1 thread vs 1 thread against the local C-Blosc2 3.0.0
+test helper binaries, measured on April 15, 2026.
 
-### Realistic data (10 MB float32 sensor data with noise)
+### Realistic data (10 MiB float32 signal data with noise)
 
 | Codec | Compress (MB/s) | Decompress (MB/s) | Ratio |
 |-------|----------------:|-------------------:|------:|
-| C-Blosc2 BloscLZ (typesize=1) | 311 | 327 | 1.0x |
-| **Rust BloscLZ (typesize=1)** | **232** | **742** | **1.0x** |
-| **Rust BloscLZ (typesize=4)** | **317** | **502** | **1.9x** |
-| **Rust LZ4 (typesize=4)** | **251** | **395** | **1.9x** |
-| Rust Zstd (typesize=4) | 145 | 350 | 2.0x |
+| C-Blosc2 BloscLZ (typesize=1) | 441 | 449 | 1.0x |
+| Rust BloscLZ (typesize=1) | 193 | 669 | 1.0x |
+| C-Blosc2 BloscLZ (typesize=4) | 155 | 358 | 1.5x |
+| Rust BloscLZ (typesize=4) | 139 | 242 | 1.5x |
+| C-Blosc2 LZ4 (typesize=4) | 340 | 911 | 1.6x |
+| Rust LZ4 (typesize=4) | 212 | 257 | 1.6x |
+| C-Blosc2 Zstd (typesize=4) | 2 | 662 | 1.8x |
+| Rust Zstd (typesize=4) | 135 | 267 | 1.7x |
 
-### Random data (10 MB, incompressible)
+### Random data (10 MiB, incompressible)
 
 | Codec | Compress (MB/s) | Decompress (MB/s) |
 |-------|----------------:|-------------------:|
-| C-Blosc2 BloscLZ | 443 | 411 |
-| **Rust BloscLZ** | **289** | **802** |
+| C-Blosc2 BloscLZ | 350 | 519 |
+| Rust BloscLZ | 221 | 619 |
 
-Rust decompression is **2.3x faster** than C. With SSE2 SIMD shuffle, Rust compress with typesize=4 matches C compress speed while achieving 1.9x compression ratio. Overall throughput (compress + decompress combined) is **1.5x faster** than C.
+Rust BloscLZ decompression is faster than C on the incompressible random case in this local run, but
+compression is currently slower. SIMD acceleration uses audited SSE2 bitshuffle/bitunshuffle wrappers
+and SSE2/AVX2 shuffle/unshuffle wrappers with scalar fallback.
 
 ## Codec Comparison
 

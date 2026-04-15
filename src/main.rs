@@ -87,12 +87,14 @@ fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::R
     filters_meta[BLOSC2_MAX_FILTERS - 1] = options.filter_meta;
     let cparams = CParams {
         compcode: options.codec as u8,
+        compcode_meta: 0,
         clevel: options.clevel,
         typesize: options.typesize,
         blocksize: options.blocksize,
         splitmode: options.splitmode,
         filters: [0, 0, 0, 0, 0, options.filter as u8],
         filters_meta,
+        use_dict: false,
         nthreads: options.nthreads,
     };
     let dparams = DParams {

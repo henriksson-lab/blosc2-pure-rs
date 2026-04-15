@@ -4,11 +4,26 @@ use crate::filters;
 use crate::header::ChunkHeader;
 use rayon::prelude::*;
 
+pub(crate) fn with_thread_pool<T: Send>(nthreads: i16, op: impl FnOnce() -> T + Send) -> T {
+    if nthreads <= 1 {
+        return op();
+    }
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(nthreads as usize)
+        .build()
+    {
+        Ok(pool) => pool.install(op),
+        Err(_) => op(),
+    }
+}
+
 /// Compression parameters.
 #[derive(Debug, Clone)]
 pub struct CParams {
     /// Codec identifier, such as `BLOSC_LZ4` or `BLOSC_ZSTD`.
     pub compcode: u8,
+    /// Per-codec metadata byte stored in the extended chunk header.
+    pub compcode_meta: u8,
     /// Compression level from 0 to 9.
     pub clevel: u8,
     /// Logical element size in bytes. Filters such as shuffle operate over this size.
@@ -21,6 +36,8 @@ pub struct CParams {
     pub filters: [u8; BLOSC2_MAX_FILTERS],
     /// Per-filter metadata bytes.
     pub filters_meta: [u8; BLOSC2_MAX_FILTERS],
+    /// Train and embed a per-chunk codec dictionary when supported.
+    pub use_dict: bool,
     /// Number of worker threads for block-parallel compression.
     pub nthreads: i16,
 }
@@ -29,12 +46,14 @@ impl Default for CParams {
     fn default() -> Self {
         CParams {
             compcode: BLOSC_BLOSCLZ,
+            compcode_meta: 0,
             clevel: 5,
             typesize: 8,
             blocksize: 0,
             splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
             filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
             filters_meta: [0; BLOSC2_MAX_FILTERS],
+            use_dict: false,
             nthreads: 1,
         }
     }
@@ -204,14 +223,19 @@ fn validate_cparams(cparams: &CParams, nbytes: usize) -> Result<(), &'static str
     if !matches!(
         cparams.compcode,
         BLOSC_BLOSCLZ | BLOSC_LZ4 | BLOSC_LZ4HC | BLOSC_ZLIB | BLOSC_ZSTD
-    ) {
+    ) && !codecs::is_registered_codec(cparams.compcode)
+    {
         return Err("Unsupported codec");
+    }
+    if cparams.use_dict && cparams.compcode != BLOSC_ZSTD {
+        return Err("Dictionary compression is only supported for Zstd");
     }
     for &filter in &cparams.filters {
         if !matches!(
             filter,
             BLOSC_NOFILTER | BLOSC_SHUFFLE | BLOSC_BITSHUFFLE | BLOSC_DELTA | BLOSC_TRUNC_PREC
-        ) {
+        ) && !filters::is_registered_filter(filter)
+        {
             return Err("Unsupported filter");
         }
     }
@@ -243,14 +267,19 @@ fn validate_header(header: &ChunkHeader, chunk_len: usize) -> Result<(), &'stati
         return Err("Invalid nbytes");
     }
     if header.special_type() == BLOSC2_NO_SPECIAL {
-        if header.use_dict() {
-            return Err("Dictionary chunks are not supported");
+        if header.use_dict() && header.compcode() != BLOSC_ZSTD {
+            return Err("Dictionary chunks are only supported for Zstd");
         }
         if header.blosc2_flags & (BLOSC2_INSTR_CODEC | BLOSC2_LAZY_CHUNK) != 0 {
             return Err("Unsupported chunk flags");
         }
         if header.vl_blocks() {
-            return Err("Variable-length blocks are not supported");
+            if header.version != BLOSC2_VERSION_FORMAT_VL_BLOCKS {
+                return Err("Invalid VL-block chunk version");
+            }
+            if header.blocksize <= 0 {
+                return Err("Invalid VL-block count");
+            }
         }
     }
     if header.memcpyed() {
@@ -273,7 +302,8 @@ fn validate_header(header: &ChunkHeader, chunk_len: usize) -> Result<(), &'stati
     if !matches!(
         header.compcode(),
         BLOSC_BLOSCLZ | BLOSC_LZ4 | BLOSC_LZ4HC | BLOSC_ZLIB | BLOSC_ZSTD
-    ) {
+    ) && !codecs::is_registered_codec(header.compcode())
+    {
         return Err("Unsupported codec");
     }
     match header.special_type() {
@@ -301,9 +331,30 @@ fn validate_header(header: &ChunkHeader, chunk_len: usize) -> Result<(), &'stati
         if !matches!(
             filter,
             BLOSC_NOFILTER | BLOSC_SHUFFLE | BLOSC_BITSHUFFLE | BLOSC_DELTA | BLOSC_TRUNC_PREC
-        ) {
+        ) && !filters::is_registered_filter(filter)
+        {
             return Err("Unsupported filter");
         }
+    }
+
+    if header.vl_blocks() {
+        let nblocks = header.blocksize as usize;
+        let min_block_table_len = nblocks
+            .checked_mul(4)
+            .and_then(|len| header_len.checked_add(len))
+            .ok_or("Invalid VL-block table size")?;
+        if cbytes < min_block_table_len {
+            return Err("Chunk too small for VL-block table");
+        }
+        if header.use_dict()
+            && cbytes
+                < min_block_table_len
+                    .checked_add(4)
+                    .ok_or("Invalid dictionary size")?
+        {
+            return Err("Chunk too small for dictionary size");
+        }
+        return Ok(());
     }
 
     let nblocks = nbytes.div_ceil(header.blocksize as usize);
@@ -316,6 +367,16 @@ fn validate_header(header: &ChunkHeader, chunk_len: usize) -> Result<(), &'stati
         && cbytes < min_block_table_len
     {
         return Err("Chunk too small for block table");
+    }
+    if header.use_dict()
+        && header.special_type() == BLOSC2_NO_SPECIAL
+        && !header.memcpyed()
+        && cbytes
+            < min_block_table_len
+                .checked_add(4)
+                .ok_or("Invalid dictionary size")?
+    {
+        return Err("Chunk too small for dictionary size");
     }
 
     Ok(())
@@ -337,6 +398,14 @@ fn stream_count(dont_split: bool, is_leftover: bool, typesize: usize, bsize: usi
 fn ensure_len(buf: &mut Vec<u8>, len: usize) {
     if len > buf.len() {
         buf.resize(len, 0);
+    }
+}
+
+fn udcompcode_for_header(compcode: u8) -> u8 {
+    if compcode_to_compformat(compcode) == BLOSC_UDCODEC_FORMAT {
+        compcode
+    } else {
+        0
     }
 }
 
@@ -411,6 +480,18 @@ fn compress_block(
         &buf2[..bsize]
     };
 
+    compress_pre_filtered_block(filtered, cparams, dont_split, typesize, is_leftover, None)
+}
+
+fn compress_pre_filtered_block(
+    filtered: &[u8],
+    cparams: &CParams,
+    dont_split: bool,
+    typesize: usize,
+    is_leftover: bool,
+    dict: Option<&[u8]>,
+) -> (Vec<u8>, bool) {
+    let bsize = filtered.len();
     // Determine number of streams
     let nstreams = stream_count(dont_split, is_leftover, typesize, bsize);
     let neblock = bsize / nstreams;
@@ -437,12 +518,22 @@ fn compress_block(
 
         let max_out = neblock + (neblock / 255) + 32;
         let mut compressed = vec![0u8; max_out];
-        let cbytes = codecs::compress_block(
-            cparams.compcode,
-            cparams.clevel,
-            stream_data,
-            &mut compressed,
-        );
+        let cbytes = match dict {
+            Some(dict) => codecs::compress_block_with_dict(
+                cparams.compcode,
+                cparams.clevel,
+                stream_data,
+                &mut compressed,
+                dict,
+            ),
+            None => codecs::compress_block_with_meta(
+                cparams.compcode,
+                cparams.clevel,
+                cparams.compcode_meta,
+                stream_data,
+                &mut compressed,
+            ),
+        };
 
         if cbytes == 0 || cbytes as usize >= neblock {
             // Incompressible: store as memcpy
@@ -455,6 +546,65 @@ fn compress_block(
     }
 
     (result, all_zero_runs)
+}
+
+fn filtered_blocks_for_dict(
+    src: &[u8],
+    cparams: &CParams,
+    blocksize: usize,
+    nblocks: usize,
+    typesize: usize,
+    filters_are_noop: bool,
+) -> Vec<Vec<u8>> {
+    let dref_end = blocksize.min(src.len());
+    (0..nblocks)
+        .map(|block_idx| {
+            let block_start = block_idx * blocksize;
+            let block_end = (block_start + blocksize).min(src.len());
+            let bsize = block_end - block_start;
+            let block_data = &src[block_start..block_end];
+            if filters_are_noop {
+                return block_data.to_vec();
+            }
+
+            let mut buf1 = vec![0u8; bsize];
+            let mut buf2 = vec![0u8; bsize];
+            let fb = filters::pipeline_forward(
+                block_data,
+                &mut buf1,
+                &mut buf2,
+                &cparams.filters,
+                &cparams.filters_meta,
+                typesize,
+                block_start,
+                Some(&src[..dref_end]),
+            );
+            if fb == 1 {
+                buf1
+            } else {
+                buf2
+            }
+        })
+        .collect()
+}
+
+fn train_zstd_dict(samples: &[Vec<u8>], nbytes: usize) -> Option<Vec<u8>> {
+    let dict_maxsize = BLOSC2_MAXDICTSIZE.min(nbytes / 20);
+    if dict_maxsize < BLOSC2_MINUSEFULDICT || samples.is_empty() {
+        return None;
+    }
+
+    let mut sample_data = Vec::with_capacity(samples.iter().map(Vec::len).sum());
+    let mut sample_sizes = Vec::with_capacity(samples.len());
+    for sample in samples {
+        if sample.is_empty() {
+            return None;
+        }
+        sample_sizes.push(sample.len());
+        sample_data.extend_from_slice(sample);
+    }
+
+    zstd::dict::from_continuous(&sample_data, &sample_sizes, dict_maxsize).ok()
 }
 
 /// Compress data into a Blosc2 chunk.
@@ -479,6 +629,8 @@ pub fn compress(src: &[u8], cparams: &CParams) -> Result<Vec<u8>, &'static str> 
             cbytes: BLOSC_EXTENDED_HEADER_LENGTH as i32,
             filters: cparams.filters,
             filters_meta: cparams.filters_meta,
+            udcompcode: udcompcode_for_header(cparams.compcode),
+            compcode_meta: cparams.compcode_meta,
             ..Default::default()
         };
         header.try_write(&mut chunk)?;
@@ -517,6 +669,76 @@ pub fn compress(src: &[u8], cparams: &CParams) -> Result<Vec<u8>, &'static str> 
         .iter()
         .all(|&f| f == BLOSC_NOFILTER || (f == BLOSC_SHUFFLE && typesize <= 1));
 
+    if cparams.use_dict && cparams.compcode == BLOSC_ZSTD && cparams.clevel > 0 {
+        let filtered_blocks =
+            filtered_blocks_for_dict(src, cparams, blocksize, nblocks, typesize, filters_are_noop);
+        if let Some(dict) = train_zstd_dict(&filtered_blocks, nbytes as usize) {
+            let dict_section_len = 4 + dict.len();
+            let max_compressed =
+                nbytes as usize + header_len + bstarts_len + dict_section_len + nblocks * 32;
+            let mut output = vec![0u8; max_compressed];
+            let mut output_pos = header_len + bstarts_len;
+
+            output[output_pos..output_pos + 4].copy_from_slice(&(dict.len() as i32).to_le_bytes());
+            output_pos += 4;
+            output[output_pos..output_pos + dict.len()].copy_from_slice(&dict);
+            output_pos += dict.len();
+
+            let mut all_zero_runs = true;
+            for (block_idx, filtered) in filtered_blocks.iter().enumerate() {
+                let block_start = block_idx * blocksize;
+                let block_end = (block_start + blocksize).min(nbytes as usize);
+                let bsize = block_end - block_start;
+                let is_leftover = block_idx == nblocks - 1 && bsize < blocksize;
+
+                let bstart_offset = header_len + block_idx * 4;
+                output[bstart_offset..bstart_offset + 4]
+                    .copy_from_slice(&(output_pos as i32).to_le_bytes());
+
+                let (block_data, block_all_zero) = compress_pre_filtered_block(
+                    filtered,
+                    cparams,
+                    dont_split,
+                    typesize,
+                    is_leftover,
+                    Some(&dict),
+                );
+                ensure_len(&mut output, output_pos + block_data.len());
+                output[output_pos..output_pos + block_data.len()].copy_from_slice(&block_data);
+                output_pos += block_data.len();
+                if !block_all_zero {
+                    all_zero_runs = false;
+                }
+            }
+
+            let mut blosc2_flags = BLOSC2_USEDICT;
+            if all_zero_runs {
+                blosc2_flags = BLOSC2_SPECIAL_ZERO << 4;
+                output_pos = header_len;
+            }
+
+            let header = ChunkHeader {
+                version: BLOSC2_VERSION_FORMAT_STABLE,
+                versionlz: compcode_to_version(cparams.compcode),
+                flags,
+                typesize: cparams.typesize as u8,
+                nbytes,
+                blocksize: blocksize as i32,
+                cbytes: output_pos as i32,
+                filters: cparams.filters,
+                filters_meta: cparams.filters_meta,
+                udcompcode: udcompcode_for_header(cparams.compcode),
+                compcode_meta: cparams.compcode_meta,
+                blosc2_flags,
+                ..Default::default()
+            };
+            header.try_write(&mut output[..BLOSC_EXTENDED_HEADER_LENGTH])?;
+
+            output.truncate(output_pos);
+            return Ok(output);
+        }
+    }
+
     let mut output_pos;
     let mut all_zero_runs;
     let mut output;
@@ -532,21 +754,23 @@ pub fn compress(src: &[u8], cparams: &CParams) -> Result<Vec<u8>, &'static str> 
             })
             .collect();
 
-        let compressed_blocks: Vec<(Vec<u8>, bool)> = block_infos
-            .par_iter()
-            .map(|&(start, end, is_leftover)| {
-                compress_block(
-                    src,
-                    &src[start..end],
-                    start,
-                    blocksize,
-                    is_leftover,
-                    cparams,
-                    dont_split,
-                    typesize,
-                )
-            })
-            .collect();
+        let compressed_blocks: Vec<(Vec<u8>, bool)> = with_thread_pool(cparams.nthreads, || {
+            block_infos
+                .par_iter()
+                .map(|&(start, end, is_leftover)| {
+                    compress_block(
+                        src,
+                        &src[start..end],
+                        start,
+                        blocksize,
+                        is_leftover,
+                        cparams,
+                        dont_split,
+                        typesize,
+                    )
+                })
+                .collect()
+        });
 
         let total_compressed: usize = compressed_blocks.iter().map(|(b, _)| b.len()).sum();
         output = vec![0u8; header_len + bstarts_len + total_compressed];
@@ -641,9 +865,10 @@ pub fn compress(src: &[u8], cparams: &CParams) -> Result<Vec<u8>, &'static str> 
                     compress_buf.resize(max_out, 0);
                 }
 
-                let cbytes = codecs::compress_block(
+                let cbytes = codecs::compress_block_with_meta(
                     cparams.compcode,
                     cparams.clevel,
+                    cparams.compcode_meta,
                     stream_data,
                     &mut compress_buf[..max_out],
                 );
@@ -691,12 +916,233 @@ pub fn compress(src: &[u8], cparams: &CParams) -> Result<Vec<u8>, &'static str> 
         cbytes: output_pos as i32,
         filters: cparams.filters,
         filters_meta: cparams.filters_meta,
+        udcompcode: udcompcode_for_header(cparams.compcode),
+        compcode_meta: cparams.compcode_meta,
         blosc2_flags,
         ..Default::default()
     };
     header.try_write(&mut output[..BLOSC_EXTENDED_HEADER_LENGTH])?;
 
     output.truncate(output_pos);
+    Ok(output)
+}
+
+pub fn compress_many(buffers: &[&[u8]], cparams: &CParams) -> Result<Vec<Vec<u8>>, &'static str> {
+    if buffers.len() > 1 && cparams.nthreads > 1 {
+        let per_chunk_params = CParams {
+            nthreads: 1,
+            ..cparams.clone()
+        };
+        with_thread_pool(cparams.nthreads, || {
+            buffers
+                .par_iter()
+                .map(|buffer| compress(buffer, &per_chunk_params))
+                .collect()
+        })
+    } else {
+        buffers
+            .iter()
+            .map(|buffer| compress(buffer, cparams))
+            .collect()
+    }
+}
+
+fn validate_vl_inputs(blocks: &[&[u8]], cparams: &CParams) -> Result<usize, &'static str> {
+    if blocks.is_empty() {
+        return Err("VL-block input cannot be empty");
+    }
+    if blocks.len() > i32::MAX as usize {
+        return Err("Too many VL-blocks");
+    }
+    if cparams.use_dict {
+        if cparams.compcode != BLOSC_ZSTD {
+            return Err("Dictionary VL-block chunks are only supported for Zstd");
+        }
+        if cparams.clevel == 0 {
+            return Err("Dictionary VL-block chunks require compression");
+        }
+    }
+    if cparams.typesize != 1 {
+        return Err("VL-block compression currently requires typesize 1");
+    }
+    if cparams.filters.contains(&BLOSC_DELTA) {
+        return Err("VL-block compression does not support delta filters");
+    }
+
+    let mut total = 0usize;
+    for block in blocks {
+        if block.is_empty() {
+            return Err("VL-blocks cannot be empty");
+        }
+        total = total
+            .checked_add(block.len())
+            .ok_or("VL-block input too large")?;
+    }
+    validate_cparams(cparams, total)?;
+    Ok(total)
+}
+
+fn filtered_vl_blocks(blocks: &[&[u8]], cparams: &CParams) -> Vec<Vec<u8>> {
+    let typesize = cparams.typesize as usize;
+    let filters_are_noop = cparams
+        .filters
+        .iter()
+        .all(|&f| f == BLOSC_NOFILTER || (f == BLOSC_SHUFFLE && typesize <= 1));
+    blocks
+        .iter()
+        .map(|block| {
+            if filters_are_noop {
+                return block.to_vec();
+            }
+
+            let mut buf1 = vec![0u8; block.len()];
+            let mut buf2 = vec![0u8; block.len()];
+            let selected = filters::pipeline_forward(
+                block,
+                &mut buf1,
+                &mut buf2,
+                &cparams.filters,
+                &cparams.filters_meta,
+                typesize,
+                0,
+                None,
+            );
+            if selected == 1 {
+                buf1
+            } else {
+                buf2
+            }
+        })
+        .collect()
+}
+
+fn compress_filtered_vl_block(filtered: &[u8], cparams: &CParams, dict: Option<&[u8]>) -> Vec<u8> {
+    let max_out = filtered.len() + (filtered.len() / 255) + 32;
+    let mut compressed = vec![0u8; max_out];
+    let cbytes = match dict {
+        Some(dict) => codecs::compress_block_with_dict(
+            cparams.compcode,
+            cparams.clevel,
+            filtered,
+            &mut compressed[..max_out],
+            dict,
+        ),
+        None => codecs::compress_block_with_meta(
+            cparams.compcode,
+            cparams.clevel,
+            cparams.compcode_meta,
+            filtered,
+            &mut compressed[..max_out],
+        ),
+    };
+
+    let mut out = Vec::with_capacity(4 + filtered.len());
+    out.extend_from_slice(&(filtered.len() as i32).to_le_bytes());
+    if cparams.clevel == 0 || cbytes <= 0 || cbytes as usize >= filtered.len() {
+        out.extend_from_slice(filtered);
+    } else {
+        out.extend_from_slice(&compressed[..cbytes as usize]);
+    }
+    out
+}
+
+fn compress_vl_block(block: &[u8], cparams: &CParams) -> Vec<u8> {
+    let filtered = filtered_vl_blocks(&[block], cparams);
+    compress_filtered_vl_block(&filtered[0], cparams, None)
+}
+
+/// Compress independent variable-length blocks into one Blosc2 VL-block chunk.
+///
+/// This currently supports `typesize = 1`; dictionary mode is Zstd-only.
+pub fn vlcompress(blocks: &[&[u8]], cparams: &CParams) -> Result<Vec<u8>, &'static str> {
+    let total_nbytes = validate_vl_inputs(blocks, cparams)?;
+    let header_len = BLOSC_EXTENDED_HEADER_LENGTH;
+    let bstarts_len = blocks.len() * 4;
+
+    let mut flags = BLOSC_DOSHUFFLE | BLOSC_DOBITSHUFFLE;
+    flags |= compcode_to_compformat(cparams.compcode) << 5;
+    flags |= BLOSC_DONT_SPLIT;
+
+    let filtered_blocks = if cparams.use_dict {
+        Some(filtered_vl_blocks(blocks, cparams))
+    } else {
+        None
+    };
+    let dict = filtered_blocks
+        .as_ref()
+        .and_then(|filtered| train_zstd_dict(filtered, total_nbytes));
+    let dict = dict.as_deref();
+
+    let compressed_blocks: Vec<Vec<u8>> = match (filtered_blocks.as_ref(), dict) {
+        (Some(filtered_blocks), Some(dict)) if cparams.nthreads > 1 && blocks.len() > 1 => {
+            with_thread_pool(cparams.nthreads, || {
+                filtered_blocks
+                    .par_iter()
+                    .map(|block| compress_filtered_vl_block(block, cparams, Some(dict)))
+                    .collect()
+            })
+        }
+        (Some(filtered_blocks), Some(dict)) => filtered_blocks
+            .iter()
+            .map(|block| compress_filtered_vl_block(block, cparams, Some(dict)))
+            .collect(),
+        _ if cparams.nthreads > 1 && blocks.len() > 1 => with_thread_pool(cparams.nthreads, || {
+            blocks
+                .par_iter()
+                .map(|block| compress_vl_block(block, cparams))
+                .collect()
+        }),
+        _ => blocks
+            .iter()
+            .map(|block| compress_vl_block(block, cparams))
+            .collect(),
+    };
+
+    let dict_section_len = dict.map_or(0, |dict| 4 + dict.len());
+
+    let total_cbytes = compressed_blocks.iter().try_fold(
+        header_len + bstarts_len + dict_section_len,
+        |acc, block| {
+            acc.checked_add(block.len())
+                .ok_or("VL-block chunk too large")
+        },
+    )?;
+    if total_cbytes > i32::MAX as usize {
+        return Err("VL-block chunk too large");
+    }
+
+    let mut output = vec![0u8; total_cbytes];
+    let mut output_pos = header_len + bstarts_len;
+    if let Some(dict) = dict {
+        output[output_pos..output_pos + 4].copy_from_slice(&(dict.len() as i32).to_le_bytes());
+        output_pos += 4;
+        output[output_pos..output_pos + dict.len()].copy_from_slice(dict);
+        output_pos += dict.len();
+    }
+    for (idx, block) in compressed_blocks.iter().enumerate() {
+        let bstart_offset = header_len + idx * 4;
+        output[bstart_offset..bstart_offset + 4]
+            .copy_from_slice(&(output_pos as i32).to_le_bytes());
+        output[output_pos..output_pos + block.len()].copy_from_slice(block);
+        output_pos += block.len();
+    }
+
+    let header = ChunkHeader {
+        version: BLOSC2_VERSION_FORMAT_VL_BLOCKS,
+        versionlz: compcode_to_version(cparams.compcode),
+        flags,
+        typesize: cparams.typesize as u8,
+        nbytes: total_nbytes as i32,
+        blocksize: blocks.len() as i32,
+        cbytes: total_cbytes as i32,
+        filters: cparams.filters,
+        filters_meta: cparams.filters_meta,
+        udcompcode: udcompcode_for_header(cparams.compcode),
+        compcode_meta: cparams.compcode_meta,
+        blosc2_flags: if dict.is_some() { BLOSC2_USEDICT } else { 0 },
+        blosc2_flags2: BLOSC2_VL_BLOCKS,
+    };
+    header.try_write(&mut output[..BLOSC_EXTENDED_HEADER_LENGTH])?;
     Ok(output)
 }
 
@@ -711,13 +1157,18 @@ fn decompress_block_data(
     is_leftover: bool,
     header: &ChunkHeader,
     dref: Option<&[u8]>,
+    dict: Option<&[u8]>,
 ) -> Result<Vec<u8>, &'static str> {
     let typesize = header.typesize as usize;
     let dont_split = header.dont_split();
     let compcode = header.compcode();
     let header_len = header.header_len();
     let chunk_limit = header.cbytes as usize;
-    let nblocks = header.nblocks();
+    let nblocks = if header.vl_blocks() {
+        header.blocksize as usize
+    } else {
+        header.nblocks()
+    };
 
     // Read block start offset
     let bstart_pos = header_len + block_idx * 4;
@@ -734,6 +1185,16 @@ fn decompress_block_data(
     let mut src_pos = src_pos_i32 as usize;
     if src_pos > chunk_limit {
         return Err("Invalid block offset");
+    }
+    if let Some(dict) = dict {
+        let min_block_start = header_len
+            .checked_add(nblocks.checked_mul(4).ok_or("Invalid block table size")?)
+            .and_then(|pos| pos.checked_add(4))
+            .and_then(|pos| pos.checked_add(dict.len()))
+            .ok_or("Invalid dictionary size")?;
+        if src_pos < min_block_start {
+            return Err("Invalid dictionary block offset");
+        }
     }
 
     let block_limit = if block_idx + 1 < nblocks {
@@ -802,11 +1263,20 @@ fn decompress_block_data(
                 return Err("Chunk truncated reading compressed block");
             }
             let cdata = &chunk[src_pos..block_end];
-            let dsize = codecs::decompress_block(
-                compcode,
-                cdata,
-                &mut buf1[dest_start..dest_start + neblock],
-            );
+            let dsize = match dict {
+                Some(dict) => codecs::decompress_block_with_dict(
+                    compcode,
+                    cdata,
+                    &mut buf1[dest_start..dest_start + neblock],
+                    dict,
+                ),
+                None => codecs::decompress_block_with_meta(
+                    compcode,
+                    header.compcode_meta,
+                    cdata,
+                    &mut buf1[dest_start..dest_start + neblock],
+                ),
+            };
             if dsize < 0 || dsize as usize != neblock {
                 return Err("Codec decompression failed");
             }
@@ -838,6 +1308,44 @@ fn decompress_block_data(
         &buf2[..bsize]
     };
     Ok(result.to_vec())
+}
+
+fn embedded_dictionary<'a>(
+    chunk: &'a [u8],
+    header: &ChunkHeader,
+) -> Result<Option<&'a [u8]>, &'static str> {
+    if !header.use_dict() {
+        return Ok(None);
+    }
+
+    let nblocks = if header.vl_blocks() {
+        header.blocksize as usize
+    } else {
+        header.nblocks()
+    };
+    let dict_size_pos = header
+        .header_len()
+        .checked_add(nblocks.checked_mul(4).ok_or("Invalid block table size")?)
+        .ok_or("Invalid dictionary offset")?;
+    let dict_size_end = dict_size_pos
+        .checked_add(4)
+        .ok_or("Invalid dictionary offset")?;
+    if dict_size_end > header.cbytes as usize || dict_size_end > chunk.len() {
+        return Err("Chunk too small for dictionary size");
+    }
+
+    let dict_size = i32::from_le_bytes(chunk[dict_size_pos..dict_size_end].try_into().unwrap());
+    if dict_size <= 0 || dict_size as usize > BLOSC2_MAXDICTSIZE {
+        return Err("Invalid dictionary size");
+    }
+    let dict_end = dict_size_end
+        .checked_add(dict_size as usize)
+        .ok_or("Invalid dictionary size")?;
+    if dict_end > header.cbytes as usize || dict_end > chunk.len() {
+        return Err("Chunk too small for dictionary");
+    }
+
+    Ok(Some(&chunk[dict_size_end..dict_end]))
 }
 
 /// Decompress a Blosc2 chunk.
@@ -875,11 +1383,158 @@ pub fn cbuffer_validate(chunk: &[u8]) -> Result<(), &'static str> {
     validate_header(&header, chunk.len())
 }
 
+fn vl_block_span<'a>(
+    chunk: &'a [u8],
+    header: &ChunkHeader,
+    nblock: usize,
+) -> Result<&'a [u8], &'static str> {
+    let nblocks = header.blocksize as usize;
+    if nblock >= nblocks {
+        return Err("VL-block index out of range");
+    }
+    let header_len = header.header_len();
+    let bstart_pos = header_len
+        .checked_add(nblock.checked_mul(4).ok_or("Invalid VL-block table size")?)
+        .ok_or("Invalid VL-block table offset")?;
+    let bstart_end = bstart_pos
+        .checked_add(4)
+        .ok_or("Invalid VL-block table offset")?;
+    if bstart_end > header.cbytes as usize || bstart_end > chunk.len() {
+        return Err("Chunk too small for VL-block table");
+    }
+    let start_i32 = i32::from_le_bytes(chunk[bstart_pos..bstart_end].try_into().unwrap());
+    if start_i32 < 0 {
+        return Err("Invalid negative VL-block offset");
+    }
+    let start = start_i32 as usize;
+    let mut min_start = header_len
+        .checked_add(
+            nblocks
+                .checked_mul(4)
+                .ok_or("Invalid VL-block table size")?,
+        )
+        .ok_or("Invalid VL-block table size")?;
+    if header.use_dict() {
+        let dict_size_end = min_start
+            .checked_add(4)
+            .ok_or("Invalid dictionary offset")?;
+        if dict_size_end > header.cbytes as usize || dict_size_end > chunk.len() {
+            return Err("Chunk too small for dictionary size");
+        }
+        let dict_size = i32::from_le_bytes(chunk[min_start..dict_size_end].try_into().unwrap());
+        if dict_size <= 0 || dict_size as usize > BLOSC2_MAXDICTSIZE {
+            return Err("Invalid dictionary size");
+        }
+        min_start = dict_size_end
+            .checked_add(dict_size as usize)
+            .ok_or("Invalid dictionary size")?;
+    }
+    if start < min_start || start > header.cbytes as usize || start > chunk.len() {
+        return Err("Invalid VL-block offset");
+    }
+
+    let end = if nblock + 1 < nblocks {
+        let next_pos = header_len + (nblock + 1) * 4;
+        let next_end = next_pos + 4;
+        if next_end > header.cbytes as usize || next_end > chunk.len() {
+            return Err("Chunk too small for VL-block table");
+        }
+        let next_i32 = i32::from_le_bytes(chunk[next_pos..next_end].try_into().unwrap());
+        if next_i32 < 0 {
+            return Err("Invalid negative VL-block offset");
+        }
+        next_i32 as usize
+    } else {
+        header.cbytes as usize
+    };
+    if end <= start || end > header.cbytes as usize || end > chunk.len() {
+        return Err("Invalid VL-block offset order");
+    }
+    Ok(&chunk[start..end])
+}
+
+/// Return the number of variable-length blocks in a VL-block chunk.
+pub fn vlchunk_get_nblocks(chunk: &[u8]) -> Result<usize, &'static str> {
+    let header = ChunkHeader::read(chunk)?;
+    validate_header(&header, chunk.len())?;
+    if !header.vl_blocks() {
+        return Err("Chunk does not use VL-blocks");
+    }
+    Ok(header.blocksize as usize)
+}
+
+/// Decompress one block from a VL-block chunk.
+pub fn vldecompress_block(chunk: &[u8], nblock: usize) -> Result<Vec<u8>, &'static str> {
+    let header = ChunkHeader::read(chunk)?;
+    validate_header(&header, chunk.len())?;
+    if !header.vl_blocks() {
+        return Err("Chunk does not use VL-blocks");
+    }
+
+    let span = vl_block_span(chunk, &header, nblock)?;
+    if span.len() < 4 {
+        return Err("VL-block span too small");
+    }
+    let bsize_i32 = i32::from_le_bytes(span[..4].try_into().unwrap());
+    if bsize_i32 <= 0 {
+        return Err("Invalid VL-block uncompressed size");
+    }
+    let bsize = bsize_i32 as usize;
+    let payload = &span[4..];
+    let typesize = header.typesize as usize;
+    let dict = embedded_dictionary(chunk, &header)?;
+
+    let mut filtered = vec![0u8; bsize];
+    if payload.len() == bsize {
+        filtered.copy_from_slice(payload);
+    } else {
+        let dsize = match dict {
+            Some(dict) => {
+                codecs::decompress_block_with_dict(header.compcode(), payload, &mut filtered, dict)
+            }
+            None => codecs::decompress_block_with_meta(
+                header.compcode(),
+                header.compcode_meta,
+                payload,
+                &mut filtered,
+            ),
+        };
+        if dsize < 0 || dsize as usize != bsize {
+            return Err("Codec decompression failed");
+        }
+    }
+
+    let mut scratch = vec![0u8; bsize];
+    let result_buf = filters::pipeline_backward(
+        &mut filtered,
+        &mut scratch,
+        bsize,
+        &header.filters,
+        &header.filters_meta,
+        typesize,
+        0,
+        None,
+        1,
+    );
+    if result_buf == 1 {
+        Ok(filtered)
+    } else {
+        Ok(scratch)
+    }
+}
+
+/// Decompress a VL-block chunk into individual block buffers.
+pub fn vldecompress(chunk: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
+    let nblocks = vlchunk_get_nblocks(chunk)?;
+    (0..nblocks)
+        .map(|nblock| vldecompress_block(chunk, nblock))
+        .collect()
+}
+
 /// Extract `nitems` logical items starting at `start` from a compressed chunk.
 ///
-/// `start` and `nitems` are item counts, not byte offsets. This currently
-/// decompresses the chunk and slices the result; it is correct but not yet a
-/// block-local partial decompressor.
+/// `start` and `nitems` are item counts, not byte offsets. Only the compressed
+/// blocks intersecting the requested byte range are decompressed.
 pub fn getitem(chunk: &[u8], start: usize, nitems: usize) -> Result<Vec<u8>, &'static str> {
     let header = ChunkHeader::read(chunk)?;
     validate_header(&header, chunk.len())?;
@@ -896,9 +1551,393 @@ pub fn getitem(chunk: &[u8], start: usize, nitems: usize) -> Result<Vec<u8>, &'s
     if byte_end > header.nbytes as usize {
         return Err("Item range out of bounds");
     }
+    if byte_len == 0 {
+        return Ok(Vec::new());
+    }
+    if header.vl_blocks() {
+        return getitem_vlblocks(chunk, &header, byte_start, byte_end, byte_len);
+    }
 
-    let data = decompress(chunk)?;
-    Ok(data[byte_start..byte_end].to_vec())
+    let nbytes = header.nbytes as usize;
+    let header_len = header.header_len();
+    let special = header.special_type();
+    if special != BLOSC2_NO_SPECIAL {
+        let data = decompress_special(chunk, &header, nbytes)?;
+        return Ok(data[byte_start..byte_end].to_vec());
+    }
+
+    if header.memcpyed() {
+        let payload_start = header_len
+            .checked_add(byte_start)
+            .ok_or("Item range overflow")?;
+        let payload_end = header_len
+            .checked_add(byte_end)
+            .ok_or("Item range overflow")?;
+        if payload_end > header.cbytes as usize || payload_end > chunk.len() {
+            return Err("Chunk too small for memcpyed data");
+        }
+        return Ok(chunk[payload_start..payload_end].to_vec());
+    }
+
+    let blocksize = header.blocksize as usize;
+    if blocksize == 0 {
+        return Err("Invalid blocksize");
+    }
+    let first_block = byte_start / blocksize;
+    let last_block = (byte_end - 1) / blocksize;
+    let nblocks = header.nblocks();
+    if last_block >= nblocks {
+        return Err("Item range out of bounds");
+    }
+
+    let dict = embedded_dictionary(chunk, &header)?;
+    let has_delta = header.filters.contains(&BLOSC_DELTA);
+    let block0_ref = if has_delta {
+        let block0_end = blocksize.min(nbytes);
+        Some(decompress_block_data(
+            chunk,
+            0,
+            0,
+            block0_end,
+            blocksize,
+            nblocks == 1 && block0_end < blocksize,
+            &header,
+            Some(&vec![0u8; blocksize.min(nbytes)]),
+            dict,
+        )?)
+    } else {
+        None
+    };
+
+    let mut out = Vec::with_capacity(byte_len);
+    for block_idx in first_block..=last_block {
+        let block_start = block_idx * blocksize;
+        let block_end = (block_start + blocksize).min(nbytes);
+        let bsize = block_end - block_start;
+        let is_leftover = block_idx == nblocks - 1 && bsize < blocksize;
+
+        let block_data = if has_delta && block_idx == 0 {
+            block0_ref
+                .as_ref()
+                .ok_or("Missing delta reference block")?
+                .clone()
+        } else {
+            decompress_block_data(
+                chunk,
+                block_idx,
+                block_start,
+                bsize,
+                blocksize,
+                is_leftover,
+                &header,
+                block0_ref.as_deref(),
+                dict,
+            )?
+        };
+
+        let local_start = byte_start.saturating_sub(block_start);
+        let local_end = byte_end.min(block_end) - block_start;
+        out.extend_from_slice(&block_data[local_start..local_end]);
+    }
+
+    Ok(out)
+}
+
+fn getitem_vlblocks(
+    chunk: &[u8],
+    header: &ChunkHeader,
+    byte_start: usize,
+    byte_end: usize,
+    byte_len: usize,
+) -> Result<Vec<u8>, &'static str> {
+    let nblocks = header.blocksize as usize;
+    let mut out = Vec::with_capacity(byte_len);
+    let mut block_start = 0usize;
+
+    for block_idx in 0..nblocks {
+        let span = vl_block_span(chunk, header, block_idx)?;
+        if span.len() < 4 {
+            return Err("VL-block span too small");
+        }
+        let bsize_i32 = i32::from_le_bytes(span[..4].try_into().unwrap());
+        if bsize_i32 <= 0 {
+            return Err("Invalid VL-block uncompressed size");
+        }
+        let bsize = bsize_i32 as usize;
+        let block_end = block_start
+            .checked_add(bsize)
+            .ok_or("VL-block sizes overflow")?;
+
+        if block_end > byte_start && block_start < byte_end {
+            let block = vldecompress_block(chunk, block_idx)?;
+            if block.len() != bsize {
+                return Err("Invalid VL-block uncompressed size");
+            }
+            let local_start = byte_start.saturating_sub(block_start);
+            let local_end = byte_end.min(block_end) - block_start;
+            out.extend_from_slice(&block[local_start..local_end]);
+        }
+        if block_end >= byte_end {
+            break;
+        }
+        block_start = block_end;
+    }
+
+    if out.len() != byte_len {
+        return Err("VL-block sizes do not add up to chunk nbytes");
+    }
+    Ok(out)
+}
+
+fn read_block_payload_spans(
+    chunk: &[u8],
+    header: &ChunkHeader,
+    min_payload_start: usize,
+) -> Result<Vec<std::ops::Range<usize>>, &'static str> {
+    let nblocks = header.nblocks();
+    let header_len = header.header_len();
+    let chunk_limit = header.cbytes as usize;
+    let mut spans = Vec::with_capacity(nblocks);
+
+    for block_idx in 0..nblocks {
+        let bstart_pos = header_len
+            .checked_add(block_idx.checked_mul(4).ok_or("Invalid block table size")?)
+            .ok_or("Invalid block table offset")?;
+        let bstart_end = bstart_pos
+            .checked_add(4)
+            .ok_or("Invalid block table offset")?;
+        if bstart_end > chunk_limit || bstart_end > chunk.len() {
+            return Err("Chunk too small for bstarts");
+        }
+
+        let start_i32 = i32::from_le_bytes(chunk[bstart_pos..bstart_end].try_into().unwrap());
+        if start_i32 < 0 {
+            return Err("Invalid negative block offset");
+        }
+        let start = start_i32 as usize;
+        if start < min_payload_start || start > chunk_limit || start > chunk.len() {
+            return Err("Invalid block offset");
+        }
+
+        let end = if block_idx + 1 < nblocks {
+            let next_pos = header_len
+                .checked_add(
+                    (block_idx + 1)
+                        .checked_mul(4)
+                        .ok_or("Invalid block table size")?,
+                )
+                .ok_or("Invalid block table offset")?;
+            let next_end = next_pos
+                .checked_add(4)
+                .ok_or("Invalid block table offset")?;
+            if next_end > chunk_limit || next_end > chunk.len() {
+                return Err("Chunk too small for bstarts");
+            }
+            let next_i32 = i32::from_le_bytes(chunk[next_pos..next_end].try_into().unwrap());
+            if next_i32 < 0 {
+                return Err("Invalid negative block offset");
+            }
+            next_i32 as usize
+        } else {
+            chunk_limit
+        };
+
+        if end < start || end > chunk_limit || end > chunk.len() {
+            return Err("Invalid block offset order");
+        }
+        spans.push(start..end);
+    }
+
+    Ok(spans)
+}
+
+/// Replace a byte range by recompressing only the compressed blocks it touches.
+///
+/// Returns `Ok(None)` when callers should fall back to a full chunk rewrite.
+pub fn replace_aligned_blocks(
+    chunk: &[u8],
+    byte_start: usize,
+    data: &[u8],
+    cparams: &CParams,
+) -> Result<Option<Vec<u8>>, &'static str> {
+    let header = ChunkHeader::read(chunk)?;
+    validate_header(&header, chunk.len())?;
+    if data.is_empty() {
+        return Ok(Some(chunk.to_vec()));
+    }
+
+    let nbytes = header.nbytes as usize;
+    let byte_end = byte_start
+        .checked_add(data.len())
+        .ok_or("Item range overflow")?;
+    if byte_end > nbytes {
+        return Err("Item range out of bounds");
+    }
+    if header.vl_blocks() || header.special_type() != BLOSC2_NO_SPECIAL {
+        return Ok(None);
+    }
+
+    let header_len = header.header_len();
+    if header.memcpyed() {
+        let payload_start = header_len
+            .checked_add(byte_start)
+            .ok_or("Item range overflow")?;
+        let payload_end = header_len
+            .checked_add(byte_end)
+            .ok_or("Item range overflow")?;
+        if payload_end > header.cbytes as usize || payload_end > chunk.len() {
+            return Err("Chunk too small for memcpyed data");
+        }
+        let mut updated = chunk.to_vec();
+        updated[payload_start..payload_end].copy_from_slice(data);
+        return Ok(Some(updated));
+    }
+
+    let blocksize = header.blocksize as usize;
+    if blocksize == 0 {
+        return Ok(None);
+    }
+    let first_block = byte_start / blocksize;
+    let last_block = (byte_end - 1) / blocksize;
+
+    let nblocks = header.nblocks();
+    if last_block >= nblocks {
+        return Err("Item range out of bounds");
+    }
+    if cparams.compcode != header.compcode()
+        || cparams.typesize as u8 != header.typesize
+        || cparams.filters != header.filters
+        || cparams.filters_meta != header.filters_meta
+    {
+        return Ok(None);
+    }
+
+    let has_delta = header.filters.contains(&BLOSC_DELTA);
+    if has_delta && first_block == 0 {
+        let block0_end = blocksize.min(nbytes);
+        if byte_start != 0 || byte_end < block0_end || last_block + 1 < nblocks {
+            return Ok(None);
+        }
+    }
+
+    let dict = embedded_dictionary(chunk, &header)?;
+    let table_end = header_len
+        .checked_add(nblocks.checked_mul(4).ok_or("Invalid block table size")?)
+        .ok_or("Invalid block table size")?;
+    let min_payload_start = table_end
+        .checked_add(dict.map_or(0, |dict| 4 + dict.len()))
+        .ok_or("Invalid dictionary size")?;
+    let old_spans = read_block_payload_spans(chunk, &header, min_payload_start)?;
+
+    let delta_ref = if has_delta && first_block == 0 {
+        Some(data[..blocksize.min(data.len())].to_vec())
+    } else if has_delta {
+        let block0_end = blocksize.min(nbytes);
+        Some(decompress_block_data(
+            chunk,
+            0,
+            0,
+            block0_end,
+            blocksize,
+            nblocks == 1 && block0_end < blocksize,
+            &header,
+            Some(&vec![0u8; blocksize.min(nbytes)]),
+            dict,
+        )?)
+    } else {
+        None
+    };
+
+    let mut block_payloads: Vec<Vec<u8>> = Vec::with_capacity(nblocks);
+    for (block_idx, old_span) in old_spans.iter().enumerate() {
+        if block_idx < first_block || block_idx > last_block {
+            block_payloads.push(chunk[old_span.clone()].to_vec());
+            continue;
+        }
+
+        let block_start = block_idx * blocksize;
+        let block_end = (block_start + blocksize).min(nbytes);
+        let bsize = block_end - block_start;
+        let is_leftover = block_idx == nblocks - 1 && bsize < blocksize;
+        let mut block_data;
+        let replacement_start = byte_start.max(block_start);
+        let replacement_end = byte_end.min(block_end);
+        let local_start = replacement_start - block_start;
+        let local_end = replacement_end - block_start;
+
+        if local_start == 0 && local_end == bsize {
+            let data_start = replacement_start - byte_start;
+            block_data = data[data_start..data_start + bsize].to_vec();
+        } else {
+            let old_block = decompress_block_data(
+                chunk,
+                block_idx,
+                block_start,
+                bsize,
+                blocksize,
+                is_leftover,
+                &header,
+                delta_ref.as_deref(),
+                dict,
+            )?;
+            block_data = old_block;
+            let data_start = replacement_start - byte_start;
+            block_data[local_start..local_end]
+                .copy_from_slice(&data[data_start..data_start + (local_end - local_start)]);
+        }
+
+        let mut buf1 = vec![0u8; bsize];
+        let mut buf2 = vec![0u8; bsize];
+        let filtered_buf = filters::pipeline_forward(
+            &block_data,
+            &mut buf1,
+            &mut buf2,
+            &header.filters,
+            &header.filters_meta,
+            header.typesize as usize,
+            block_start,
+            delta_ref.as_deref(),
+        );
+        let filtered = if filtered_buf == 1 {
+            &buf1[..bsize]
+        } else {
+            &buf2[..bsize]
+        };
+        let (block_payload, _) = compress_pre_filtered_block(
+            filtered,
+            cparams,
+            header.dont_split(),
+            header.typesize as usize,
+            is_leftover,
+            dict,
+        );
+        block_payloads.push(block_payload);
+    }
+
+    let total_len = block_payloads
+        .iter()
+        .try_fold(min_payload_start, |acc, payload| {
+            acc.checked_add(payload.len()).ok_or("Chunk too large")
+        })?;
+    if total_len > i32::MAX as usize {
+        return Err("Chunk too large");
+    }
+
+    let mut output = vec![0u8; table_end];
+    output[..header_len].copy_from_slice(&chunk[..header_len]);
+    output.extend_from_slice(&chunk[table_end..min_payload_start]);
+
+    for (block_idx, payload) in block_payloads.iter().enumerate() {
+        let bstart_offset = header_len + block_idx * 4;
+        let payload_offset = output.len() as i32;
+        output[bstart_offset..bstart_offset + 4].copy_from_slice(&payload_offset.to_le_bytes());
+        output.extend_from_slice(payload);
+    }
+
+    let mut updated_header = header;
+    updated_header.cbytes = output.len() as i32;
+    updated_header.try_write(&mut output[..header_len])?;
+    Ok(Some(output))
 }
 
 /// Blosc1-style compression wrapper using the default BloscLZ codec.
@@ -957,6 +1996,18 @@ pub fn decompress_with_threads(chunk: &[u8], nthreads: i16) -> Result<Vec<u8>, &
         return Ok(Vec::new());
     }
 
+    if header.vl_blocks() {
+        let blocks = vldecompress(chunk)?;
+        let mut output = Vec::with_capacity(nbytes);
+        for block in blocks {
+            output.extend(block);
+        }
+        if output.len() != nbytes {
+            return Err("VL-block sizes do not add up to chunk nbytes");
+        }
+        return Ok(output);
+    }
+
     let blocksize = header.blocksize as usize;
     let nblocks = header.nblocks();
     let header_len = header.header_len();
@@ -974,6 +2025,8 @@ pub fn decompress_with_threads(chunk: &[u8], nthreads: i16) -> Result<Vec<u8>, &
         }
         return Err("Chunk too small for memcpyed data");
     }
+
+    let dict = embedded_dictionary(chunk, &header)?;
 
     // Check if delta filter is used (needs sequential block 0 first)
     let has_delta = header.filters.contains(&BLOSC_DELTA);
@@ -993,6 +2046,7 @@ pub fn decompress_with_threads(chunk: &[u8], nthreads: i16) -> Result<Vec<u8>, &
             nblocks == 1 && block0_end < blocksize,
             &header,
             Some(&output[..blocksize.min(output.len())]),
+            dict,
         )?;
         output[..block0_end].copy_from_slice(&block0_data);
 
@@ -1012,6 +2066,7 @@ pub fn decompress_with_threads(chunk: &[u8], nthreads: i16) -> Result<Vec<u8>, &
                 is_leftover,
                 &header,
                 Some(&output[..blocksize.min(output.len())]),
+                dict,
             )?;
             output[block_start..block_end].copy_from_slice(&block_data);
         }
@@ -1027,22 +2082,26 @@ pub fn decompress_with_threads(chunk: &[u8], nthreads: i16) -> Result<Vec<u8>, &
             })
             .collect();
 
-        let results: Vec<Result<(usize, Vec<u8>), &'static str>> = block_infos
-            .par_iter()
-            .map(|&(idx, start, bsize, is_leftover)| {
-                let data = decompress_block_data(
-                    chunk,
-                    idx,
-                    start,
-                    bsize,
-                    blocksize,
-                    is_leftover,
-                    &header,
-                    None,
-                )?;
-                Ok((start, data))
-            })
-            .collect();
+        let results: Vec<Result<(usize, Vec<u8>), &'static str>> =
+            with_thread_pool(nthreads, || {
+                block_infos
+                    .par_iter()
+                    .map(|&(idx, start, bsize, is_leftover)| {
+                        let data = decompress_block_data(
+                            chunk,
+                            idx,
+                            start,
+                            bsize,
+                            blocksize,
+                            is_leftover,
+                            &header,
+                            None,
+                            dict,
+                        )?;
+                        Ok((start, data))
+                    })
+                    .collect()
+            });
 
         for result in results {
             let (start, data) = result?;
@@ -1065,6 +2124,7 @@ pub fn decompress_with_threads(chunk: &[u8], nthreads: i16) -> Result<Vec<u8>, &
                 is_leftover,
                 &header,
                 None,
+                dict,
             )?;
             output[block_start..block_end].copy_from_slice(&block_data);
         }
@@ -1182,6 +2242,53 @@ mod tests {
         let mut truncated = compressed.clone();
         truncated.truncate(truncated.len() - 1);
         assert!(cbuffer_validate(&truncated).is_err());
+    }
+
+    #[test]
+    fn test_getitem_decompresses_only_touched_blocks() {
+        let data: Vec<u8> = (0..512u32).flat_map(|i| i.to_le_bytes()).collect();
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 4,
+            blocksize: 128,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            ..Default::default()
+        };
+        let mut compressed = compress(&data, &cparams).unwrap();
+        let header = ChunkHeader::read(&compressed).unwrap();
+        assert!(header.nblocks() > 2);
+
+        let block2_bstart = BLOSC_EXTENDED_HEADER_LENGTH + 2 * 4;
+        compressed[block2_bstart..block2_bstart + 4].copy_from_slice(&(-1i32).to_le_bytes());
+        assert!(decompress(&compressed).is_err());
+
+        let items = getitem(&compressed, 4, 8).unwrap();
+        assert_eq!(items, data[4 * 4..12 * 4]);
+    }
+
+    #[test]
+    fn test_getitem_block_local_with_delta_and_dictionary() {
+        let data: Vec<u8> = (0..8192u32).flat_map(|i| (i % 257).to_le_bytes()).collect();
+        for (filters, use_dict) in [
+            ([0, 0, 0, 0, BLOSC_DELTA, BLOSC_SHUFFLE], false),
+            ([0, 0, 0, 0, 0, BLOSC_SHUFFLE], true),
+        ] {
+            let cparams = CParams {
+                compcode: BLOSC_ZSTD,
+                clevel: 5,
+                typesize: 4,
+                blocksize: 1024,
+                splitmode: BLOSC_NEVER_SPLIT,
+                filters,
+                use_dict,
+                ..Default::default()
+            };
+            let compressed = compress(&data, &cparams).unwrap();
+            let items = getitem(&compressed, 300, 600).unwrap();
+            assert_eq!(items, data[300 * 4..900 * 4]);
+        }
     }
 
     #[test]
@@ -1525,6 +2632,169 @@ mod tests {
         let compressed = compress(&data, &cparams).unwrap();
         let decompressed = decompress_with_threads(&compressed, 4).unwrap();
         assert_eq!(data, decompressed);
+    }
+
+    #[test]
+    fn test_zstd_dictionary_chunk_roundtrip() {
+        let data: Vec<u8> = (0..200_000u32)
+            .flat_map(|i| {
+                let value = i % 4096;
+                value.to_le_bytes()
+            })
+            .collect();
+        let cparams = CParams {
+            compcode: BLOSC_ZSTD,
+            clevel: 5,
+            typesize: 4,
+            blocksize: 4096,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            use_dict: true,
+            ..Default::default()
+        };
+
+        let compressed = compress(&data, &cparams).unwrap();
+        let header = ChunkHeader::read(&compressed).unwrap();
+        assert!(header.use_dict());
+        assert!(embedded_dictionary(&compressed, &header).unwrap().is_some());
+
+        let decompressed = decompress_with_threads(&compressed, 4).unwrap();
+        assert_eq!(data, decompressed);
+    }
+
+    fn sequence_codec_compress(_clevel: u8, meta: u8, src: &[u8], dest: &mut [u8]) -> i32 {
+        if src.len() < 2 || dest.len() < 3 {
+            return 0;
+        }
+        dest[0] = src[0];
+        dest[1] = src[1].wrapping_sub(src[0]);
+        dest[2] = meta;
+        3
+    }
+
+    fn sequence_codec_decompress(meta: u8, src: &[u8], dest: &mut [u8]) -> i32 {
+        if src.len() != 3 || src[2] != meta {
+            return -1;
+        }
+        for (idx, byte) in dest.iter_mut().enumerate() {
+            *byte = src[0].wrapping_add(src[1].wrapping_mul(idx as u8));
+        }
+        dest.len() as i32
+    }
+
+    #[test]
+    fn test_user_defined_codec_roundtrip_and_metadata() {
+        const CODEC_ID: u8 = 200;
+        codecs::register_codec(CODEC_ID, sequence_codec_compress, sequence_codec_decompress)
+            .unwrap();
+
+        let data: Vec<u8> = (0..200u8).collect();
+        let cparams = CParams {
+            compcode: CODEC_ID,
+            compcode_meta: 17,
+            clevel: 5,
+            typesize: 1,
+            blocksize: 200,
+            filters: [0; BLOSC2_MAX_FILTERS],
+            ..Default::default()
+        };
+
+        let compressed = compress(&data, &cparams).unwrap();
+        let header = ChunkHeader::read(&compressed).unwrap();
+        assert_eq!(header.compcode(), CODEC_ID);
+        assert_eq!(header.compcode_meta, 17);
+        assert_eq!(decompress(&compressed).unwrap(), data);
+    }
+
+    #[test]
+    fn test_dictionary_falls_back_for_small_payload() {
+        let data = b"small payload";
+        let cparams = CParams {
+            compcode: BLOSC_ZSTD,
+            clevel: 5,
+            typesize: 1,
+            use_dict: true,
+            ..Default::default()
+        };
+
+        let compressed = compress(data, &cparams).unwrap();
+        let header = ChunkHeader::read(&compressed).unwrap();
+        assert!(!header.use_dict());
+        assert_eq!(decompress(&compressed).unwrap(), data);
+    }
+
+    #[test]
+    fn test_vlblocks_roundtrip() {
+        let blocks: [&[u8]; 3] = [b"red\0", b"green-green\0", b"blue-blue-blue-blue\0"];
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 1,
+            nthreads: 4,
+            ..Default::default()
+        };
+
+        let compressed = vlcompress(&blocks, &cparams).unwrap();
+        let header = ChunkHeader::read(&compressed).unwrap();
+        assert!(header.vl_blocks());
+        assert_eq!(header.version, BLOSC2_VERSION_FORMAT_VL_BLOCKS);
+        assert_eq!(vlchunk_get_nblocks(&compressed).unwrap(), 3);
+
+        let split = vldecompress(&compressed).unwrap();
+        assert_eq!(
+            split,
+            blocks
+                .iter()
+                .map(|block| block.to_vec())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            vldecompress_block(&compressed, 1).unwrap(),
+            b"green-green\0"
+        );
+        assert_eq!(
+            decompress(&compressed).unwrap(),
+            b"red\0green-green\0blue-blue-blue-blue\0"
+        );
+        assert_eq!(getitem(&compressed, 2, 16).unwrap(), b"d\0green-green\0bl");
+    }
+
+    #[test]
+    fn test_zstd_dictionary_vlblocks_roundtrip() {
+        let blocks: Vec<Vec<u8>> = (0..64)
+            .map(|i| {
+                format!(
+                    "{{\"id\":\"ingredient-{i:03}\",\"vegan\":\"{}\",\"percent\":{},\"text\":\"INGREDIENT NUMBER {i:03}\"}}",
+                    if i % 3 == 0 { "maybe" } else { "yes" },
+                    i % 17
+                )
+                .into_bytes()
+            })
+            .collect();
+        let block_refs: Vec<&[u8]> = blocks.iter().map(Vec::as_slice).collect();
+        let cparams = CParams {
+            compcode: BLOSC_ZSTD,
+            clevel: 5,
+            typesize: 1,
+            nthreads: 4,
+            use_dict: true,
+            ..Default::default()
+        };
+
+        let compressed = vlcompress(&block_refs, &cparams).unwrap();
+        let header = ChunkHeader::read(&compressed).unwrap();
+        assert!(header.vl_blocks());
+        assert!(header.use_dict());
+        assert!(embedded_dictionary(&compressed, &header).unwrap().is_some());
+
+        assert_eq!(vldecompress(&compressed).unwrap(), blocks);
+        assert_eq!(vldecompress_block(&compressed, 17).unwrap(), blocks[17]);
+        let expected_concat: Vec<u8> = blocks.iter().flatten().copied().collect();
+        assert_eq!(decompress(&compressed).unwrap(), expected_concat);
+        assert_eq!(
+            getitem(&compressed, 10, 128).unwrap(),
+            expected_concat[10..138]
+        );
     }
 
     #[test]

@@ -18,6 +18,8 @@ pub const BLOSC2_MAX_OVERHEAD: usize = BLOSC_EXTENDED_HEADER_LENGTH;
 pub const BLOSC2_MAX_BUFFERSIZE: i32 = i32::MAX - BLOSC2_MAX_OVERHEAD as i32;
 pub const BLOSC_MIN_BUFFERSIZE: usize = 32;
 pub const BLOSC_MAX_TYPESIZE: usize = 255;
+pub const BLOSC2_MAXDICTSIZE: usize = 32 * 1024;
+pub const BLOSC2_MINUSEFULDICT: usize = 256;
 
 // Filters
 pub const BLOSC2_MAX_FILTERS: usize = 6;
@@ -26,6 +28,7 @@ pub const BLOSC_SHUFFLE: u8 = 1;
 pub const BLOSC_BITSHUFFLE: u8 = 2;
 pub const BLOSC_DELTA: u8 = 3;
 pub const BLOSC_TRUNC_PREC: u8 = 4;
+pub const BLOSC2_USER_DEFINED_FILTERS_START: u8 = 32;
 
 // Codecs
 pub const BLOSC_BLOSCLZ: u8 = 0;
@@ -33,6 +36,7 @@ pub const BLOSC_LZ4: u8 = 1;
 pub const BLOSC_LZ4HC: u8 = 2;
 pub const BLOSC_ZLIB: u8 = 4;
 pub const BLOSC_ZSTD: u8 = 5;
+pub const BLOSC2_USER_DEFINED_CODECS_START: u8 = 32;
 
 // Codec format codes (for header flags bits 5-7)
 pub const BLOSC_BLOSCLZ_FORMAT: u8 = 0;

@@ -1,29 +1,115 @@
 pub mod blosclz;
 
 use crate::constants::*;
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+
+pub type CodecCompressFn = fn(clevel: u8, meta: u8, src: &[u8], dest: &mut [u8]) -> i32;
+pub type CodecDecompressFn = fn(meta: u8, src: &[u8], dest: &mut [u8]) -> i32;
+
+#[derive(Clone, Copy)]
+struct UserCodec {
+    compress: CodecCompressFn,
+    decompress: CodecDecompressFn,
+}
+
+static USER_CODECS: OnceLock<RwLock<HashMap<u8, UserCodec>>> = OnceLock::new();
+
+fn user_codecs() -> &'static RwLock<HashMap<u8, UserCodec>> {
+    USER_CODECS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub fn register_codec(
+    compcode: u8,
+    compress: CodecCompressFn,
+    decompress: CodecDecompressFn,
+) -> Result<(), &'static str> {
+    if compcode < BLOSC2_USER_DEFINED_CODECS_START {
+        return Err("User-defined codec IDs must be >= 32");
+    }
+    user_codecs()
+        .write()
+        .map_err(|_| "Codec registry poisoned")?
+        .insert(
+            compcode,
+            UserCodec {
+                compress,
+                decompress,
+            },
+        );
+    Ok(())
+}
+
+pub fn is_registered_codec(compcode: u8) -> bool {
+    user_codecs()
+        .read()
+        .is_ok_and(|codecs| codecs.contains_key(&compcode))
+}
 
 /// Compress a block using the specified codec.
 /// Returns the number of compressed bytes, or 0 if incompressible.
 pub fn compress_block(compcode: u8, clevel: u8, src: &[u8], dest: &mut [u8]) -> i32 {
+    compress_block_with_meta(compcode, clevel, 0, src, dest)
+}
+
+pub fn compress_block_with_meta(
+    compcode: u8,
+    clevel: u8,
+    meta: u8,
+    src: &[u8],
+    dest: &mut [u8],
+) -> i32 {
     match compcode {
         BLOSC_BLOSCLZ => blosclz::compress(clevel as i32, src, dest),
         BLOSC_LZ4 => lz4_compress(src, dest),
         BLOSC_LZ4HC => lz4hc_compress(clevel, src, dest),
         BLOSC_ZLIB => zlib_compress(src, dest, clevel),
         BLOSC_ZSTD => zstd_compress(src, dest, clevel),
-        _ => 0,
+        _ => user_codecs()
+            .read()
+            .ok()
+            .and_then(|codecs| codecs.get(&compcode).copied())
+            .map_or(0, |codec| (codec.compress)(clevel, meta, src, dest)),
+    }
+}
+
+pub fn compress_block_with_dict(
+    compcode: u8,
+    clevel: u8,
+    src: &[u8],
+    dest: &mut [u8],
+    dict: &[u8],
+) -> i32 {
+    match compcode {
+        BLOSC_ZSTD => zstd_compress_with_dict(src, dest, clevel, dict),
+        _ => compress_block(compcode, clevel, src, dest),
     }
 }
 
 /// Decompress a block using the specified codec.
 /// Returns the number of decompressed bytes, or negative on error.
 pub fn decompress_block(compcode: u8, src: &[u8], dest: &mut [u8]) -> i32 {
+    decompress_block_with_meta(compcode, 0, src, dest)
+}
+
+pub fn decompress_block_with_meta(compcode: u8, meta: u8, src: &[u8], dest: &mut [u8]) -> i32 {
     match compcode {
         BLOSC_BLOSCLZ => blosclz::decompress(src, dest),
         BLOSC_LZ4 | BLOSC_LZ4HC => lz4_decompress(src, dest),
         BLOSC_ZLIB => zlib_decompress(src, dest),
         BLOSC_ZSTD => zstd_decompress(src, dest),
-        _ => -1,
+        _ => user_codecs()
+            .read()
+            .ok()
+            .and_then(|codecs| codecs.get(&compcode).copied())
+            .map_or(-1, |codec| (codec.decompress)(meta, src, dest)),
+    }
+}
+
+pub fn decompress_block_with_dict(compcode: u8, src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
+    match compcode {
+        BLOSC_ZSTD => zstd_decompress_with_dict(src, dest, dict),
+        _ => decompress_block(compcode, src, dest),
     }
 }
 
@@ -115,9 +201,27 @@ fn zstd_compress(src: &[u8], dest: &mut [u8], clevel: u8) -> i32 {
     }
 }
 
+fn zstd_compress_with_dict(src: &[u8], dest: &mut [u8], clevel: u8, dict: &[u8]) -> i32 {
+    match zstd::bulk::Compressor::with_dictionary(clevel as i32, dict)
+        .and_then(|mut compressor| compressor.compress_to_buffer(src, dest))
+    {
+        Ok(n) => n as i32,
+        Err(_) => 0,
+    }
+}
+
 fn zstd_decompress(src: &[u8], dest: &mut [u8]) -> i32 {
     // Use decompress_to_buffer to write directly into dest
     match zstd::bulk::decompress_to_buffer(src, dest) {
+        Ok(n) => n as i32,
+        Err(_) => -1,
+    }
+}
+
+fn zstd_decompress_with_dict(src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
+    match zstd::bulk::Decompressor::with_dictionary(dict)
+        .and_then(|mut decompressor| decompressor.decompress_to_buffer(src, dest))
+    {
         Ok(n) => n as i32,
         Err(_) => -1,
     }
