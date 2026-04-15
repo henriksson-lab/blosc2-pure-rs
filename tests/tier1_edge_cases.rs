@@ -3,11 +3,12 @@
 
 use blosc2_pure_rs::compress::{compress, decompress, CParams};
 use blosc2_pure_rs::constants::*;
+mod common;
 use blosc2_pure_rs::filters;
-use blosc2_pure_rs::ffi;
+use common::ffi;
 
-fn init() -> blosc2_pure_rs::Blosc2 {
-    blosc2_pure_rs::Blosc2::new()
+fn init() -> common::Blosc2 {
+    common::Blosc2::new()
 }
 
 // ─── Block splitting modes ───────────────────────────────────────
@@ -69,7 +70,11 @@ fn test_split_mode_cross_compat_with_c() {
     let _b = init();
     let data: Vec<u8> = (0..10000u32).flat_map(|i| i.to_le_bytes()).collect();
 
-    for splitmode in [BLOSC_ALWAYS_SPLIT, BLOSC_NEVER_SPLIT, BLOSC_FORWARD_COMPAT_SPLIT] {
+    for splitmode in [
+        BLOSC_ALWAYS_SPLIT,
+        BLOSC_NEVER_SPLIT,
+        BLOSC_FORWARD_COMPAT_SPLIT,
+    ] {
         let cparams = CParams {
             compcode: BLOSC_LZ4,
             clevel: 5,
@@ -84,14 +89,21 @@ fn test_split_mode_cross_compat_with_c() {
         let mut c_restored = vec![0u8; data.len()];
         let dsize = unsafe {
             ffi::blosc2_decompress(
-                chunk.as_ptr() as *const _, chunk.len() as i32,
-                c_restored.as_mut_ptr() as *mut _, c_restored.len() as i32,
+                chunk.as_ptr() as *const _,
+                chunk.len() as i32,
+                c_restored.as_mut_ptr() as *mut _,
+                c_restored.len() as i32,
             )
         };
-        assert_eq!(dsize, data.len() as i32,
-            "C decompress failed for splitmode={splitmode}");
-        assert_eq!(data, c_restored,
-            "C decompress mismatch for splitmode={splitmode}");
+        assert_eq!(
+            dsize,
+            data.len() as i32,
+            "C decompress failed for splitmode={splitmode}"
+        );
+        assert_eq!(
+            data, c_restored,
+            "C decompress mismatch for splitmode={splitmode}"
+        );
     }
 }
 
@@ -99,7 +111,9 @@ fn test_split_mode_cross_compat_with_c() {
 
 #[test]
 fn test_typesize_16() {
-    let data: Vec<u8> = (0..5000u16).map(|i| (i.wrapping_mul(7) & 0xFF) as u8).collect();
+    let data: Vec<u8> = (0..5000u16)
+        .map(|i| (i.wrapping_mul(7) & 0xFF) as u8)
+        .collect();
     let cparams = CParams {
         compcode: BLOSC_LZ4,
         clevel: 5,
@@ -113,7 +127,9 @@ fn test_typesize_16() {
 
 #[test]
 fn test_typesize_32() {
-    let data: Vec<u8> = (0..10000u16).map(|i| (i.wrapping_mul(13) & 0xFF) as u8).collect();
+    let data: Vec<u8> = (0..10000u16)
+        .map(|i| (i.wrapping_mul(13) & 0xFF) as u8)
+        .collect();
     let cparams = CParams {
         compcode: BLOSC_ZSTD,
         clevel: 5,
@@ -127,7 +143,9 @@ fn test_typesize_32() {
 
 #[test]
 fn test_typesize_64() {
-    let data: Vec<u8> = (0..20000u16).map(|i| (i.wrapping_mul(11) & 0xFF) as u8).collect();
+    let data: Vec<u8> = (0..20000u16)
+        .map(|i| (i.wrapping_mul(11) & 0xFF) as u8)
+        .collect();
     let cparams = CParams {
         compcode: BLOSC_LZ4,
         clevel: 5,
@@ -141,7 +159,9 @@ fn test_typesize_64() {
 
 #[test]
 fn test_typesize_128() {
-    let data: Vec<u8> = (0..20000u16).map(|i| (i.wrapping_add(42) & 0xFF) as u8).collect();
+    let data: Vec<u8> = (0..20000u16)
+        .map(|i| (i.wrapping_add(42) & 0xFF) as u8)
+        .collect();
     let cparams = CParams {
         compcode: BLOSC_BLOSCLZ,
         clevel: 5,
@@ -178,7 +198,10 @@ fn test_large_typesize_shuffle_roundtrip() {
 
         filters::shuffle(typesize, &data, &mut shuffled);
         filters::unshuffle(typesize, &shuffled, &mut restored);
-        assert_eq!(data, restored, "Shuffle roundtrip failed for typesize={typesize}");
+        assert_eq!(
+            data, restored,
+            "Shuffle roundtrip failed for typesize={typesize}"
+        );
     }
 }
 
@@ -264,7 +287,10 @@ fn test_incompressible_random_data() {
         };
         let chunk = compress(&data, &cparams).unwrap();
         let restored = decompress(&chunk).unwrap();
-        assert_eq!(data, restored, "Incompressible roundtrip failed for codec={compcode}");
+        assert_eq!(
+            data, restored,
+            "Incompressible roundtrip failed for codec={compcode}"
+        );
     }
 }
 
@@ -305,11 +331,17 @@ fn test_incompressible_cross_compat_c() {
     let mut c_restored = vec![0u8; data.len()];
     let dsize = unsafe {
         ffi::blosc2_decompress(
-            chunk.as_ptr() as *const _, chunk.len() as i32,
-            c_restored.as_mut_ptr() as *mut _, c_restored.len() as i32,
+            chunk.as_ptr() as *const _,
+            chunk.len() as i32,
+            c_restored.as_mut_ptr() as *mut _,
+            c_restored.len() as i32,
         )
     };
-    assert_eq!(dsize, data.len() as i32, "C decompress of incompressible data failed");
+    assert_eq!(
+        dsize,
+        data.len() as i32,
+        "C decompress of incompressible data failed"
+    );
     assert_eq!(data, c_restored);
 }
 
@@ -318,7 +350,11 @@ fn test_incompressible_cross_compat_c() {
 #[test]
 fn test_all_clevels() {
     let data: Vec<u8> = b"Repeated pattern for clevel testing! "
-        .iter().cycle().take(50000).copied().collect();
+        .iter()
+        .cycle()
+        .take(50000)
+        .copied()
+        .collect();
 
     for clevel in 0..=9u8 {
         for compcode in [BLOSC_BLOSCLZ, BLOSC_LZ4, BLOSC_ZSTD] {
@@ -330,8 +366,10 @@ fn test_all_clevels() {
             };
             let chunk = compress(&data, &cparams).unwrap();
             let restored = decompress(&chunk).unwrap();
-            assert_eq!(data, restored,
-                "clevel={clevel} codec={compcode} roundtrip failed");
+            assert_eq!(
+                data, restored,
+                "clevel={clevel} codec={compcode} roundtrip failed"
+            );
         }
     }
 }

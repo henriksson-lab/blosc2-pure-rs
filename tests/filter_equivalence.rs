@@ -1,9 +1,10 @@
 #![cfg(feature = "_ffi")]
-use blosc2_pure_rs::ffi;
+mod common;
 use blosc2_pure_rs::filters;
+use common::ffi;
 
-fn init_blosc2() -> blosc2_pure_rs::Blosc2 {
-    blosc2_pure_rs::Blosc2::new()
+fn init_blosc2() -> common::Blosc2 {
+    common::Blosc2::new()
 }
 
 #[test]
@@ -29,10 +30,7 @@ fn test_shuffle_matches_c() {
             );
         }
 
-        assert_eq!(
-            rust_out, c_out,
-            "Shuffle mismatch for typesize={typesize}"
-        );
+        assert_eq!(rust_out, c_out, "Shuffle mismatch for typesize={typesize}");
 
         // Test unshuffle
         let mut rust_restored = vec![0u8; blocksize];

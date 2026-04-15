@@ -4,7 +4,10 @@ pub const BLOSC2_VERSION_FORMAT_VL_BLOCKS: u8 = 6;
 pub const BLOSC2_VERSION_FORMAT: u8 = BLOSC2_VERSION_FORMAT_VL_BLOCKS;
 
 // Frame format versions
+pub const BLOSC2_VERSION_FRAME_FORMAT_RC1: u8 = 2;
 pub const BLOSC2_VERSION_FRAME_FORMAT: u8 = 3;
+pub const FRAME_VARIABLE_CHUNKS: u8 = 1 << 6;
+pub const FRAME_VL_BLOCKS: u8 = 1 << 7;
 
 // Header sizes
 pub const BLOSC_MIN_HEADER_LENGTH: usize = 16;

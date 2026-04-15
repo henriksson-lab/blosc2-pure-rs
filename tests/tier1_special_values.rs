@@ -4,11 +4,12 @@
 
 use blosc2_pure_rs::compress::{compress, decompress, CParams};
 use blosc2_pure_rs::constants::*;
+mod common;
 use blosc2_pure_rs::header::ChunkHeader;
-use blosc2_pure_rs::ffi;
+use common::ffi;
 
-fn init() -> blosc2_pure_rs::Blosc2 {
-    blosc2_pure_rs::Blosc2::new()
+fn init() -> common::Blosc2 {
+    common::Blosc2::new()
 }
 
 // ─── All-zero data ───────────────────────────────────────────────
@@ -25,11 +26,17 @@ fn test_compress_all_zeros_detected() {
     let chunk = compress(&data, &cparams).unwrap();
     let header = ChunkHeader::read(&chunk).unwrap();
 
-    assert_eq!(header.special_type(), BLOSC2_SPECIAL_ZERO,
-        "All-zero data should produce SPECIAL_ZERO chunk");
+    assert_eq!(
+        header.special_type(),
+        BLOSC2_SPECIAL_ZERO,
+        "All-zero data should produce SPECIAL_ZERO chunk"
+    );
     // Special zero chunks should be very small (just the header)
-    assert!(chunk.len() <= BLOSC_EXTENDED_HEADER_LENGTH + 8,
-        "SPECIAL_ZERO chunk should be tiny, got {} bytes", chunk.len());
+    assert!(
+        chunk.len() <= BLOSC_EXTENDED_HEADER_LENGTH + 8,
+        "SPECIAL_ZERO chunk should be tiny, got {} bytes",
+        chunk.len()
+    );
 
     let restored = decompress(&chunk).unwrap();
     assert_eq!(data, restored);
@@ -47,7 +54,10 @@ fn test_compress_all_zeros_various_typesizes() {
         };
         let chunk = compress(&data, &cparams).unwrap();
         let restored = decompress(&chunk).unwrap();
-        assert_eq!(data, restored, "Zero roundtrip failed for typesize={typesize}");
+        assert_eq!(
+            data, restored,
+            "Zero roundtrip failed for typesize={typesize}"
+        );
     }
 }
 
@@ -64,12 +74,15 @@ fn test_c_compressed_zeros_rust_decompress() {
         cp.clevel = 5;
         cp.typesize = 4;
         cp.nthreads = 1;
-        cp.splitmode = BLOSC_FORWARD_COMPAT_SPLIT as i32;
+        cp.splitmode = BLOSC_FORWARD_COMPAT_SPLIT;
         cp.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_SHUFFLE;
         let cctx = ffi::blosc2_create_cctx(cp);
         let r = ffi::blosc2_compress_ctx(
-            cctx, data.as_ptr() as *const _, data.len() as i32,
-            c_chunk.as_mut_ptr() as *mut _, c_chunk.len() as i32,
+            cctx,
+            data.as_ptr() as *const _,
+            data.len() as i32,
+            c_chunk.as_mut_ptr() as *mut _,
+            c_chunk.len() as i32,
         );
         ffi::blosc2_free_ctx(cctx);
         r
@@ -78,7 +91,10 @@ fn test_c_compressed_zeros_rust_decompress() {
 
     // Decompress with Rust
     let restored = decompress(&c_chunk[..csize as usize]).unwrap();
-    assert_eq!(data, restored, "C-compressed zeros → Rust decompress mismatch");
+    assert_eq!(
+        data, restored,
+        "C-compressed zeros → Rust decompress mismatch"
+    );
 }
 
 // ─── All-NaN data ────────────────────────────────────────────────
@@ -86,8 +102,7 @@ fn test_c_compressed_zeros_rust_decompress() {
 #[test]
 fn test_compress_all_nan_f32() {
     let nan_val = f32::NAN;
-    let data: Vec<u8> = std::iter::repeat(nan_val.to_le_bytes())
-        .take(5000)
+    let data: Vec<u8> = std::iter::repeat_n(nan_val.to_le_bytes(), 5000)
         .flatten()
         .collect();
 
@@ -112,8 +127,7 @@ fn test_compress_all_nan_f32() {
 #[test]
 fn test_compress_all_nan_f64() {
     let nan_val = f64::NAN;
-    let data: Vec<u8> = std::iter::repeat(nan_val.to_le_bytes())
-        .take(2500)
+    let data: Vec<u8> = std::iter::repeat_n(nan_val.to_le_bytes(), 2500)
         .flatten()
         .collect();
 
@@ -152,8 +166,7 @@ fn test_compress_repeated_byte() {
 #[test]
 fn test_compress_repeated_u32() {
     let val: u32 = 0xDEADBEEF;
-    let data: Vec<u8> = std::iter::repeat(val.to_le_bytes())
-        .take(5000)
+    let data: Vec<u8> = std::iter::repeat_n(val.to_le_bytes(), 5000)
         .flatten()
         .collect();
 
@@ -188,8 +201,11 @@ fn test_mostly_zeros_some_nonzero() {
     let header = ChunkHeader::read(&chunk).unwrap();
 
     // Should NOT be SPECIAL_ZERO since there are non-zero bytes
-    assert_ne!(header.special_type(), BLOSC2_SPECIAL_ZERO,
-        "Mixed data should not be SPECIAL_ZERO");
+    assert_ne!(
+        header.special_type(),
+        BLOSC2_SPECIAL_ZERO,
+        "Mixed data should not be SPECIAL_ZERO"
+    );
 
     let restored = decompress(&chunk).unwrap();
     assert_eq!(data, restored);
@@ -199,8 +215,8 @@ fn test_mostly_zeros_some_nonzero() {
 
 #[test]
 fn test_schunk_with_zero_chunks() {
-    use blosc2_pure_rs::schunk::Schunk;
     use blosc2_pure_rs::compress::DParams;
+    use blosc2_pure_rs::schunk::Schunk;
 
     let cparams = CParams {
         compcode: BLOSC_LZ4,
@@ -212,7 +228,9 @@ fn test_schunk_with_zero_chunks() {
     let mut schunk = Schunk::new(cparams, dparams);
 
     let zeros = vec![0u8; 10000];
-    let nonzero: Vec<u8> = (0..10000u32).flat_map(|i| (i % 256).to_le_bytes()).collect();
+    let nonzero: Vec<u8> = (0..10000u32)
+        .flat_map(|i| (i % 256).to_le_bytes())
+        .collect();
 
     schunk.append_buffer(&zeros).unwrap();
     schunk.append_buffer(&nonzero[..10000]).unwrap();
@@ -231,8 +249,8 @@ fn test_schunk_with_zero_chunks() {
 
 #[test]
 fn test_schunk_frame_roundtrip_with_zeros() {
-    use blosc2_pure_rs::schunk::Schunk;
     use blosc2_pure_rs::compress::DParams;
+    use blosc2_pure_rs::schunk::Schunk;
 
     let cparams = CParams {
         compcode: BLOSC_LZ4,

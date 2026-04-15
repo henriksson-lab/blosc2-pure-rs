@@ -1,5 +1,4 @@
 use crate::constants::*;
-use crate::shuffle_sse2;
 
 /// Apply byte-wise shuffle (transpose bytes within elements).
 ///
@@ -7,32 +6,21 @@ use crate::shuffle_sse2;
 /// gather all j-th bytes of each element contiguously.
 pub fn shuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
     let blocksize = src.len();
-    if typesize <= 1 || blocksize == 0 {
-        dest[..blocksize].copy_from_slice(&src[..blocksize]);
+    if dest.len() < blocksize {
         return;
     }
-
-    // Try SSE2 accelerated shuffle
-    if shuffle_sse2::shuffle_sse2(typesize, src, dest) {
+    if typesize <= 1 || blocksize == 0 {
+        dest[..blocksize].copy_from_slice(&src[..blocksize]);
         return;
     }
 
     let neblock_quot = blocksize / typesize;
     let neblock_rem = blocksize % typesize;
 
-    // Safety: all indices are bounded by neblock_quot * typesize <= blocksize
-    // which is <= src.len() and dest.len()
-    debug_assert!(neblock_quot * typesize <= blocksize);
-    debug_assert!(blocksize <= src.len());
-    debug_assert!(blocksize <= dest.len());
-
-    unsafe {
-        for j in 0..typesize {
-            let dest_base = j * neblock_quot;
-            for i in 0..neblock_quot {
-                *dest.get_unchecked_mut(dest_base + i) =
-                    *src.get_unchecked(i * typesize + j);
-            }
+    for j in 0..typesize {
+        let dest_base = j * neblock_quot;
+        for i in 0..neblock_quot {
+            dest[dest_base + i] = src[i * typesize + j];
         }
     }
 
@@ -45,30 +33,21 @@ pub fn shuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
 /// Reverse byte-wise shuffle (untranspose bytes within elements).
 pub fn unshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
     let blocksize = src.len();
-    if typesize <= 1 || blocksize == 0 {
-        dest[..blocksize].copy_from_slice(&src[..blocksize]);
+    if dest.len() < blocksize {
         return;
     }
-
-    // Try SSE2 accelerated unshuffle
-    if shuffle_sse2::unshuffle_sse2(typesize, src, dest) {
+    if typesize <= 1 || blocksize == 0 {
+        dest[..blocksize].copy_from_slice(&src[..blocksize]);
         return;
     }
 
     let neblock_quot = blocksize / typesize;
     let neblock_rem = blocksize % typesize;
 
-    debug_assert!(neblock_quot * typesize <= blocksize);
-    debug_assert!(blocksize <= src.len());
-    debug_assert!(blocksize <= dest.len());
-
-    unsafe {
-        for i in 0..neblock_quot {
-            let dest_base = i * typesize;
-            for j in 0..typesize {
-                *dest.get_unchecked_mut(dest_base + j) =
-                    *src.get_unchecked(j * neblock_quot + i);
-            }
+    for i in 0..neblock_quot {
+        let dest_base = i * typesize;
+        for j in 0..typesize {
+            dest[dest_base + j] = src[j * neblock_quot + i];
         }
     }
 
@@ -80,29 +59,22 @@ pub fn unshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
 
 /// Transpose bytes within elements (step 1 of bitshuffle).
 fn trans_byte_elem(src: &[u8], dest: &mut [u8], size: usize, elem_size: usize) {
-    debug_assert!(size * elem_size <= src.len());
-    debug_assert!(size * elem_size <= dest.len());
-
-    unsafe {
-        let mut ii = 0;
-        while ii + 7 < size {
-            for jj in 0..elem_size {
-                let dest_base = jj * size + ii;
-                let src_base = ii * elem_size + jj;
-                for kk in 0..8 {
-                    *dest.get_unchecked_mut(dest_base + kk) =
-                        *src.get_unchecked(src_base + kk * elem_size);
-                }
+    let mut ii = 0;
+    while ii + 7 < size {
+        for jj in 0..elem_size {
+            let dest_base = jj * size + ii;
+            let src_base = ii * elem_size + jj;
+            for kk in 0..8 {
+                dest[dest_base + kk] = src[src_base + kk * elem_size];
             }
-            ii += 8;
         }
-        while ii < size {
-            for jj in 0..elem_size {
-                *dest.get_unchecked_mut(jj * size + ii) =
-                    *src.get_unchecked(ii * elem_size + jj);
-            }
-            ii += 1;
+        ii += 8;
+    }
+    while ii < size {
+        for jj in 0..elem_size {
+            dest[jj * size + ii] = src[ii * elem_size + jj];
         }
+        ii += 1;
     }
 }
 
@@ -144,8 +116,7 @@ fn trans_bitrow_eight(src: &[u8], dest: &mut [u8], size: usize, elem_size: usize
         for jj in 0..elem_size {
             let src_off = (ii * elem_size + jj) * nbyte_row;
             let dst_off = (jj * 8 + ii) * nbyte_row;
-            dest[dst_off..dst_off + nbyte_row]
-                .copy_from_slice(&src[src_off..src_off + nbyte_row]);
+            dest[dst_off..dst_off + nbyte_row].copy_from_slice(&src[src_off..src_off + nbyte_row]);
         }
     }
 }
@@ -159,9 +130,14 @@ pub fn bitshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) -> i64 {
 }
 
 /// Bitshuffle with optional scratch buffer to avoid allocation.
-pub fn bitshuffle_with_scratch(typesize: usize, src: &[u8], dest: &mut [u8], scratch: Option<&mut [u8]>) -> i64 {
+pub fn bitshuffle_with_scratch(
+    typesize: usize,
+    src: &[u8],
+    dest: &mut [u8],
+    scratch: Option<&mut [u8]>,
+) -> i64 {
     let blocksize = src.len();
-    if typesize == 0 || blocksize == 0 {
+    if typesize == 0 || blocksize == 0 || dest.len() < blocksize {
         return 0;
     }
 
@@ -173,6 +149,9 @@ pub fn bitshuffle_with_scratch(typesize: usize, src: &[u8], dest: &mut [u8], scr
         // Use provided scratch or allocate
         let mut owned_tmp;
         let tmp = if let Some(s) = scratch {
+            if s.len() < nbyte8 {
+                return 0;
+            }
             &mut s[..nbyte8]
         } else {
             owned_tmp = vec![0u8; nbyte8];
@@ -198,8 +177,7 @@ fn trans_byte_bitrow(src: &[u8], dest: &mut [u8], size: usize, elem_size: usize)
     for jj in 0..elem_size {
         for ii in 0..nbyte_row {
             for kk in 0..8usize {
-                dest[ii * 8 * elem_size + jj * 8 + kk] =
-                    src[(jj * 8 + kk) * nbyte_row + ii];
+                dest[ii * 8 * elem_size + jj * 8 + kk] = src[(jj * 8 + kk) * nbyte_row + ii];
             }
         }
     }
@@ -232,9 +210,14 @@ pub fn bitunshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) -> i64 {
 }
 
 /// Bitunshuffle with optional scratch buffer to avoid allocation.
-pub fn bitunshuffle_with_scratch(typesize: usize, src: &[u8], dest: &mut [u8], scratch: Option<&mut [u8]>) -> i64 {
+pub fn bitunshuffle_with_scratch(
+    typesize: usize,
+    src: &[u8],
+    dest: &mut [u8],
+    scratch: Option<&mut [u8]>,
+) -> i64 {
     let blocksize = src.len();
-    if typesize == 0 || blocksize == 0 {
+    if typesize == 0 || blocksize == 0 || dest.len() < blocksize {
         return 0;
     }
 
@@ -245,6 +228,9 @@ pub fn bitunshuffle_with_scratch(typesize: usize, src: &[u8], dest: &mut [u8], s
     if size8 > 0 {
         let mut owned_tmp;
         let tmp = if let Some(s) = scratch {
+            if s.len() < nbyte8 {
+                return 0;
+            }
             &mut s[..nbyte8]
         } else {
             owned_tmp = vec![0u8; nbyte8];
@@ -266,20 +252,34 @@ pub fn bitunshuffle_with_scratch(typesize: usize, src: &[u8], dest: &mut [u8], s
 ///
 /// If `offset == 0` (reference block), XOR each element with the previous element
 /// in the reference. Otherwise, XOR with the corresponding element in the reference.
-pub fn delta_encode(dref: &[u8], offset: usize, nbytes: usize, typesize: usize,
-                    src: &[u8], dest: &mut [u8]) {
+pub fn delta_encode(
+    dref: &[u8],
+    offset: usize,
+    nbytes: usize,
+    typesize: usize,
+    src: &[u8],
+    dest: &mut [u8],
+) {
+    if typesize == 0 || src.len() < nbytes || dest.len() < nbytes {
+        return;
+    }
     // Use byte-level XOR for simplicity — the C code optimizes by typesize
     // but the result is identical since XOR is byte-wise
     if offset == 0 {
         // Reference block: delta against previous elements in dref
-        for i in 0..typesize.min(nbytes) {
-            dest[i] = dref[i];
+        let head = typesize.min(nbytes);
+        if dref.len() < nbytes.max(head) {
+            return;
         }
+        dest[..head].copy_from_slice(&dref[..head]);
         for i in typesize..nbytes {
             dest[i] = src[i] ^ dref[i - typesize];
         }
     } else {
         // Non-reference block: delta against dref
+        if dref.len() < nbytes {
+            return;
+        }
         for i in 0..nbytes {
             dest[i] = src[i] ^ dref[i];
         }
@@ -289,8 +289,16 @@ pub fn delta_encode(dref: &[u8], offset: usize, nbytes: usize, typesize: usize,
 /// Reverse delta encoding (in-place).
 /// For offset=0 (reference block), decode is self-referential: dest[i] ^= dest[i-typesize].
 /// For offset>0, decode uses dref: dest[i] ^= dref[i].
-pub fn delta_decode(dref: Option<&[u8]>, offset: usize, nbytes: usize, typesize: usize,
-                    dest: &mut [u8]) {
+pub fn delta_decode(
+    dref: Option<&[u8]>,
+    offset: usize,
+    nbytes: usize,
+    typesize: usize,
+    dest: &mut [u8],
+) {
+    if typesize == 0 || dest.len() < nbytes {
+        return;
+    }
     if offset == 0 {
         // Reference block: self-referential decode (dest[i] ^= dest[i-typesize])
         for i in typesize..nbytes {
@@ -298,6 +306,9 @@ pub fn delta_decode(dref: Option<&[u8]>, offset: usize, nbytes: usize, typesize:
         }
     } else if let Some(dref) = dref {
         // Non-reference block: undo delta against dref
+        if dref.len() < nbytes {
+            return;
+        }
         for i in 0..nbytes {
             dest[i] ^= dref[i];
         }
@@ -308,6 +319,7 @@ pub fn delta_decode(dref: Option<&[u8]>, offset: usize, nbytes: usize, typesize:
 ///
 /// Returns the filtered data (may swap between `buf1` and `buf2`).
 /// The caller provides two working buffers; `src` is the input.
+#[allow(clippy::too_many_arguments)]
 pub fn pipeline_forward(
     src: &[u8],
     buf1: &mut [u8],
@@ -319,6 +331,9 @@ pub fn pipeline_forward(
     dref: Option<&[u8]>,
 ) -> usize {
     let bsize = src.len();
+    if buf1.len() < bsize || buf2.len() < bsize {
+        return 0;
+    }
 
     // Track current data location: 0 = src (read-only), 1 = buf1, 2 = buf2
     // Start from src without copying — first filter reads src directly.
@@ -335,35 +350,36 @@ pub fn pipeline_forward(
         // Output: alternates between buf1 and buf2
         let out_buf = if current == 2 { 1u8 } else { 2u8 };
 
-        let inp: &[u8] = match current {
-            0 => &src[..bsize],
-            1 => unsafe { &*(buf1 as *const [u8]) },
-            _ => unsafe { &*(buf2 as *const [u8]) },
-        };
-        let out: &mut [u8] = if out_buf == 1 {
-            unsafe { &mut *(buf1 as *mut [u8]) }
-        } else {
-            unsafe { &mut *(buf2 as *mut [u8]) }
+        let (inp, out) = match (current, out_buf) {
+            (0, 1) => (&src[..bsize], &mut buf1[..bsize]),
+            (0, 2) => (&src[..bsize], &mut buf2[..bsize]),
+            (1, 2) => (&buf1[..bsize], &mut buf2[..bsize]),
+            (2, 1) => (&buf2[..bsize], &mut buf1[..bsize]),
+            _ => unreachable!("filter pipeline cannot read and write the same buffer"),
         };
 
         match filter {
             BLOSC_SHUFFLE => {
-                let ts = if filters_meta[i] == 0 { typesize } else { filters_meta[i] as usize };
-                shuffle(ts, &inp[..bsize], &mut out[..bsize]);
+                let ts = if filters_meta[i] == 0 {
+                    typesize
+                } else {
+                    filters_meta[i] as usize
+                };
+                shuffle(ts, inp, out);
             }
             BLOSC_BITSHUFFLE => {
-                bitshuffle(typesize, &inp[..bsize], &mut out[..bsize]);
+                bitshuffle(typesize, inp, out);
             }
             BLOSC_DELTA => {
                 let actual_dref = dref.unwrap_or(src);
-                delta_encode(actual_dref, block_offset, bsize, typesize, &inp[..bsize], &mut out[..bsize]);
+                delta_encode(actual_dref, block_offset, bsize, typesize, inp, out);
             }
             BLOSC_TRUNC_PREC => {
                 let prec = filters_meta[i] as usize;
-                trunc_prec_forward(&inp[..bsize], &mut out[..bsize], typesize, prec);
+                trunc_prec_forward(inp, out, typesize, prec);
             }
             _ => {
-                out[..bsize].copy_from_slice(&inp[..bsize]);
+                out.copy_from_slice(inp);
             }
         }
 
@@ -382,6 +398,7 @@ pub fn pipeline_forward(
 /// Apply the backward filter pipeline to a block (in-place friendly).
 ///
 /// Returns which buffer holds the result (1 or 2).
+#[allow(clippy::too_many_arguments)]
 pub fn pipeline_backward(
     buf1: &mut [u8],
     buf2: &mut [u8],
@@ -393,6 +410,12 @@ pub fn pipeline_backward(
     dref: Option<&[u8]>,
     current_buf: usize,
 ) -> usize {
+    if current_buf != 1 && current_buf != 2 {
+        return 0;
+    }
+    if buf1.len() < bsize || buf2.len() < bsize {
+        return 0;
+    }
     let mut current = current_buf as u8;
 
     // Filters applied in reverse order
@@ -403,32 +426,34 @@ pub fn pipeline_backward(
         }
 
         let (inp, out) = if current == 1 {
-            let (a, b) = (buf1 as *mut [u8], buf2 as *mut [u8]);
-            unsafe { (&*a, &mut *b) }
+            (&buf1[..bsize], &mut buf2[..bsize])
         } else {
-            let (a, b) = (buf2 as *mut [u8], buf1 as *mut [u8]);
-            unsafe { (&*a, &mut *b) }
+            (&buf2[..bsize], &mut buf1[..bsize])
         };
 
         match filter {
             BLOSC_SHUFFLE => {
-                let ts = if filters_meta[i] == 0 { typesize } else { filters_meta[i] as usize };
-                unshuffle(ts, &inp[..bsize], &mut out[..bsize]);
+                let ts = if filters_meta[i] == 0 {
+                    typesize
+                } else {
+                    filters_meta[i] as usize
+                };
+                unshuffle(ts, inp, out);
             }
             BLOSC_BITSHUFFLE => {
-                bitunshuffle(typesize, &inp[..bsize], &mut out[..bsize]);
+                bitunshuffle(typesize, inp, out);
             }
             BLOSC_DELTA => {
                 // Delta decode: copy data to output, then decode in-place
-                out[..bsize].copy_from_slice(&inp[..bsize]);
-                delta_decode(dref, block_offset, bsize, typesize, &mut out[..bsize]);
+                out.copy_from_slice(inp);
+                delta_decode(dref, block_offset, bsize, typesize, out);
             }
             BLOSC_TRUNC_PREC => {
                 // Truncation is lossy — backward is a no-op (data already truncated)
-                out[..bsize].copy_from_slice(&inp[..bsize]);
+                out.copy_from_slice(inp);
             }
             _ => {
-                out[..bsize].copy_from_slice(&inp[..bsize]);
+                out.copy_from_slice(inp);
             }
         }
 
@@ -470,6 +495,11 @@ fn trunc_prec_forward(src: &[u8], dest: &mut [u8], typesize: usize, prec_bits: u
             dest[off + bytes_to_clear] &= mask;
         }
     }
+
+    let tail_start = n_elements * typesize;
+    if tail_start < src.len() {
+        dest[tail_start..src.len()].copy_from_slice(&src[tail_start..]);
+    }
 }
 
 #[cfg(test)]
@@ -497,6 +527,18 @@ mod tests {
     }
 
     #[test]
+    fn test_shuffle_rejects_short_destinations() {
+        let data: Vec<u8> = (0..16).collect();
+        let mut dest = vec![0xA5; 15];
+
+        shuffle(4, &data, &mut dest);
+        assert_eq!(dest, vec![0xA5; 15]);
+
+        unshuffle(4, &data, &mut dest);
+        assert_eq!(dest, vec![0xA5; 15]);
+    }
+
+    #[test]
     fn test_bitshuffle_roundtrip() {
         // Size must be a multiple of 8 elements
         let data: Vec<u8> = (0..64).collect(); // 16 elements of 4 bytes
@@ -506,6 +548,46 @@ mod tests {
         bitshuffle(4, &data, &mut shuffled);
         bitunshuffle(4, &shuffled, &mut restored);
         assert_eq!(data, restored);
+    }
+
+    #[test]
+    fn test_bitshuffle_preserves_leftover_elements() {
+        for typesize in [1, 2, 4, 8, 16] {
+            for extra_elements in [1, 3, 5, 7] {
+                let len = (16 + extra_elements) * typesize;
+                let data: Vec<u8> = (0..len)
+                    .map(|i: usize| (i.wrapping_mul(37).wrapping_add(typesize)) as u8)
+                    .collect();
+                let mut shuffled = vec![0u8; len];
+                let mut restored = vec![0u8; len];
+
+                assert_eq!(bitshuffle(typesize, &data, &mut shuffled), len as i64);
+                assert_eq!(bitunshuffle(typesize, &shuffled, &mut restored), len as i64);
+                assert_eq!(
+                    data, restored,
+                    "bitshuffle leftover roundtrip failed for typesize={typesize} extra_elements={extra_elements}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_bitshuffle_rejects_short_buffers() {
+        let data: Vec<u8> = (0..64).collect();
+        let mut short_dest = vec![0u8; 63];
+        let mut scratch = vec![0u8; 63];
+        let mut dest = vec![0u8; 64];
+
+        assert_eq!(bitshuffle(4, &data, &mut short_dest), 0);
+        assert_eq!(bitunshuffle(4, &data, &mut short_dest), 0);
+        assert_eq!(
+            bitshuffle_with_scratch(4, &data, &mut dest, Some(&mut scratch)),
+            0
+        );
+        assert_eq!(
+            bitunshuffle_with_scratch(4, &data, &mut dest, Some(&mut scratch)),
+            0
+        );
     }
 
     #[test]
@@ -535,5 +617,118 @@ mod tests {
         decoded.copy_from_slice(&encoded);
         delta_decode(None, 0, 16, 1, &mut decoded); // self-referential at offset=0
         assert_eq!(src, decoded);
+    }
+
+    #[test]
+    fn test_delta_rejects_invalid_buffers() {
+        let src: Vec<u8> = (0..16).collect();
+        let dref: Vec<u8> = (16..32).collect();
+        let mut dest = vec![0xA5; 16];
+
+        delta_encode(&dref, 1, 16, 0, &src, &mut dest);
+        assert_eq!(dest, vec![0xA5; 16]);
+
+        delta_encode(&dref, 1, 16, 1, &src[..15], &mut dest);
+        assert_eq!(dest, vec![0xA5; 16]);
+
+        delta_encode(&dref, 1, 16, 1, &src, &mut dest[..15]);
+        assert_eq!(dest[..15], vec![0xA5; 15]);
+        assert_eq!(dest[15], 0xA5);
+
+        delta_encode(&dref[..15], 1, 16, 1, &src, &mut dest);
+        assert_eq!(dest, vec![0xA5; 16]);
+
+        delta_encode(&src[..15], 0, 16, 1, &src, &mut dest);
+        assert_eq!(dest, vec![0xA5; 16]);
+
+        delta_decode(Some(&dref), 1, 16, 0, &mut dest);
+        assert_eq!(dest, vec![0xA5; 16]);
+
+        delta_decode(Some(&dref), 1, 16, 1, &mut dest[..15]);
+        assert_eq!(dest[..15], vec![0xA5; 15]);
+        assert_eq!(dest[15], 0xA5);
+
+        delta_decode(Some(&dref[..15]), 1, 16, 1, &mut dest);
+        assert_eq!(dest, vec![0xA5; 16]);
+    }
+
+    #[test]
+    fn test_pipeline_rejects_invalid_buffers() {
+        let src: Vec<u8> = (0..16).collect();
+        let mut buf1 = vec![0xA5; 16];
+        let mut buf2 = vec![0x5A; 16];
+        let mut short_buf = vec![0u8; 15];
+        let filters = [BLOSC_SHUFFLE, 0, 0, 0, 0, 0];
+        let filters_meta = [0; BLOSC2_MAX_FILTERS];
+
+        assert_eq!(
+            pipeline_forward(
+                &src,
+                &mut short_buf,
+                &mut buf2,
+                &filters,
+                &filters_meta,
+                4,
+                0,
+                None,
+            ),
+            0
+        );
+        assert_eq!(buf2, vec![0x5A; 16]);
+
+        assert_eq!(
+            pipeline_forward(
+                &src,
+                &mut buf1,
+                &mut short_buf,
+                &filters,
+                &filters_meta,
+                4,
+                0,
+                None,
+            ),
+            0
+        );
+        assert_eq!(buf1, vec![0xA5; 16]);
+
+        assert_eq!(
+            pipeline_backward(
+                &mut buf1,
+                &mut buf2,
+                16,
+                &filters,
+                &filters_meta,
+                4,
+                0,
+                None,
+                0,
+            ),
+            0
+        );
+
+        assert_eq!(
+            pipeline_backward(
+                &mut short_buf,
+                &mut buf2,
+                16,
+                &filters,
+                &filters_meta,
+                4,
+                0,
+                None,
+                1,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn test_trunc_prec_preserves_tail_bytes() {
+        let src = [0xFFu8, 0xFF, 0xFF, 0xFF, 0xAA, 0xBB];
+        let mut dest = [0u8; 6];
+
+        trunc_prec_forward(&src, &mut dest, 4, 16);
+
+        assert_eq!(&dest[4..], &src[4..]);
     }
 }

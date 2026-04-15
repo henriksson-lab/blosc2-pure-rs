@@ -4,15 +4,18 @@
 
 use blosc2_pure_rs::compress::{compress, decompress, CParams};
 use blosc2_pure_rs::constants::*;
+mod common;
 use blosc2_pure_rs::filters;
-use blosc2_pure_rs::ffi;
+use common::ffi;
 
-fn init() -> blosc2_pure_rs::Blosc2 {
-    blosc2_pure_rs::Blosc2::new()
+fn init() -> common::Blosc2 {
+    common::Blosc2::new()
 }
 
 fn sequential_f32(n: usize) -> Vec<u8> {
-    (0..n as u32).flat_map(|i| (i as f32).to_le_bytes()).collect()
+    (0..n as u32)
+        .flat_map(|i| (i as f32).to_le_bytes())
+        .collect()
 }
 
 fn sequential_u64(n: usize) -> Vec<u8> {
@@ -32,12 +35,22 @@ fn test_pipeline_delta_shuffle_roundtrip() {
     let meta = [0u8; BLOSC2_MAX_FILTERS];
 
     let result_buf = filters::pipeline_forward(
-        &data, &mut buf1, &mut buf2,
-        &filter_array, &meta, 4, 0, None,
+        &data,
+        &mut buf1,
+        &mut buf2,
+        &filter_array,
+        &meta,
+        4,
+        0,
+        None,
     );
 
     // Data should be transformed
-    let filtered = if result_buf == 1 { &buf1[..bsize] } else { &buf2[..bsize] };
+    let filtered = if result_buf == 1 {
+        &buf1[..bsize]
+    } else {
+        &buf2[..bsize]
+    };
     assert_ne!(&data[..], filtered, "Filters should transform data");
 
     // Reverse
@@ -45,12 +58,27 @@ fn test_pipeline_delta_shuffle_roundtrip() {
     let mut rbuf2 = vec![0u8; bsize];
 
     let restored_buf = filters::pipeline_backward(
-        &mut rbuf1, &mut rbuf2, bsize,
-        &filter_array, &meta, 4, 0, None, 1,
+        &mut rbuf1,
+        &mut rbuf2,
+        bsize,
+        &filter_array,
+        &meta,
+        4,
+        0,
+        None,
+        1,
     );
 
-    let restored = if restored_buf == 1 { &rbuf1[..bsize] } else { &rbuf2[..bsize] };
-    assert_eq!(&data[..], restored, "DELTA+SHUFFLE pipeline roundtrip failed");
+    let restored = if restored_buf == 1 {
+        &rbuf1[..bsize]
+    } else {
+        &rbuf2[..bsize]
+    };
+    assert_eq!(
+        &data[..],
+        restored,
+        "DELTA+SHUFFLE pipeline roundtrip failed"
+    );
 }
 
 #[test]
@@ -64,17 +92,44 @@ fn test_pipeline_shuffle_only_roundtrip() {
     let meta = [0u8; BLOSC2_MAX_FILTERS];
 
     let result_buf = filters::pipeline_forward(
-        &data, &mut buf1, &mut buf2, &filter_array, &meta, 4, 0, None,
+        &data,
+        &mut buf1,
+        &mut buf2,
+        &filter_array,
+        &meta,
+        4,
+        0,
+        None,
     );
-    let filtered = if result_buf == 1 { &buf1[..bsize] } else { &buf2[..bsize] };
+    let filtered = if result_buf == 1 {
+        &buf1[..bsize]
+    } else {
+        &buf2[..bsize]
+    };
 
     let mut rbuf1 = filtered.to_vec();
     let mut rbuf2 = vec![0u8; bsize];
     let restored_buf = filters::pipeline_backward(
-        &mut rbuf1, &mut rbuf2, bsize, &filter_array, &meta, 4, 0, None, 1,
+        &mut rbuf1,
+        &mut rbuf2,
+        bsize,
+        &filter_array,
+        &meta,
+        4,
+        0,
+        None,
+        1,
     );
-    let restored = if restored_buf == 1 { &rbuf1[..bsize] } else { &rbuf2[..bsize] };
-    assert_eq!(&data[..], restored, "SHUFFLE-only pipeline roundtrip failed");
+    let restored = if restored_buf == 1 {
+        &rbuf1[..bsize]
+    } else {
+        &rbuf2[..bsize]
+    };
+    assert_eq!(
+        &data[..],
+        restored,
+        "SHUFFLE-only pipeline roundtrip failed"
+    );
 }
 
 #[test]
@@ -89,17 +144,44 @@ fn test_pipeline_bitshuffle_only_roundtrip() {
     let meta = [0u8; BLOSC2_MAX_FILTERS];
 
     let result_buf = filters::pipeline_forward(
-        &data, &mut buf1, &mut buf2, &filter_array, &meta, 4, 0, None,
+        &data,
+        &mut buf1,
+        &mut buf2,
+        &filter_array,
+        &meta,
+        4,
+        0,
+        None,
     );
-    let filtered = if result_buf == 1 { &buf1[..bsize] } else { &buf2[..bsize] };
+    let filtered = if result_buf == 1 {
+        &buf1[..bsize]
+    } else {
+        &buf2[..bsize]
+    };
 
     let mut rbuf1 = filtered.to_vec();
     let mut rbuf2 = vec![0u8; bsize];
     let restored_buf = filters::pipeline_backward(
-        &mut rbuf1, &mut rbuf2, bsize, &filter_array, &meta, 4, 0, None, 1,
+        &mut rbuf1,
+        &mut rbuf2,
+        bsize,
+        &filter_array,
+        &meta,
+        4,
+        0,
+        None,
+        1,
     );
-    let restored = if restored_buf == 1 { &rbuf1[..bsize] } else { &rbuf2[..bsize] };
-    assert_eq!(&data[..], restored, "BITSHUFFLE-only pipeline roundtrip failed");
+    let restored = if restored_buf == 1 {
+        &rbuf1[..bsize]
+    } else {
+        &rbuf2[..bsize]
+    };
+    assert_eq!(
+        &data[..],
+        restored,
+        "BITSHUFFLE-only pipeline roundtrip failed"
+    );
 }
 
 // ─── Full compress/decompress with multi-filter ──────────────────
@@ -154,7 +236,10 @@ fn test_compress_trunc_prec_shuffle() {
     assert_eq!(data.len(), restored.len());
     let chunk2 = compress(&restored, &cparams).unwrap();
     let restored2 = decompress(&chunk2).unwrap();
-    assert_eq!(restored, restored2, "TRUNC_PREC should be stable after first application");
+    assert_eq!(
+        restored, restored2,
+        "TRUNC_PREC should be stable after first application"
+    );
 }
 
 // ─── Cross-check multi-filter with C FFI ─────────────────────────
@@ -172,13 +257,16 @@ fn test_c_delta_shuffle_rust_decompress() {
         cp.clevel = 5;
         cp.typesize = 4;
         cp.nthreads = 1;
-        cp.splitmode = BLOSC_FORWARD_COMPAT_SPLIT as i32;
+        cp.splitmode = BLOSC_FORWARD_COMPAT_SPLIT;
         cp.filters[4] = BLOSC_DELTA;
         cp.filters[5] = BLOSC_SHUFFLE;
         let cctx = ffi::blosc2_create_cctx(cp);
         let r = ffi::blosc2_compress_ctx(
-            cctx, data.as_ptr() as *const _, src_size,
-            c_chunk.as_mut_ptr() as *mut _, c_chunk.len() as i32,
+            cctx,
+            data.as_ptr() as *const _,
+            src_size,
+            c_chunk.as_mut_ptr() as *mut _,
+            c_chunk.len() as i32,
         );
         ffi::blosc2_free_ctx(cctx);
         r
@@ -206,12 +294,21 @@ fn test_rust_delta_shuffle_c_decompress() {
     let mut c_restored = vec![0u8; data.len()];
     let dsize = unsafe {
         ffi::blosc2_decompress(
-            chunk.as_ptr() as *const _, chunk.len() as i32,
-            c_restored.as_mut_ptr() as *mut _, c_restored.len() as i32,
+            chunk.as_ptr() as *const _,
+            chunk.len() as i32,
+            c_restored.as_mut_ptr() as *mut _,
+            c_restored.len() as i32,
         )
     };
-    assert_eq!(dsize, data.len() as i32, "C decompress of Rust DELTA+SHUFFLE failed");
-    assert_eq!(data, c_restored, "Rust DELTA+SHUFFLE → C decompress mismatch");
+    assert_eq!(
+        dsize,
+        data.len() as i32,
+        "C decompress of Rust DELTA+SHUFFLE failed"
+    );
+    assert_eq!(
+        data, c_restored,
+        "Rust DELTA+SHUFFLE → C decompress mismatch"
+    );
 }
 
 // ─── All codec × multi-filter combinations ───────────────────────
@@ -219,7 +316,13 @@ fn test_rust_delta_shuffle_c_decompress() {
 #[test]
 fn test_all_codecs_delta_shuffle() {
     let data = sequential_f32(5000);
-    for compcode in [BLOSC_BLOSCLZ, BLOSC_LZ4, BLOSC_LZ4HC, BLOSC_ZLIB, BLOSC_ZSTD] {
+    for compcode in [
+        BLOSC_BLOSCLZ,
+        BLOSC_LZ4,
+        BLOSC_LZ4HC,
+        BLOSC_ZLIB,
+        BLOSC_ZSTD,
+    ] {
         let cparams = CParams {
             compcode,
             clevel: 5,

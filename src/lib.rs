@@ -1,38 +1,9 @@
-#[cfg(feature = "_ffi")]
-pub mod ffi;
-pub mod constants;
-pub mod header;
-pub mod filters;
 pub mod codecs;
-pub mod shuffle_sse2;
 pub mod compress;
+pub mod constants;
+pub mod filters;
+pub mod header;
 pub mod schunk;
-
-/// RAII guard that initializes the C-Blosc2 library via FFI.
-/// Only available with the `ffi` feature.
-#[cfg(feature = "_ffi")]
-pub struct Blosc2 {
-    _private: (),
-}
-
-#[cfg(feature = "_ffi")]
-impl Blosc2 {
-    pub fn new() -> Self {
-        unsafe {
-            ffi::blosc2_init();
-        }
-        Blosc2 { _private: () }
-    }
-}
-
-#[cfg(feature = "_ffi")]
-impl Drop for Blosc2 {
-    fn drop(&mut self) {
-        unsafe {
-            ffi::blosc2_destroy();
-        }
-    }
-}
 
 /// Codec identifiers matching the C library constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +16,7 @@ pub enum Codec {
 }
 
 impl Codec {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_name(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "blosclz" => Some(Codec::BloscLz),
             "lz4" => Some(Codec::Lz4),
@@ -54,6 +25,14 @@ impl Codec {
             "zstd" => Some(Codec::Zstd),
             _ => None,
         }
+    }
+}
+
+impl std::str::FromStr for Codec {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_name(s).ok_or(())
     }
 }
 
@@ -68,7 +47,7 @@ pub enum Filter {
 }
 
 impl Filter {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_name(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "nofilter" | "none" => Some(Filter::NoFilter),
             "shuffle" => Some(Filter::Shuffle),
@@ -80,6 +59,13 @@ impl Filter {
     }
 }
 
+impl std::str::FromStr for Filter {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_name(s).ok_or(())
+    }
+}
+
 /// Default chunk size used for file compression (1 MB).
 pub const DEFAULT_CHUNKSIZE: usize = 1_000_000;
-

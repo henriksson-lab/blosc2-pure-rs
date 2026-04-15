@@ -4,15 +4,11 @@ use crate::constants::*;
 
 /// Compress a block using the specified codec.
 /// Returns the number of compressed bytes, or 0 if incompressible.
-pub fn compress_block(
-    compcode: u8,
-    clevel: u8,
-    src: &[u8],
-    dest: &mut [u8],
-) -> i32 {
+pub fn compress_block(compcode: u8, clevel: u8, src: &[u8], dest: &mut [u8]) -> i32 {
     match compcode {
         BLOSC_BLOSCLZ => blosclz::compress(clevel as i32, src, dest),
-        BLOSC_LZ4 | BLOSC_LZ4HC => lz4_compress(src, dest),
+        BLOSC_LZ4 => lz4_compress(src, dest),
+        BLOSC_LZ4HC => lz4hc_compress(clevel, src, dest),
         BLOSC_ZLIB => zlib_compress(src, dest, clevel),
         BLOSC_ZSTD => zstd_compress(src, dest, clevel),
         _ => 0,
@@ -21,11 +17,7 @@ pub fn compress_block(
 
 /// Decompress a block using the specified codec.
 /// Returns the number of decompressed bytes, or negative on error.
-pub fn decompress_block(
-    compcode: u8,
-    src: &[u8],
-    dest: &mut [u8],
-) -> i32 {
+pub fn decompress_block(compcode: u8, src: &[u8], dest: &mut [u8]) -> i32 {
     match compcode {
         BLOSC_BLOSCLZ => blosclz::decompress(src, dest),
         BLOSC_LZ4 | BLOSC_LZ4HC => lz4_decompress(src, dest),
@@ -54,6 +46,29 @@ fn lz4_compress(src: &[u8], dest: &mut [u8]) -> i32 {
     }
 }
 
+fn lz4hc_compress(clevel: u8, src: &[u8], dest: &mut [u8]) -> i32 {
+    let Ok(src_len) = i32::try_from(src.len()) else {
+        return 0;
+    };
+    let Ok(dst_cap) = i32::try_from(dest.len()) else {
+        return 0;
+    };
+
+    // SAFETY: lz4-sys only reads `src_len` bytes from `src` and writes at most
+    // `dst_cap` bytes to `dest`. Both lengths were checked to fit C `int`.
+    let written = unsafe {
+        lz4_sys::LZ4_compress_HC(
+            src.as_ptr().cast(),
+            dest.as_mut_ptr().cast(),
+            src_len,
+            dst_cap,
+            i32::from(clevel),
+        )
+    };
+
+    written.max(0)
+}
+
 fn lz4_decompress(src: &[u8], dest: &mut [u8]) -> i32 {
     match lz4_flex::block::decompress_into(src, dest) {
         Ok(n) => n as i32,
@@ -68,11 +83,7 @@ fn zlib_compress(src: &[u8], dest: &mut [u8], clevel: u8) -> i32 {
     let level = Compression::new(clevel as u32);
     let mut compress = flate2::Compress::new(level, true);
 
-    let status = compress.compress(
-        src,
-        dest,
-        flate2::FlushCompress::Finish,
-    );
+    let status = compress.compress(src, dest, flate2::FlushCompress::Finish);
 
     match status {
         Ok(flate2::Status::StreamEnd) => compress.total_out() as i32,
@@ -91,7 +102,7 @@ fn zlib_decompress(src: &[u8], dest: &mut [u8]) -> i32 {
     let mut decompress = Decompress::new(true);
     match decompress.decompress(src, dest, FlushDecompress::Finish) {
         Ok(flate2::Status::StreamEnd) => decompress.total_out() as i32,
-        Ok(_) => decompress.total_out() as i32,
+        Ok(_) => -1,
         Err(_) => -1,
     }
 }
@@ -109,5 +120,29 @@ fn zstd_decompress(src: &[u8], dest: &mut [u8]) -> i32 {
     match zstd::bulk::decompress_to_buffer(src, dest) {
         Ok(n) => n as i32,
         Err(_) => -1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lz4hc_roundtrips_via_lz4_decoder() {
+        let data: Vec<u8> = (0..8192u32).flat_map(|i| (i % 64).to_le_bytes()).collect();
+        let mut compressed = vec![0; data.len() + 1024];
+
+        let csize = compress_block(BLOSC_LZ4HC, 9, &data, &mut compressed);
+        assert!(csize > 0);
+
+        let mut decompressed = vec![0; data.len()];
+        let dsize = decompress_block(
+            BLOSC_LZ4HC,
+            &compressed[..csize as usize],
+            &mut decompressed,
+        );
+
+        assert_eq!(dsize as usize, data.len());
+        assert_eq!(decompressed, data);
     }
 }

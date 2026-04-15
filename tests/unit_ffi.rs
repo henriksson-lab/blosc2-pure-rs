@@ -1,25 +1,24 @@
 #![cfg(feature = "_ffi")]
-use blosc2_pure_rs::ffi;
+mod common;
+use common::ffi;
 
-fn init_blosc2() -> blosc2_pure_rs::Blosc2 {
-    blosc2_pure_rs::Blosc2::new()
+fn init_blosc2() -> common::Blosc2 {
+    common::Blosc2::new()
 }
 
 #[test]
 fn test_compress_decompress_basic() {
     let _b = init_blosc2();
 
-    let data: Vec<u8> = (0..10000u32)
-        .flat_map(|i| i.to_le_bytes())
-        .collect();
+    let data: Vec<u8> = (0..10000u32).flat_map(|i| i.to_le_bytes()).collect();
     let src_size = data.len() as i32;
     let mut compressed = vec![0u8; src_size as usize + ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize];
 
     let csize = unsafe {
         ffi::blosc2_compress(
-            5,                          // clevel
-            ffi::BLOSC_SHUFFLE as i32,  // filter
-            4,                          // typesize
+            5,                         // clevel
+            ffi::BLOSC_SHUFFLE as i32, // filter
+            4,                         // typesize
             data.as_ptr() as *const _,
             src_size,
             compressed.as_mut_ptr() as *mut _,
@@ -45,9 +44,7 @@ fn test_compress_decompress_basic() {
 fn test_compress_all_codecs() {
     let _b = init_blosc2();
 
-    let data: Vec<u8> = (0..5000u32)
-        .flat_map(|i| i.to_le_bytes())
-        .collect();
+    let data: Vec<u8> = (0..5000u32).flat_map(|i| i.to_le_bytes()).collect();
     let src_size = data.len() as i32;
     let buf_size = src_size as usize + ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize;
 
@@ -94,7 +91,10 @@ fn test_compress_all_codecs() {
                 decompressed.as_mut_ptr() as *mut _,
                 decompressed.len() as i32,
             );
-            assert_eq!(dsize, src_size, "Decompress size mismatch for codec {codec}");
+            assert_eq!(
+                dsize, src_size,
+                "Decompress size mismatch for codec {codec}"
+            );
             assert_eq!(data, decompressed, "Data mismatch for codec {codec}");
 
             ffi::blosc2_free_ctx(cctx);
@@ -107,9 +107,7 @@ fn test_compress_all_codecs() {
 fn test_compress_all_filters() {
     let _b = init_blosc2();
 
-    let data: Vec<u8> = (0..5000u64)
-        .flat_map(|i| i.to_le_bytes())
-        .collect();
+    let data: Vec<u8> = (0..5000u64).flat_map(|i| i.to_le_bytes()).collect();
     let src_size = data.len() as i32;
     let buf_size = src_size as usize + ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize;
 
@@ -154,7 +152,10 @@ fn test_compress_all_filters() {
                 decompressed.as_mut_ptr() as *mut _,
                 decompressed.len() as i32,
             );
-            assert_eq!(dsize, src_size, "Decompress size mismatch for filter {filter}");
+            assert_eq!(
+                dsize, src_size,
+                "Decompress size mismatch for filter {filter}"
+            );
             assert_eq!(data, decompressed, "Data mismatch for filter {filter}");
 
             ffi::blosc2_free_ctx(cctx);
@@ -167,9 +168,7 @@ fn test_compress_all_filters() {
 fn test_schunk_roundtrip() {
     let _b = init_blosc2();
 
-    let data: Vec<u8> = (0..100000u32)
-        .flat_map(|i| i.to_le_bytes())
-        .collect();
+    let data: Vec<u8> = (0..100000u32).flat_map(|i| i.to_le_bytes()).collect();
 
     unsafe {
         let mut cparams = ffi::blosc2_get_blosc2_cparams_defaults();
@@ -229,7 +228,9 @@ fn test_different_typesizes() {
     let _b = init_blosc2();
 
     for typesize in [1i32, 2, 4, 8] {
-        let data: Vec<u8> = (0..10000u16).map(|i| (i.wrapping_mul(7) & 0xFF) as u8).collect();
+        let data: Vec<u8> = (0..10000u16)
+            .map(|i| (i.wrapping_mul(7) & 0xFF) as u8)
+            .collect();
         let src_size = data.len() as i32;
         let buf_size = src_size as usize + ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize;
 
@@ -265,7 +266,10 @@ fn test_different_typesizes() {
                 decompressed.as_mut_ptr() as *mut _,
                 decompressed.len() as i32,
             );
-            assert_eq!(dsize, src_size, "Decompress size mismatch for typesize={typesize}");
+            assert_eq!(
+                dsize, src_size,
+                "Decompress size mismatch for typesize={typesize}"
+            );
             assert_eq!(data, decompressed, "Data mismatch for typesize={typesize}");
 
             ffi::blosc2_free_ctx(cctx);
@@ -278,9 +282,7 @@ fn test_different_typesizes() {
 fn test_compression_levels() {
     let _b = init_blosc2();
 
-    let data: Vec<u8> = (0..20000u32)
-        .flat_map(|i| i.to_le_bytes())
-        .collect();
+    let data: Vec<u8> = (0..20000u32).flat_map(|i| i.to_le_bytes()).collect();
     let src_size = data.len() as i32;
     let buf_size = src_size as usize + ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize;
 
@@ -306,7 +308,10 @@ fn test_compression_levels() {
                 decompressed.as_mut_ptr() as *mut _,
                 decompressed.len() as i32,
             );
-            assert_eq!(dsize, src_size, "Decompress size mismatch for clevel={clevel}");
+            assert_eq!(
+                dsize, src_size,
+                "Decompress size mismatch for clevel={clevel}"
+            );
             assert_eq!(data, decompressed, "Data mismatch for clevel={clevel}");
         }
     }
@@ -341,7 +346,7 @@ fn test_getitem() {
             100, // start
             100, // nitems
             items.as_mut_ptr() as *mut _,
-            (100 * 4) as i32,
+            100 * 4,
         );
         assert!(rc > 0, "getitem failed: {rc}");
 

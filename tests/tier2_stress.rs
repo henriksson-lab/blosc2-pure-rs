@@ -3,11 +3,12 @@
 
 use blosc2_pure_rs::compress::{CParams, DParams};
 use blosc2_pure_rs::constants::*;
+mod common;
 use blosc2_pure_rs::schunk::Schunk;
-use blosc2_pure_rs::ffi;
+use common::ffi;
 
-fn init() -> blosc2_pure_rs::Blosc2 {
-    blosc2_pure_rs::Blosc2::new()
+fn init() -> common::Blosc2 {
+    common::Blosc2::new()
 }
 
 // ─── Multi-chunk stress ──────────────────────────────────────────
@@ -74,8 +75,8 @@ fn test_100_chunks_frame_roundtrip() {
 
     // Verify all chunks
     for c in 0..nchunks {
-        let orig = schunk.decompress_chunk(c as i64).unwrap();
-        let restored = schunk2.decompress_chunk(c as i64).unwrap();
+        let orig = schunk.decompress_chunk(c).unwrap();
+        let restored = schunk2.decompress_chunk(c).unwrap();
         assert_eq!(orig, restored, "Frame roundtrip chunk {c} mismatch");
     }
 }
@@ -153,7 +154,13 @@ fn test_c_compress_all_codecs_rust_decompress() {
     let _b = init();
     let data: Vec<u8> = (0..10000u32).flat_map(|i| i.to_le_bytes()).collect();
 
-    for &compcode in &[BLOSC_BLOSCLZ, BLOSC_LZ4, BLOSC_LZ4HC, BLOSC_ZLIB, BLOSC_ZSTD] {
+    for &compcode in &[
+        BLOSC_BLOSCLZ,
+        BLOSC_LZ4,
+        BLOSC_LZ4HC,
+        BLOSC_ZLIB,
+        BLOSC_ZSTD,
+    ] {
         let mut c_chunk = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD];
         let csize = unsafe {
             let mut cp: ffi::blosc2_cparams = std::mem::zeroed();
@@ -161,12 +168,15 @@ fn test_c_compress_all_codecs_rust_decompress() {
             cp.clevel = 5;
             cp.typesize = 4;
             cp.nthreads = 1;
-            cp.splitmode = BLOSC_FORWARD_COMPAT_SPLIT as i32;
+            cp.splitmode = BLOSC_FORWARD_COMPAT_SPLIT;
             cp.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_SHUFFLE;
             let cctx = ffi::blosc2_create_cctx(cp);
             let r = ffi::blosc2_compress_ctx(
-                cctx, data.as_ptr() as *const _, data.len() as i32,
-                c_chunk.as_mut_ptr() as *mut _, c_chunk.len() as i32,
+                cctx,
+                data.as_ptr() as *const _,
+                data.len() as i32,
+                c_chunk.as_mut_ptr() as *mut _,
+                c_chunk.len() as i32,
             );
             ffi::blosc2_free_ctx(cctx);
             r
@@ -191,12 +201,15 @@ fn test_c_compress_all_filters_rust_decompress() {
             cp.clevel = 5;
             cp.typesize = 4;
             cp.nthreads = 1;
-            cp.splitmode = BLOSC_FORWARD_COMPAT_SPLIT as i32;
+            cp.splitmode = BLOSC_FORWARD_COMPAT_SPLIT;
             cp.filters[BLOSC2_MAX_FILTERS - 1] = filter;
             let cctx = ffi::blosc2_create_cctx(cp);
             let r = ffi::blosc2_compress_ctx(
-                cctx, data.as_ptr() as *const _, data.len() as i32,
-                c_chunk.as_mut_ptr() as *mut _, c_chunk.len() as i32,
+                cctx,
+                data.as_ptr() as *const _,
+                data.len() as i32,
+                c_chunk.as_mut_ptr() as *mut _,
+                c_chunk.len() as i32,
             );
             ffi::blosc2_free_ctx(cctx);
             r
@@ -213,7 +226,8 @@ fn test_c_compress_all_splitmodes_rust_decompress() {
     let _b = init();
     let data: Vec<u8> = (0..10000u32).flat_map(|i| i.to_le_bytes()).collect();
 
-    for &splitmode in &[1i32, 2, 4] { // ALWAYS, NEVER, FORWARD_COMPAT
+    for &splitmode in &[1i32, 2, 4] {
+        // ALWAYS, NEVER, FORWARD_COMPAT
         let mut c_chunk = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD];
         let csize = unsafe {
             let mut cp: ffi::blosc2_cparams = std::mem::zeroed();
@@ -225,8 +239,11 @@ fn test_c_compress_all_splitmodes_rust_decompress() {
             cp.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_SHUFFLE;
             let cctx = ffi::blosc2_create_cctx(cp);
             let r = ffi::blosc2_compress_ctx(
-                cctx, data.as_ptr() as *const _, data.len() as i32,
-                c_chunk.as_mut_ptr() as *mut _, c_chunk.len() as i32,
+                cctx,
+                data.as_ptr() as *const _,
+                data.len() as i32,
+                c_chunk.as_mut_ptr() as *mut _,
+                c_chunk.len() as i32,
             );
             ffi::blosc2_free_ctx(cctx);
             r

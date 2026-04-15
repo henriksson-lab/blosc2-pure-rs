@@ -9,6 +9,9 @@ equal output to the original. Please report any deviations.
 
 The aim of this project is to increase performance, especially by providing this code through a type-safe library interface.
 The code can also be compiled to be used for webassembly.
+The aim is a pure Rust runtime implementation. LZ4HC compression is currently out of scope for the pure-Rust target;
+the crate uses `lz4-sys` as a temporary compatibility shim. Anyone interested in pure-Rust LZ4HC support can contact us
+about having it added.
 
 Compressing is currently slower than C. This will be fixed in the future
 
@@ -20,7 +23,12 @@ Compressing is currently slower than C. This will be fixed in the future
 - **Multi-threaded**: Block-parallel compression and decompression via rayon
 - **CLI**: Compress and decompress files (optional `cli` feature)
 - **Library API**: In-memory compression with `Schunk` container
-- **Pure Rust**: No C dependencies at runtime
+- **Mostly Rust runtime**: LZ4HC temporarily uses `lz4-sys`; pure-Rust LZ4HC is out of scope for now
+
+## Current Limitations
+
+- `lz4hc` currently uses `lz4-sys` for true LZ4HC compression. Pure-Rust LZ4HC is out of scope for now; anyone
+  interested in having it added can contact us.
 
 ## Installation
 
@@ -42,14 +50,20 @@ The CLI binary is named `blosc2` and requires the `cli` feature.
 blosc2 compress input.bin output.b2frame
 blosc2 compress input.bin output.b2frame --codec zstd --clevel 9
 blosc2 compress input.bin output.b2frame -c lz4 -l 5 -t 4 -f shuffle
+blosc2 compress floats.bin floats.b2frame -c zstd -l 7 -t 4 -b 262144 --chunksize 1000000 --splitmode forward
+blosc2 compress floats.bin floats-trunc.b2frame -f truncprec --filter-meta 16 -t 4
 ```
 
 Options:
 - `-c, --codec`: Compression codec (`blosclz`, `lz4`, `lz4hc`, `zlib`, `zstd`). Default: `blosclz`
 - `-l, --clevel`: Compression level (0-9). Default: `9`
 - `-t, --typesize`: Element type size in bytes. Default: `1`
+- `-b, --blocksize`: Explicit block size in bytes (`0` = automatic). Default: `0`
+- `--chunksize`: Input bytes per frame chunk. Default: `1000000`
+- `-s, --splitmode`: Split mode (`always`, `never`, `auto`, `forward`). Default: `forward`
 - `-n, --nthreads`: Number of threads. Default: `4`
 - `-f, --filter`: Filter (`nofilter`, `shuffle`, `bitshuffle`, `delta`, `truncprec`). Default: `shuffle`
+- `--filter-meta`: Filter metadata byte. For `truncprec`, this is the retained precision in bits. Default: `0`
 
 ### Decompress
 
@@ -90,6 +104,20 @@ let restored = decompress(&chunk).unwrap();
 assert_eq!(data, restored);
 ```
 
+### Chunk metadata and item slicing
+
+```rust
+use blosc2_pure_rs::compress::{cbuffer_sizes, getitem};
+
+let (nbytes, cbytes, blocksize) = cbuffer_sizes(&chunk).unwrap();
+assert_eq!(nbytes, data.len());
+assert_eq!(cbytes, chunk.len());
+assert!(blocksize > 0);
+
+let items_10_to_19 = getitem(&chunk, 10, 10).unwrap();
+assert_eq!(items_10_to_19, data[10 * 4..20 * 4]);
+```
+
 ### Multi-chunk container (Schunk)
 
 ```rust
@@ -126,6 +154,31 @@ let schunk2 = Schunk::open("data.b2frame").unwrap();
 let restored = schunk2.decompress_chunk(0).unwrap();
 ```
 
+### In-memory frames and slices
+
+```rust
+let frame = schunk.to_frame();
+let mut from_memory = Schunk::from_frame(&frame).unwrap();
+
+let first_bytes = from_memory.get_slice(0, 128).unwrap();
+from_memory.set_slice(0, &first_bytes).unwrap();
+let all_data = from_memory.decompress_all().unwrap();
+```
+
+### Blosc1-style wrappers
+
+```rust
+use blosc2_pure_rs::compress::{blosc1_compress, blosc1_decompress};
+
+let mut compressed = vec![0u8; data.len() + blosc2_pure_rs::constants::BLOSC2_MAX_OVERHEAD];
+let csize = blosc1_compress(5, BLOSC_SHUFFLE, 4, &data, &mut compressed).unwrap();
+
+let mut restored = vec![0u8; data.len()];
+let dsize = blosc1_decompress(&compressed[..csize], &mut restored).unwrap();
+assert_eq!(dsize, data.len());
+assert_eq!(restored, data);
+```
+
 ## Benchmarks
 
 10 MB float32 sensor data with noise, single-threaded, compiled with `-C target-cpu=native`.
@@ -156,7 +209,7 @@ Rust decompression is **2.3x faster** than C. With SSE2 SIMD shuffle, Rust compr
 |-------|-------|-------------|----------|
 | BloscLZ | Fast | Moderate | General purpose |
 | LZ4 | Fastest | Moderate | Speed-critical |
-| LZ4HC | Slow | Good | Not yet differentiated from LZ4 |
+| LZ4HC | Slow | Good | Via `lz4-sys`; pure-Rust LZ4HC is out of scope |
 | Zlib | Slow | Good | Balanced |
 | Zstd | Moderate | Best | Storage-critical |
 
@@ -178,8 +231,9 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release --features cli
 The full test suite cross-checks against C-Blosc2 via FFI and requires the `c-blosc2` source directory, cmake, and libclang:
 
 ```bash
-cargo test --features _ffi,cli    # Full test suite (113 tests)
-cargo test --lib                  # Unit tests only (16 tests, no C dependency)
+cargo test --all-features
+cargo test --lib --all-features
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 ## Frame Format Compatibility

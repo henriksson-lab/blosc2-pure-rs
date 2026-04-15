@@ -52,7 +52,9 @@ fn create_pseudorandom_data(size: usize) -> Vec<u8> {
     let mut data = Vec::with_capacity(size);
     let mut state: u64 = 0xDEADBEEF;
     for _ in 0..size {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         data.push((state >> 33) as u8);
     }
     data
@@ -72,22 +74,31 @@ fn rust_roundtrip(data: &[u8], codec: &str, clevel: u8, filter: &str, typesize: 
             "compress",
             input.to_str().unwrap(),
             compressed.to_str().unwrap(),
-            "-c", codec,
-            "-l", &clevel.to_string(),
-            "-f", filter,
-            "-t", &typesize.to_string(),
-            "-n", "1",
+            "-c",
+            codec,
+            "-l",
+            &clevel.to_string(),
+            "-f",
+            filter,
+            "-t",
+            &typesize.to_string(),
+            "-n",
+            "1",
         ])
         .status()
         .expect("Failed to run Rust compress");
-    assert!(status.success(), "Rust compress failed for codec={codec} clevel={clevel} filter={filter}");
+    assert!(
+        status.success(),
+        "Rust compress failed for codec={codec} clevel={clevel} filter={filter}"
+    );
 
     let status = Command::new(RUST_BIN)
         .args([
             "decompress",
             compressed.to_str().unwrap(),
             restored.to_str().unwrap(),
-            "-n", "1",
+            "-n",
+            "1",
         ])
         .status()
         .expect("Failed to run Rust decompress");
@@ -96,7 +107,8 @@ fn rust_roundtrip(data: &[u8], codec: &str, clevel: u8, filter: &str, typesize: 
     let original = data;
     let restored_data = fs::read(&restored).unwrap();
     assert_eq!(
-        original, &restored_data[..],
+        original,
+        &restored_data[..],
         "Roundtrip mismatch for codec={codec} clevel={clevel} filter={filter} typesize={typesize}"
     );
 }
@@ -134,7 +146,10 @@ fn c_compress_rust_decompress(data: &[u8]) {
         ])
         .status()
         .expect("Failed to run Rust decompress");
-    assert!(status.success(), "Rust decompress of C-compressed data failed");
+    assert!(
+        status.success(),
+        "Rust decompress of C-compressed data failed"
+    );
 
     // C decompress for reference
     let status = Command::new(&c_decompress)
@@ -147,7 +162,11 @@ fn c_compress_rust_decompress(data: &[u8]) {
     let rust_data = fs::read(&rust_restored).unwrap();
     let c_data = fs::read(&c_restored).unwrap();
 
-    assert_eq!(original, &rust_data[..], "C compress → Rust decompress mismatch");
+    assert_eq!(
+        original,
+        &rust_data[..],
+        "C compress → Rust decompress mismatch"
+    );
     assert_eq!(original, &c_data[..], "C roundtrip mismatch");
 }
 
@@ -172,9 +191,12 @@ fn rust_compress_c_decompress(data: &[u8]) {
             "compress",
             input.to_str().unwrap(),
             rust_compressed.to_str().unwrap(),
-            "-c", "blosclz",
-            "-l", "9",
-            "-n", "1",
+            "-c",
+            "blosclz",
+            "-l",
+            "9",
+            "-n",
+            "1",
         ])
         .status()
         .expect("Failed to run Rust compress");
@@ -182,14 +204,24 @@ fn rust_compress_c_decompress(data: &[u8]) {
 
     // C decompress what Rust compressed
     let status = Command::new(&c_decompress)
-        .args([rust_compressed.to_str().unwrap(), c_restored.to_str().unwrap()])
+        .args([
+            rust_compressed.to_str().unwrap(),
+            c_restored.to_str().unwrap(),
+        ])
         .status()
         .expect("Failed to run C decompress");
-    assert!(status.success(), "C decompress of Rust-compressed data failed");
+    assert!(
+        status.success(),
+        "C decompress of Rust-compressed data failed"
+    );
 
     let original = data;
     let c_data = fs::read(&c_restored).unwrap();
-    assert_eq!(original, &c_data[..], "Rust compress → C decompress mismatch");
+    assert_eq!(
+        original,
+        &c_data[..],
+        "Rust compress → C decompress mismatch"
+    );
 }
 
 // === Roundtrip tests for all codecs ===
@@ -385,8 +417,10 @@ fn test_multithreaded_compress() {
             "compress",
             input.to_str().unwrap(),
             compressed.to_str().unwrap(),
-            "-c", "lz4",
-            "-n", "4",
+            "-c",
+            "lz4",
+            "-n",
+            "4",
         ])
         .status()
         .unwrap();
@@ -397,7 +431,8 @@ fn test_multithreaded_compress() {
             "decompress",
             compressed.to_str().unwrap(),
             restored.to_str().unwrap(),
-            "-n", "4",
+            "-n",
+            "4",
         ])
         .status()
         .unwrap();

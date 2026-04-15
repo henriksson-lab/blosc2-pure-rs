@@ -1,10 +1,11 @@
 #![cfg(feature = "_ffi")]
-use blosc2_pure_rs::ffi;
 use blosc2_pure_rs::codecs;
 use blosc2_pure_rs::constants::*;
+mod common;
+use common::ffi;
 
-fn init_blosc2() -> blosc2_pure_rs::Blosc2 {
-    blosc2_pure_rs::Blosc2::new()
+fn init_blosc2() -> common::Blosc2 {
+    common::Blosc2::new()
 }
 
 /// Compress with C BloscLZ, decompress with Rust BloscLZ
@@ -12,9 +13,7 @@ fn init_blosc2() -> blosc2_pure_rs::Blosc2 {
 fn test_blosclz_c_compress_rust_decompress() {
     let _b = init_blosc2();
 
-    let data: Vec<u8> = (0..10000u32)
-        .flat_map(|i| i.to_le_bytes())
-        .collect();
+    let data: Vec<u8> = (0..10000u32).flat_map(|i| i.to_le_bytes()).collect();
     let src_size = data.len() as i32;
     let buf_size = src_size as usize + BLOSC_EXTENDED_HEADER_LENGTH;
 
@@ -26,7 +25,7 @@ fn test_blosclz_c_compress_rust_decompress() {
         cparams.clevel = 5;
         cparams.typesize = 4;
         cparams.nthreads = 1;
-        cparams.splitmode = BLOSC_NEVER_SPLIT as i32;
+        cparams.splitmode = BLOSC_NEVER_SPLIT;
         // No filters to isolate codec behavior
         cparams.filters = [0; 6];
 
@@ -62,77 +61,79 @@ fn test_blosclz_c_compress_rust_decompress() {
 fn test_blosclz_rust_roundtrip() {
     // Use highly compressible data (repeated patterns)
     let data: Vec<u8> = b"Hello BloscLZ! This is a test with repeating patterns. "
-        .iter().cycle().take(40000).copied().collect();
+        .iter()
+        .cycle()
+        .take(40000)
+        .copied()
+        .collect();
     let mut compressed = vec![0u8; data.len() + 1000];
     let csize = codecs::blosclz::compress(5, &data, &mut compressed);
     assert!(csize > 0, "Rust BloscLZ compression failed");
 
     let mut decompressed = vec![0u8; data.len()];
-    let dsize = codecs::blosclz::decompress(
-        &compressed[..csize as usize],
-        &mut decompressed,
+    let dsize = codecs::blosclz::decompress(&compressed[..csize as usize], &mut decompressed);
+    assert_eq!(
+        dsize as usize,
+        data.len(),
+        "Rust BloscLZ decompression size mismatch"
     );
-    assert_eq!(dsize as usize, data.len(), "Rust BloscLZ decompression size mismatch");
     assert_eq!(data, decompressed, "Rust BloscLZ roundtrip mismatch");
 }
 
 /// Test LZ4 roundtrip via Rust codecs
 #[test]
 fn test_lz4_rust_roundtrip() {
-    let data: Vec<u8> = (0..5000u32)
-        .flat_map(|i| i.to_le_bytes())
-        .collect();
+    let data: Vec<u8> = (0..5000u32).flat_map(|i| i.to_le_bytes()).collect();
     let mut compressed = vec![0u8; data.len() + 1000];
     let csize = codecs::compress_block(BLOSC_LZ4, 5, &data, &mut compressed);
     assert!(csize > 0, "LZ4 compression failed");
 
     let mut decompressed = vec![0u8; data.len()];
-    let dsize = codecs::decompress_block(
-        BLOSC_LZ4,
-        &compressed[..csize as usize],
-        &mut decompressed,
+    let dsize =
+        codecs::decompress_block(BLOSC_LZ4, &compressed[..csize as usize], &mut decompressed);
+    assert_eq!(
+        dsize as usize,
+        data.len(),
+        "LZ4 decompression size mismatch"
     );
-    assert_eq!(dsize as usize, data.len(), "LZ4 decompression size mismatch");
     assert_eq!(data, decompressed, "LZ4 roundtrip mismatch");
 }
 
 /// Test Zlib roundtrip via Rust codecs
 #[test]
 fn test_zlib_rust_roundtrip() {
-    let data: Vec<u8> = (0..5000u32)
-        .flat_map(|i| i.to_le_bytes())
-        .collect();
+    let data: Vec<u8> = (0..5000u32).flat_map(|i| i.to_le_bytes()).collect();
     let mut compressed = vec![0u8; data.len() + 1000];
     let csize = codecs::compress_block(BLOSC_ZLIB, 5, &data, &mut compressed);
     assert!(csize > 0, "Zlib compression failed");
 
     let mut decompressed = vec![0u8; data.len()];
-    let dsize = codecs::decompress_block(
-        BLOSC_ZLIB,
-        &compressed[..csize as usize],
-        &mut decompressed,
+    let dsize =
+        codecs::decompress_block(BLOSC_ZLIB, &compressed[..csize as usize], &mut decompressed);
+    assert_eq!(
+        dsize as usize,
+        data.len(),
+        "Zlib decompression size mismatch"
     );
-    assert_eq!(dsize as usize, data.len(), "Zlib decompression size mismatch");
     assert_eq!(data, decompressed, "Zlib roundtrip mismatch");
 }
 
 /// Test Zstd roundtrip via Rust codecs
 #[test]
 fn test_zstd_rust_roundtrip() {
-    let data: Vec<u8> = (0..5000u32)
-        .flat_map(|i| i.to_le_bytes())
-        .collect();
+    let data: Vec<u8> = (0..5000u32).flat_map(|i| i.to_le_bytes()).collect();
     let mut compressed = vec![0u8; data.len() + 1000];
     let csize = codecs::compress_block(BLOSC_ZSTD, 5, &data, &mut compressed);
     assert!(csize > 0, "Zstd compression failed");
 
     let mut decompressed = vec![0u8; data.len()];
-    let dsize = codecs::decompress_block(
-        BLOSC_ZSTD,
-        &compressed[..csize as usize],
-        &mut decompressed,
+    let dsize =
+        codecs::decompress_block(BLOSC_ZSTD, &compressed[..csize as usize], &mut decompressed);
+    assert_eq!(
+        dsize as usize,
+        data.len(),
+        "Zstd decompression size mismatch"
     );
-    assert_eq!(dsize as usize, data.len(), "Zstd decompression size mismatch");
     assert_eq!(data, decompressed, "Zstd roundtrip mismatch");
 }
 
@@ -140,16 +141,27 @@ fn test_zstd_rust_roundtrip() {
 #[test]
 fn test_all_codecs_patterns() {
     let patterns: Vec<(&str, Vec<u8>)> = vec![
-        ("sequential", (0..20000u32).flat_map(|i| i.to_le_bytes()).collect()),
+        (
+            "sequential",
+            (0..20000u32).flat_map(|i| i.to_le_bytes()).collect(),
+        ),
         ("repeated", vec![42u8; 20000]),
         ("sparse", {
             let mut d = vec![0u8; 20000];
-            for i in (0..20000).step_by(100) { d[i] = 0xFF; }
+            for i in (0..20000).step_by(100) {
+                d[i] = 0xFF;
+            }
             d
         }),
     ];
 
-    let codecs = [BLOSC_BLOSCLZ, BLOSC_LZ4, BLOSC_LZ4HC, BLOSC_ZLIB, BLOSC_ZSTD];
+    let codecs = [
+        BLOSC_BLOSCLZ,
+        BLOSC_LZ4,
+        BLOSC_LZ4HC,
+        BLOSC_ZLIB,
+        BLOSC_ZSTD,
+    ];
 
     for (name, data) in &patterns {
         for &codec in &codecs {
@@ -161,11 +173,8 @@ fn test_all_codecs_patterns() {
             }
 
             let mut decompressed = vec![0u8; data.len()];
-            let dsize = codecs::decompress_block(
-                codec,
-                &compressed[..csize as usize],
-                &mut decompressed,
-            );
+            let dsize =
+                codecs::decompress_block(codec, &compressed[..csize as usize], &mut decompressed);
             assert_eq!(
                 dsize as usize,
                 data.len(),

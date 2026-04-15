@@ -74,15 +74,15 @@ impl ChunkHeader {
 
     /// Number of blocks in this chunk.
     pub fn nblocks(&self) -> usize {
-        if self.blocksize == 0 {
+        if self.nbytes <= 0 || self.blocksize <= 0 {
             return 0;
         }
-        (self.nbytes as usize + self.blocksize as usize - 1) / self.blocksize as usize
+        (self.nbytes as usize).div_ceil(self.blocksize as usize)
     }
 
     /// Size of the last (possibly partial) block.
     pub fn leftover(&self) -> usize {
-        if self.blocksize == 0 {
+        if self.nbytes <= 0 || self.blocksize <= 0 {
             return 0;
         }
         let rem = self.nbytes as usize % self.blocksize as usize;
@@ -112,10 +112,12 @@ impl ChunkHeader {
 
         // Extended header (32 bytes)
         if h.is_extended() && data.len() >= BLOSC_EXTENDED_HEADER_LENGTH {
-            h.filters.copy_from_slice(&data[BLOSC2_CHUNK_FILTER_CODES..BLOSC2_CHUNK_FILTER_CODES + 6]);
+            h.filters
+                .copy_from_slice(&data[BLOSC2_CHUNK_FILTER_CODES..BLOSC2_CHUNK_FILTER_CODES + 6]);
             h.udcompcode = data[BLOSC2_CHUNK_UDCOMPCODE];
             h.compcode_meta = data[BLOSC2_CHUNK_COMPCODE_META];
-            h.filters_meta.copy_from_slice(&data[BLOSC2_CHUNK_FILTER_META..BLOSC2_CHUNK_FILTER_META + 6]);
+            h.filters_meta
+                .copy_from_slice(&data[BLOSC2_CHUNK_FILTER_META..BLOSC2_CHUNK_FILTER_META + 6]);
             h.blosc2_flags2 = data[BLOSC2_CHUNK_BLOSC2_FLAGS2];
             h.blosc2_flags = data[BLOSC2_CHUNK_BLOSC2_FLAGS];
         }
@@ -123,9 +125,11 @@ impl ChunkHeader {
         Ok(h)
     }
 
-    /// Write a 32-byte extended header to a buffer.
-    pub fn write(&self, buf: &mut [u8]) {
-        assert!(buf.len() >= BLOSC_EXTENDED_HEADER_LENGTH);
+    /// Try to write a 32-byte extended header to a buffer.
+    pub fn try_write(&self, buf: &mut [u8]) -> Result<(), &'static str> {
+        if buf.len() < BLOSC_EXTENDED_HEADER_LENGTH {
+            return Err("Buffer too small for extended header");
+        }
 
         buf[BLOSC2_CHUNK_VERSION] = self.version;
         buf[BLOSC2_CHUNK_VERSIONLZ] = self.versionlz;
@@ -142,6 +146,13 @@ impl ChunkHeader {
             .copy_from_slice(&self.filters_meta);
         buf[BLOSC2_CHUNK_BLOSC2_FLAGS2] = self.blosc2_flags2;
         buf[BLOSC2_CHUNK_BLOSC2_FLAGS] = self.blosc2_flags;
+        Ok(())
+    }
+
+    /// Write a 32-byte extended header to a buffer.
+    pub fn write(&self, buf: &mut [u8]) {
+        self.try_write(buf)
+            .expect("buffer must fit a Blosc2 extended header");
     }
 }
 
@@ -165,7 +176,7 @@ mod tests {
         };
 
         let mut buf = [0u8; BLOSC_EXTENDED_HEADER_LENGTH];
-        h.write(&mut buf);
+        h.try_write(&mut buf).unwrap();
         let h2 = ChunkHeader::read(&buf).unwrap();
 
         assert_eq!(h.version, h2.version);
@@ -178,6 +189,14 @@ mod tests {
     }
 
     #[test]
+    fn test_header_try_write_rejects_short_buffer() {
+        let h = ChunkHeader::default();
+        let mut buf = [0u8; BLOSC_EXTENDED_HEADER_LENGTH - 1];
+
+        assert!(h.try_write(&mut buf).is_err());
+    }
+
+    #[test]
     fn test_nblocks_calculation() {
         let h = ChunkHeader {
             nbytes: 10000,
@@ -186,5 +205,29 @@ mod tests {
         };
         assert_eq!(h.nblocks(), 3); // ceil(10000/4096)
         assert_eq!(h.leftover(), 10000 - 4096 * 2);
+    }
+
+    #[test]
+    fn test_nblocks_rejects_invalid_signed_sizes() {
+        for h in [
+            ChunkHeader {
+                nbytes: -1,
+                blocksize: 4096,
+                ..Default::default()
+            },
+            ChunkHeader {
+                nbytes: 10000,
+                blocksize: -1,
+                ..Default::default()
+            },
+            ChunkHeader {
+                nbytes: 10000,
+                blocksize: 0,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(h.nblocks(), 0);
+            assert_eq!(h.leftover(), 0);
+        }
     }
 }
