@@ -1,6 +1,6 @@
 [package]
 name = "blosc2-pure-rs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Rust implementation of the Blosc2 high-performance compression library"
 license = "BSD-3-Clause"
@@ -12,6 +12,9 @@ keywords = ["compression", "blosc", "lz4", "zstd", "shuffle"]
 categories = ["compression", "encoding"]
 include = [
     "/src/**/*.rs",
+    "/benches/**/*.rs",
+    "/docs/**/*.md",
+    "/examples/**/*.rs",
     "/build.rs",
     "/Cargo.toml",
     "/README.md",
@@ -30,6 +33,12 @@ required-features = ["cli"]
 [features]
 default = []
 cli = ["dep:clap"]
+# Use flate2's zlib-rs backend instead of the default miniz_oxide backend.
+# This remains pure Rust and is useful for performance comparisons.
+zlib-rs = ["flate2/zlib-rs"]
+# Enable temporary native LZ4HC compression through lz4-sys.
+# Pure-Rust LZ4HC compression is out of scope for now.
+lz4hc-sys = ["dep:lz4-sys"]
 # Internal feature for development testing against C-Blosc2.
 # Not part of the public API. Requires c-blosc2 source in c-blosc2/.
 _ffi = ["dep:cmake", "dep:bindgen"]
@@ -38,12 +47,17 @@ _ffi = ["dep:cmake", "dep:bindgen"]
 clap = { version = "4", features = ["derive"], optional = true }
 rayon = "1"
 lz4_flex = "0.13"
-lz4-sys = "1.11"
+lz4-sys = { version = "1.11", optional = true }
 flate2 = "1"
 zstd = "0.13"
 
 [dev-dependencies]
+criterion = "0.5"
 tempfile = "3"
+
+[[bench]]
+name = "perf"
+harness = false
 
 [profile.release]
 lto = true

@@ -2987,13 +2987,21 @@ mod tests {
 
     #[test]
     fn test_schunk_frame_roundtrip_matrix() {
-        for &compcode in &[
-            BLOSC_BLOSCLZ,
-            BLOSC_LZ4,
-            BLOSC_LZ4HC,
-            BLOSC_ZLIB,
-            BLOSC_ZSTD,
-        ] {
+        let codecs = {
+            let codecs = vec![BLOSC_BLOSCLZ, BLOSC_LZ4, BLOSC_ZLIB, BLOSC_ZSTD];
+            #[cfg(feature = "lz4hc-sys")]
+            {
+                let mut codecs = codecs;
+                codecs.insert(2, BLOSC_LZ4HC);
+                codecs
+            }
+            #[cfg(not(feature = "lz4hc-sys"))]
+            {
+                codecs
+            }
+        };
+
+        for compcode in codecs {
             let cparams = CParams {
                 compcode,
                 clevel: 5,

@@ -239,6 +239,7 @@ fn vl_dict_blocks() -> Vec<Vec<u8>> {
 unsafe fn c_vl_compress(
     blocks: &[Vec<u8>],
     compcode: u8,
+    typesize: i32,
     nthreads: i16,
     use_dict: bool,
 ) -> Vec<u8> {
@@ -254,7 +255,7 @@ unsafe fn c_vl_compress(
     let mut cparams: ffi::blosc2_cparams = std::mem::zeroed();
     cparams.compcode = compcode;
     cparams.clevel = 5;
-    cparams.typesize = 1;
+    cparams.typesize = typesize;
     cparams.nthreads = nthreads;
     cparams.splitmode = BLOSC_FORWARD_COMPAT_SPLIT;
     cparams.use_dict = i32::from(use_dict);
@@ -322,7 +323,7 @@ fn test_vlblocks_c_compress_rust_decompress() {
         BLOSC_ZLIB,
         BLOSC_ZSTD,
     ] {
-        let c_chunk = unsafe { c_vl_compress(&blocks, compcode, 4, false) };
+        let c_chunk = unsafe { c_vl_compress(&blocks, compcode, 1, 4, false) };
         assert_eq!(vlchunk_get_nblocks(&c_chunk).unwrap(), blocks.len());
         assert_eq!(decompress(&c_chunk).unwrap(), expected_concat);
         assert_eq!(vldecompress(&c_chunk).unwrap(), blocks);
@@ -413,13 +414,55 @@ fn test_vlblocks_rust_compress_c_decompress() {
 }
 
 #[test]
+fn test_vlblocks_typesize4_cross_compat() {
+    let _b = init_blosc2();
+    let blocks: Vec<Vec<u8>> = vec![
+        (0..33u32).flat_map(u32::to_le_bytes).collect(),
+        (1000..1097u32).flat_map(u32::to_le_bytes).collect(),
+        b"not-a-multiple-of-typesize".to_vec(),
+    ];
+    let block_refs: Vec<&[u8]> = blocks.iter().map(Vec::as_slice).collect();
+    let expected_concat: Vec<u8> = blocks.iter().flatten().copied().collect();
+
+    let c_chunk = unsafe { c_vl_compress(&blocks, BLOSC_LZ4, 4, 4, false) };
+    assert_eq!(vlchunk_get_nblocks(&c_chunk).unwrap(), blocks.len());
+    assert_eq!(vldecompress(&c_chunk).unwrap(), blocks);
+    assert_eq!(decompress(&c_chunk).unwrap(), expected_concat);
+
+    let cparams = CParams {
+        compcode: BLOSC_LZ4,
+        clevel: 5,
+        typesize: 4,
+        nthreads: 4,
+        splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
+        filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+        ..Default::default()
+    };
+    let rust_chunk = vlcompress(&block_refs, &cparams).unwrap();
+    let c_blocks = unsafe { c_vl_decompress(&rust_chunk, blocks.len()) };
+    assert_eq!(c_blocks, blocks);
+
+    let mut c_decompressed = vec![0u8; expected_concat.len()];
+    let dsize = unsafe {
+        ffi::blosc2_decompress(
+            rust_chunk.as_ptr() as *const c_void,
+            rust_chunk.len() as i32,
+            c_decompressed.as_mut_ptr() as *mut c_void,
+            c_decompressed.len() as i32,
+        )
+    };
+    assert_eq!(dsize, expected_concat.len() as i32);
+    assert_eq!(c_decompressed, expected_concat);
+}
+
+#[test]
 fn test_zstd_dictionary_vlblocks_cross_compat() {
     let _b = init_blosc2();
     let blocks = vl_dict_blocks();
     let block_refs: Vec<&[u8]> = blocks.iter().map(Vec::as_slice).collect();
     let expected_concat: Vec<u8> = blocks.iter().flatten().copied().collect();
 
-    let c_chunk = unsafe { c_vl_compress(&blocks, BLOSC_ZSTD, 4, true) };
+    let c_chunk = unsafe { c_vl_compress(&blocks, BLOSC_ZSTD, 1, 4, true) };
     assert_eq!(vlchunk_get_nblocks(&c_chunk).unwrap(), blocks.len());
     assert_eq!(vldecompress(&c_chunk).unwrap(), blocks);
     assert_eq!(decompress(&c_chunk).unwrap(), expected_concat);

@@ -60,6 +60,9 @@ pub fn shuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
         dest[..blocksize].copy_from_slice(&src[..blocksize]);
         return;
     }
+    if shuffle_common_width(typesize, src, dest) {
+        return;
+    }
     if simd::try_shuffle(typesize, src, dest) {
         return;
     }
@@ -90,6 +93,9 @@ pub fn unshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
         dest[..blocksize].copy_from_slice(&src[..blocksize]);
         return;
     }
+    if unshuffle_common_width(typesize, src, dest) {
+        return;
+    }
     if simd::try_unshuffle(typesize, src, dest) {
         return;
     }
@@ -108,6 +114,140 @@ pub fn unshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
         let start = blocksize - neblock_rem;
         dest[start..blocksize].copy_from_slice(&src[start..blocksize]);
     }
+}
+
+fn shuffle_common_width(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
+    match typesize {
+        2 => {
+            shuffle2(src, dest);
+            true
+        }
+        4 => {
+            shuffle4(src, dest);
+            true
+        }
+        8 => {
+            shuffle8(src, dest);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn unshuffle_common_width(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
+    match typesize {
+        2 => {
+            unshuffle2(src, dest);
+            true
+        }
+        4 => {
+            unshuffle4(src, dest);
+            true
+        }
+        8 => {
+            unshuffle8(src, dest);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn shuffle2(src: &[u8], dest: &mut [u8]) {
+    let nelements = src.len() / 2;
+    let main_len = nelements * 2;
+    let (d0, d1) = dest[..main_len].split_at_mut(nelements);
+    for (i, element) in src[..main_len].chunks_exact(2).enumerate() {
+        d0[i] = element[0];
+        d1[i] = element[1];
+    }
+    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
+}
+
+fn unshuffle2(src: &[u8], dest: &mut [u8]) {
+    let nelements = src.len() / 2;
+    let main_len = nelements * 2;
+    let (s0, s1) = src[..main_len].split_at(nelements);
+    for (i, element) in dest[..main_len].chunks_exact_mut(2).enumerate() {
+        element[0] = s0[i];
+        element[1] = s1[i];
+    }
+    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
+}
+
+fn shuffle4(src: &[u8], dest: &mut [u8]) {
+    let nelements = src.len() / 4;
+    let main_len = nelements * 4;
+    let (d0, rest) = dest[..main_len].split_at_mut(nelements);
+    let (d1, rest) = rest.split_at_mut(nelements);
+    let (d2, d3) = rest.split_at_mut(nelements);
+    for (i, element) in src[..main_len].chunks_exact(4).enumerate() {
+        d0[i] = element[0];
+        d1[i] = element[1];
+        d2[i] = element[2];
+        d3[i] = element[3];
+    }
+    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
+}
+
+fn unshuffle4(src: &[u8], dest: &mut [u8]) {
+    let nelements = src.len() / 4;
+    let main_len = nelements * 4;
+    let (s0, rest) = src[..main_len].split_at(nelements);
+    let (s1, rest) = rest.split_at(nelements);
+    let (s2, s3) = rest.split_at(nelements);
+    for (i, element) in dest[..main_len].chunks_exact_mut(4).enumerate() {
+        element[0] = s0[i];
+        element[1] = s1[i];
+        element[2] = s2[i];
+        element[3] = s3[i];
+    }
+    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
+}
+
+fn shuffle8(src: &[u8], dest: &mut [u8]) {
+    let nelements = src.len() / 8;
+    let main_len = nelements * 8;
+    let (d0, rest) = dest[..main_len].split_at_mut(nelements);
+    let (d1, rest) = rest.split_at_mut(nelements);
+    let (d2, rest) = rest.split_at_mut(nelements);
+    let (d3, rest) = rest.split_at_mut(nelements);
+    let (d4, rest) = rest.split_at_mut(nelements);
+    let (d5, rest) = rest.split_at_mut(nelements);
+    let (d6, d7) = rest.split_at_mut(nelements);
+    for (i, element) in src[..main_len].chunks_exact(8).enumerate() {
+        d0[i] = element[0];
+        d1[i] = element[1];
+        d2[i] = element[2];
+        d3[i] = element[3];
+        d4[i] = element[4];
+        d5[i] = element[5];
+        d6[i] = element[6];
+        d7[i] = element[7];
+    }
+    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
+}
+
+fn unshuffle8(src: &[u8], dest: &mut [u8]) {
+    let nelements = src.len() / 8;
+    let main_len = nelements * 8;
+    let (s0, rest) = src[..main_len].split_at(nelements);
+    let (s1, rest) = rest.split_at(nelements);
+    let (s2, rest) = rest.split_at(nelements);
+    let (s3, rest) = rest.split_at(nelements);
+    let (s4, rest) = rest.split_at(nelements);
+    let (s5, rest) = rest.split_at(nelements);
+    let (s6, s7) = rest.split_at(nelements);
+    for (i, element) in dest[..main_len].chunks_exact_mut(8).enumerate() {
+        element[0] = s0[i];
+        element[1] = s1[i];
+        element[2] = s2[i];
+        element[3] = s3[i];
+        element[4] = s4[i];
+        element[5] = s5[i];
+        element[6] = s6[i];
+        element[7] = s7[i];
+    }
+    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

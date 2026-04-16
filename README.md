@@ -4,20 +4,40 @@ A pure Rust implementation of the [Blosc2](https://www.blosc.org/) high-performa
 
 Blosc2 is a block-oriented compressor optimized for binary data such as numerical arrays, tensors, and structured formats. It applies a filter pipeline (shuffle, bitshuffle, delta) before compression to exploit data patterns, then compresses with one of several codecs.
 
-This is a translation of the original code and not the authoritative implementation. This code should generate bitwise
-equal output to the original. Please report any deviations.
-
-The aim of this project is to increase performance, especially by providing this code through a type-safe library interface.
-The code can also be compiled to be used for webassembly.
-The aim is a pure Rust runtime implementation. LZ4HC compression is currently out of scope for the pure-Rust target;
-the crate uses `lz4-sys` as a temporary compatibility shim. Anyone interested in pure-Rust LZ4HC support can contact us
-about having it added.
+The aim is a pure Rust runtime implementation. 
+* LZ4HC compression is currently out of scope for the pure-Rust target. The default build rejects LZ4HC compression.
+* Enable the `lz4hc-sys` feature to use `lz4-sys` as a temporary compatibility shim while a pure-Rust replacement is unavailable.
+* Anyone interested in pure-Rust LZ4HC support can contact us about having it added.
 
 Compressing is currently slower than C. This will be fixed in the future
 
+## This is an LLM-mediated faithful (hopefully) translation, not the original code! 
+
+Most users should probably first see if the existing original code works for them, unless they have reason otherwise. The original source
+may have newer features and it has had more love in terms of fixing bugs. In fact, we aim to replicate bugs if they are present, for the
+sake of reproducibility! (but then we might have added a few more in the process)
+
+There are however cases when you might prefer this Rust version. We generally agree with [this manifesto](https://rewrites.bio/) but more specifically:
+* We have had many issues with ensuring that our software works using existing containers (Docker, PodMan, Singularity). One size does not fit all and it eats our resources trying to keep up with every way of delivering software
+* Common package managers do not work well. It was great when we had a few Linux distributions with stable procedures, but now there are just too many ecosystems (Homebrew, Conda). Conda has an NP-complete resolver which does not scale. Homebrew is only so-stable. And our dependencies in Python still break. These can no longer be considered professional serious options. Meanwhile, Cargo enables multiple versions of packages to be available, even within the same program(!)
+* The future is the web. We deploy software in the web browser, and until now that has meant Javascript. This is a language where even the == operator is broken. Typescript is one step up, but a game changer is the ability to compile Rust code into webassembly, enabling performance and sharing of code with the backend. Translating code to Rust enables new ways of deployment and running code in the browser has especial benefits for science - researchers do not have deep pockets to run servers, so pushing compute to the user enables deployment that otherwise would be impossible
+* Old CLI-based utilities are bad for the environment(!). A large amount of compute resources are spent creating and communicating via small files, which we can bypass by using code as libraries. Even better, we can avoid frequent reloading of databases by hoisting this stage, with up to 100x speedups in some cases. Less compute means faster compute and less electricity wasted
+* LLM-mediated translations may actually be safer to use than the original code. This article shows that [running the same code on different operating systems can give somewhat different answers](https://doi.org/10.1038/nbt.3820). This is a gap that Rust+Cargo can reduce. Typesafe interfaces also reduce coding mistakes and error handling, as opposed to typical command-line scripting
+
+But:
+
+* **This approach should still be considered experimental**. The LLM technology is immature and has sharp corners. But there are opportunities to reap, and the genie is not going back into the bottle. This translation is as much aimed to learn how to improve the technology and get feedback on the results.
+* Translations are not endorsed by the original authors unless otherwise noted. **Do not send bug reports to the original developers**. Use our Github issues page instead.
+* **Do not trust the benchmarks on this page**. They are used to help evaluate the translation. If you want improved performance, you generally have to use this code as a library, and use the additional tricks it offers. We generally accept performance losses in order to reduce our dependency issues
+* **Check the original Github pages for information about the package**. This README is kept sparse on purpose. It is not meant to be the primary source of information
+* **If you are the author of the original code and wish to move to Rust, you can obtain ownership of this repository and crate**. Until then, our commitment is to offer an as-faithful-as-possible translation of a snapshot of your code. If we find serious bugs, we will report them to you. Otherwise we will just replicate them, to ensure comparability across studies that claim to use package XYZ v.666. Think of this like a fancy Ubuntu .deb-package of your software - that is how we treat it
+
+This blurb might be out of date. Go to [this page](https://github.com/henriksson-lab/rustification) for the latest information and further information about how we approach translation
+
+
 ## Features
 
-- **5 codecs**: BloscLZ (ported from C), LZ4, LZ4HC, Zlib, Zstd
+- **5 codecs**: BloscLZ (ported from C), LZ4, Zlib, Zstd, plus feature-gated LZ4HC compression
 - **4 filters**: Shuffle, Bitshuffle, Delta, Truncated Precision
 - **Frame format**: Compatible with C-Blosc2 `.b2frame` files (read and write)
 - **Lazy frame reads**: File-backed `LazySchunk` loads compressed chunks on demand
@@ -26,12 +46,15 @@ Compressing is currently slower than C. This will be fixed in the future
 - **Zstd dictionaries**: Per-chunk dictionary training with C/Rust-compatible dictionary chunks
 - **CLI**: Compress and decompress files (optional `cli` feature)
 - **Library API**: In-memory compression with `Schunk` container
-- **Mostly Rust runtime**: LZ4HC temporarily uses `lz4-sys`; pure-Rust LZ4HC is out of scope for now
+- **Pure-Rust default build**: LZ4HC compression is feature-gated behind the temporary `lz4hc-sys` shim
 
 ## Current Limitations
 
-- `lz4hc` currently uses `lz4-sys` for true LZ4HC compression. Pure-Rust LZ4HC is out of scope for now; anyone
-  interested in having it added can contact us.
+- `lz4hc` compression requires the `lz4hc-sys` feature, which uses `lz4-sys` for true LZ4HC compression. Pure-Rust
+  LZ4HC is out of scope for now; anyone interested in having it added can contact us. LZ4HC decompression remains
+  available in default builds through the pure-Rust LZ4 decoder.
+- B2ND metadata serialization supports up to 15 dimensions. 16-D arrays are extremely uncommon and are out of scope
+  for now.
 
 ## Installation
 
@@ -58,7 +81,7 @@ blosc2 compress floats.bin floats-trunc.b2frame -f truncprec --filter-meta 16 -t
 ```
 
 Options:
-- `-c, --codec`: Compression codec (`blosclz`, `lz4`, `lz4hc`, `zlib`, `zstd`). Default: `blosclz`
+- `-c, --codec`: Compression codec (`blosclz`, `lz4`, `lz4hc`, `zlib`, `zstd`). `lz4hc` requires `lz4hc-sys`. Default: `blosclz`
 - `-l, --clevel`: Compression level (0-9). Default: `9`
 - `-t, --typesize`: Element type size in bytes. Default: `1`
 - `-b, --blocksize`: Explicit block size in bytes (`0` = automatic). Default: `0`
@@ -188,33 +211,35 @@ assert_eq!(restored, data);
 
 ## Benchmarks
 
-10 MiB deterministic float32 signal data with noise, single-threaded, compiled with
-`-C target-cpu=native`. All comparisons are 1 thread vs 1 thread against the local C-Blosc2 3.0.0
-test helper binaries, measured on April 15, 2026.
+10 MiB inputs, single-threaded, compiled with `-C target-cpu=native`. LZ4HC rows use the optional
+`lz4hc-sys` feature. All comparisons are
+1 thread vs 1 thread against the local C-Blosc2 3.0.0 test helper binaries, measured on
+April 16, 2026. Values are median MB/s across 5 runs, and decompressed output was verified
+against the original input.
 
 ### Realistic data (10 MiB float32 signal data with noise)
 
-| Codec | Compress (MB/s) | Decompress (MB/s) | Ratio |
-|-------|----------------:|-------------------:|------:|
-| C-Blosc2 BloscLZ (typesize=1) | 441 | 449 | 1.0x |
-| Rust BloscLZ (typesize=1) | 193 | 669 | 1.0x |
-| C-Blosc2 BloscLZ (typesize=4) | 155 | 358 | 1.5x |
-| Rust BloscLZ (typesize=4) | 139 | 242 | 1.5x |
-| C-Blosc2 LZ4 (typesize=4) | 340 | 911 | 1.6x |
-| Rust LZ4 (typesize=4) | 212 | 257 | 1.6x |
-| C-Blosc2 Zstd (typesize=4) | 2 | 662 | 1.8x |
-| Rust Zstd (typesize=4) | 135 | 267 | 1.7x |
+| Codec | Typesize | C Compress (MB/s) | Rust Compress (MB/s) | C Decompress (MB/s) | Rust Decompress (MB/s) | Ratio |
+|-------|---------:|------------------:|---------------------:|--------------------:|-----------------------:|------:|
+| BloscLZ | 1 | 282.7 | 263.6 | 526.7 | 852.8 | 1.0x |
+| BloscLZ | 4 | 333.9 | 204.6 | 501.7 | 569.7 | 1.3x |
+| LZ4 | 4 | 274.1 | 206.9 | 455.0 | 583.5 | 1.3x |
+| LZ4HC | 4 | 322.1 | 27.9 | 465.6 | 596.6 | C 1.3x / Rust 1.4x |
+| Zlib | 4 | 319.3 | 22.1 | 496.0 | 328.2 | C 1.3x / Rust 1.5x |
+| Zstd | 4 | 2.3 | 68.8 | 336.6 | 532.5 | C 1.5x / Rust 1.4x |
 
 ### Random data (10 MiB, incompressible)
 
-| Codec | Compress (MB/s) | Decompress (MB/s) |
-|-------|----------------:|-------------------:|
-| C-Blosc2 BloscLZ | 350 | 519 |
-| Rust BloscLZ | 221 | 619 |
+| Codec | Typesize | C Compress (MB/s) | Rust Compress (MB/s) | C Decompress (MB/s) | Rust Decompress (MB/s) | Ratio |
+|-------|---------:|------------------:|---------------------:|--------------------:|-----------------------:|------:|
+| BloscLZ | 1 | 302.3 | 258.6 | 547.9 | 849.3 | 1.0x |
+| LZ4 | 4 | 319.4 | 179.8 | 1038.1 | 690.2 | 1.0x |
 
-Rust BloscLZ decompression is faster than C on the incompressible random case in this local run, but
-compression is currently slower. SIMD acceleration uses audited SSE2 bitshuffle/bitunshuffle wrappers
-and SSE2/AVX2 shuffle/unshuffle wrappers with scalar fallback.
+Rust BloscLZ `typesize=1` compression is close to C and Rust decompression is faster in these
+local runs. `typesize=4` BloscLZ/LZ4 compression remains slower than C, but `typesize=4`
+decompression is faster for the signal-data cases in this run. zlib compression and optional
+`lz4hc-sys` LZ4HC compression remain slower than C. SIMD acceleration uses audited SSE2
+bitshuffle/bitunshuffle wrappers and specialized safe shuffle/unshuffle paths with scalar fallback.
 
 ## Codec Comparison
 
@@ -222,7 +247,7 @@ and SSE2/AVX2 shuffle/unshuffle wrappers with scalar fallback.
 |-------|-------|-------------|----------|
 | BloscLZ | Fast | Moderate | General purpose |
 | LZ4 | Fastest | Moderate | Speed-critical |
-| LZ4HC | Slow | Good | Via `lz4-sys`; pure-Rust LZ4HC is out of scope |
+| LZ4HC | Slow | Good | Optional `lz4hc-sys` shim; pure-Rust LZ4HC is out of scope |
 | Zlib | Slow | Good | Balanced |
 | Zstd | Moderate | Best | Storage-critical |
 
@@ -231,6 +256,9 @@ and SSE2/AVX2 shuffle/unshuffle wrappers with scalar fallback.
 ```bash
 cargo build --release                              # Library only
 cargo build --release --features cli               # Library + CLI
+cargo build --release --features zlib-rs           # Use flate2's zlib-rs backend
+cargo build --release --features lz4hc-sys         # Enable temporary lz4-sys LZ4HC compression
+cargo build --release --features "cli lz4hc-sys"   # CLI with LZ4HC compression
 ```
 
 For benchmarks, compile with native CPU optimizations:
@@ -238,6 +266,10 @@ For benchmarks, compile with native CPU optimizations:
 ```bash
 RUSTFLAGS="-C target-cpu=native" cargo build --release --features cli
 ```
+
+The default zlib backend is `flate2`'s pure-Rust miniz backend. The `zlib-rs` feature is also
+pure Rust and can be tested locally; in the current benchmark workload it was slightly slower
+than the default, so it is not enabled by default.
 
 ## Testing
 

@@ -6,7 +6,14 @@ fn main() {
 #[cfg(feature = "_ffi")]
 fn build_ffi() {
     use std::env;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    if !Path::new("c-blosc2").exists() {
+        println!(
+            "cargo:warning=_ffi feature enabled, but c-blosc2/ is not present; skipping C-Blosc2 FFI build"
+        );
+        return;
+    }
 
     let dst = cmake::Config::new("c-blosc2")
         .define("BUILD_TESTS", "OFF")

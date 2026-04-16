@@ -282,6 +282,168 @@ impl B2ndArray {
         }
         Ok(out)
     }
+
+    pub fn shape(&self) -> &[i64] {
+        &self.meta.shape
+    }
+
+    pub fn chunkshape(&self) -> &[i32] {
+        &self.meta.chunkshape
+    }
+
+    pub fn blockshape(&self) -> &[i32] {
+        &self.meta.blockshape
+    }
+
+    /// Return a dense row-major buffer for the half-open item slice
+    /// `start..stop` in each dimension.
+    pub fn get_slice(&self, start: &[i64], stop: &[i64]) -> Result<Vec<u8>, &'static str> {
+        let typesize = self.schunk.cparams.typesize as usize;
+        let slice = validate_slice_bounds(&self.meta, start, stop)?;
+        let dense = self.to_cbuffer()?;
+        let out_len = product_usize(&slice.extents)?
+            .checked_mul(typesize)
+            .ok_or("B2ND slice too large")?;
+        let mut out = vec![0u8; out_len];
+        copy_dense_region(
+            &dense,
+            DenseRegion {
+                shape: &self.meta.shape,
+                start: &slice.starts,
+            },
+            &mut out,
+            DenseRegion {
+                shape: &slice.extents_as_i64,
+                start: &vec![0; slice.extents.len()],
+            },
+            &slice.extents,
+            typesize,
+        )?;
+        Ok(out)
+    }
+
+    /// Overwrite the half-open item slice `start..stop` from a dense row-major
+    /// source buffer whose shape is `stop - start`.
+    pub fn set_slice(
+        &mut self,
+        start: &[i64],
+        stop: &[i64],
+        data: &[u8],
+    ) -> Result<(), &'static str> {
+        let typesize = self.schunk.cparams.typesize as usize;
+        let slice = validate_slice_bounds(&self.meta, start, stop)?;
+        let expected_len = product_usize(&slice.extents)?
+            .checked_mul(typesize)
+            .ok_or("B2ND slice too large")?;
+        if data.len() != expected_len {
+            return Err("B2ND slice buffer size does not match slice shape and typesize");
+        }
+
+        let mut dense = self.to_cbuffer()?;
+        copy_dense_region(
+            data,
+            DenseRegion {
+                shape: &slice.extents_as_i64,
+                start: &vec![0; slice.extents.len()],
+            },
+            &mut dense,
+            DenseRegion {
+                shape: &self.meta.shape,
+                start: &slice.starts,
+            },
+            &slice.extents,
+            typesize,
+        )?;
+        self.rebuild_from_dense(self.meta.clone(), &dense)
+    }
+
+    /// Resize the array, preserving the overlapping prefix region and zero-filling
+    /// new cells.
+    pub fn resize(&mut self, new_shape: Vec<i64>) -> Result<(), &'static str> {
+        let mut new_meta = self.meta.clone();
+        new_meta.shape = new_shape;
+        new_meta.validate()?;
+
+        let typesize = self.schunk.cparams.typesize as usize;
+        let old_dense = self.to_cbuffer()?;
+        let new_len = new_meta
+            .nitems()?
+            .checked_mul(typesize)
+            .ok_or("B2ND buffer too large")?;
+        let mut new_dense = vec![0u8; new_len];
+        let overlap: Vec<usize> = self
+            .meta
+            .shape
+            .iter()
+            .zip(&new_meta.shape)
+            .map(|(&old_dim, &new_dim)| old_dim.min(new_dim) as usize)
+            .collect();
+        let zero_start = vec![0; overlap.len()];
+        copy_dense_region(
+            &old_dense,
+            DenseRegion {
+                shape: &self.meta.shape,
+                start: &zero_start,
+            },
+            &mut new_dense,
+            DenseRegion {
+                shape: &new_meta.shape,
+                start: &zero_start,
+            },
+            &overlap,
+            typesize,
+        )?;
+        self.rebuild_from_dense(new_meta, &new_dense)
+    }
+
+    fn rebuild_from_dense(&mut self, meta: B2ndMeta, data: &[u8]) -> Result<(), &'static str> {
+        let rebuilt = Self::from_cbuffer(
+            meta,
+            data,
+            self.schunk.cparams.clone(),
+            self.schunk.dparams.clone(),
+        )?;
+        *self = rebuilt;
+        Ok(())
+    }
+}
+
+struct B2ndSlice {
+    starts: Vec<usize>,
+    extents: Vec<usize>,
+    extents_as_i64: Vec<i64>,
+}
+
+fn validate_slice_bounds(
+    meta: &B2ndMeta,
+    start: &[i64],
+    stop: &[i64],
+) -> Result<B2ndSlice, &'static str> {
+    let ndim = meta.ndim();
+    if start.len() != ndim || stop.len() != ndim {
+        return Err("B2ND slice rank does not match array rank");
+    }
+
+    let mut starts = Vec::with_capacity(ndim);
+    let mut extents = Vec::with_capacity(ndim);
+    let mut extents_as_i64 = Vec::with_capacity(ndim);
+    for dim in 0..ndim {
+        if start[dim] < 0 || stop[dim] > meta.shape[dim] || start[dim] >= stop[dim] {
+            return Err("Invalid B2ND slice bounds");
+        }
+        let extent = stop[dim]
+            .checked_sub(start[dim])
+            .ok_or("Invalid B2ND slice bounds")?;
+        starts.push(start[dim] as usize);
+        extents.push(extent as usize);
+        extents_as_i64.push(extent);
+    }
+    product_usize(&extents)?;
+    Ok(B2ndSlice {
+        starts,
+        extents,
+        extents_as_i64,
+    })
 }
 
 fn expect_byte(data: &[u8], pos: &mut usize, expected: u8) -> Result<(), &'static str> {
@@ -398,6 +560,57 @@ fn byte_strides_i64(shape: &[i64], typesize: usize) -> Result<Vec<usize>, &'stat
             .ok_or("B2ND shape too large")?;
     }
     Ok(strides)
+}
+
+fn dense_offset(starts: &[usize], idx: &[usize], strides: &[usize]) -> Result<usize, &'static str> {
+    starts
+        .iter()
+        .zip(idx)
+        .zip(strides)
+        .try_fold(0usize, |acc, ((&start, &idx), &stride)| {
+            start
+                .checked_add(idx)
+                .and_then(|coord| coord.checked_mul(stride))
+                .and_then(|offset| acc.checked_add(offset))
+                .ok_or("B2ND dense offset overflow")
+        })
+}
+
+struct DenseRegion<'a> {
+    shape: &'a [i64],
+    start: &'a [usize],
+}
+
+fn copy_dense_region(
+    src: &[u8],
+    src_region: DenseRegion<'_>,
+    dst: &mut [u8],
+    dst_region: DenseRegion<'_>,
+    extents: &[usize],
+    typesize: usize,
+) -> Result<(), &'static str> {
+    if src_region.shape.len() != extents.len()
+        || dst_region.shape.len() != extents.len()
+        || src_region.start.len() != extents.len()
+        || dst_region.start.len() != extents.len()
+    {
+        return Err("B2ND dense copy rank mismatch");
+    }
+    let src_strides = byte_strides_i64(src_region.shape, typesize)?;
+    let dst_strides = byte_strides_i64(dst_region.shape, typesize)?;
+    copy_region(
+        0,
+        extents,
+        |idx| {
+            Ok((
+                dense_offset(src_region.start, idx, &src_strides)?,
+                dense_offset(dst_region.start, idx, &dst_strides)?,
+            ))
+        },
+        src,
+        dst,
+        typesize,
+    )
 }
 
 struct B2ndLayout {
@@ -634,5 +847,73 @@ mod tests {
         let restored = B2ndArray::from_frame(&frame).unwrap();
         assert_eq!(restored.meta, meta);
         assert_eq!(restored.to_cbuffer().unwrap(), data);
+    }
+
+    fn u16_bytes(values: &[u16]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn test_b2nd_slice_set_and_resize_helpers() {
+        let meta = B2ndMeta::new(vec![5, 7], vec![3, 4], vec![3, 2], "<u2", 0).unwrap();
+        let values: Vec<u16> = (0..35u16).collect();
+        let data = u16_bytes(&values);
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 2,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            ..Default::default()
+        };
+        let mut array = B2ndArray::from_cbuffer(meta, &data, cparams, DParams::default()).unwrap();
+        assert_eq!(array.shape(), &[5, 7]);
+        assert_eq!(array.chunkshape(), &[3, 4]);
+        assert_eq!(array.blockshape(), &[3, 2]);
+
+        let slice = array.get_slice(&[1, 2], &[4, 6]).unwrap();
+        let mut expected_slice = Vec::new();
+        for row in 1..4 {
+            for col in 2..6 {
+                expected_slice.push(values[row * 7 + col]);
+            }
+        }
+        assert_eq!(slice, u16_bytes(&expected_slice));
+
+        let replacement: Vec<u16> = (1000..1012).collect();
+        array
+            .set_slice(&[1, 2], &[4, 6], &u16_bytes(&replacement))
+            .unwrap();
+        let mut expected = values.clone();
+        for (idx, value) in replacement.iter().enumerate() {
+            let row = 1 + idx / 4;
+            let col = 2 + idx % 4;
+            expected[row * 7 + col] = *value;
+        }
+        assert_eq!(array.to_cbuffer().unwrap(), u16_bytes(&expected));
+
+        array.resize(vec![6, 4]).unwrap();
+        assert_eq!(array.shape(), &[6, 4]);
+        let mut resized = vec![0u16; 6 * 4];
+        for row in 0..5 {
+            for col in 0..4 {
+                resized[row * 4 + col] = expected[row * 7 + col];
+            }
+        }
+        assert_eq!(array.to_cbuffer().unwrap(), u16_bytes(&resized));
+
+        array.resize(vec![2, 3]).unwrap();
+        let mut shrunk = Vec::new();
+        for row in 0..2 {
+            for col in 0..3 {
+                shrunk.push(resized[row * 4 + col]);
+            }
+        }
+        assert_eq!(array.to_cbuffer().unwrap(), u16_bytes(&shrunk));
+        assert!(array.get_slice(&[0, 0], &[0, 1]).is_err());
+        assert!(array.set_slice(&[0, 0], &[1, 1], &[1, 2, 3]).is_err());
     }
 }

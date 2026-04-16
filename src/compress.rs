@@ -227,6 +227,10 @@ fn validate_cparams(cparams: &CParams, nbytes: usize) -> Result<(), &'static str
     {
         return Err("Unsupported codec");
     }
+    #[cfg(not(feature = "lz4hc-sys"))]
+    if cparams.compcode == BLOSC_LZ4HC {
+        return Err("LZ4HC compression requires the lz4hc-sys feature");
+    }
     if cparams.use_dict && cparams.compcode != BLOSC_ZSTD {
         return Err("Dictionary compression is only supported for Zstd");
     }
@@ -458,6 +462,36 @@ fn compress_block(
     typesize: usize,
 ) -> (Vec<u8>, bool) {
     let bsize = block_data.len();
+    let filters_are_noop = cparams
+        .filters
+        .iter()
+        .all(|&f| f == BLOSC_NOFILTER || (f == BLOSC_SHUFFLE && typesize <= 1));
+    if filters_are_noop {
+        return compress_pre_filtered_block(
+            block_data,
+            cparams,
+            dont_split,
+            typesize,
+            is_leftover,
+            None,
+        );
+    }
+
+    if let Some(shuffle_typesize) =
+        single_shuffle_filter(&cparams.filters, &cparams.filters_meta, typesize)
+    {
+        let mut filtered = vec![0u8; bsize];
+        filters::shuffle(shuffle_typesize, block_data, &mut filtered);
+        return compress_pre_filtered_block(
+            &filtered,
+            cparams,
+            dont_split,
+            typesize,
+            is_leftover,
+            None,
+        );
+    }
+
     let mut buf1 = vec![0u8; bsize];
     let mut buf2 = vec![0u8; bsize];
 
@@ -483,6 +517,32 @@ fn compress_block(
     compress_pre_filtered_block(filtered, cparams, dont_split, typesize, is_leftover, None)
 }
 
+fn single_shuffle_filter(
+    filters: &[u8; BLOSC2_MAX_FILTERS],
+    filters_meta: &[u8; BLOSC2_MAX_FILTERS],
+    typesize: usize,
+) -> Option<usize> {
+    let mut shuffle_typesize = None;
+    for (idx, &filter) in filters.iter().enumerate() {
+        if filter == BLOSC_NOFILTER {
+            continue;
+        }
+        if filter != BLOSC_SHUFFLE || shuffle_typesize.is_some() {
+            return None;
+        }
+        let ts = if filters_meta[idx] == 0 {
+            typesize
+        } else {
+            filters_meta[idx] as usize
+        };
+        if ts <= 1 {
+            return None;
+        }
+        shuffle_typesize = Some(ts);
+    }
+    shuffle_typesize
+}
+
 fn compress_pre_filtered_block(
     filtered: &[u8],
     cparams: &CParams,
@@ -498,6 +558,8 @@ fn compress_pre_filtered_block(
 
     let mut result = Vec::with_capacity(bsize);
     let mut all_zero_runs = true;
+    let max_out = neblock + (neblock / 255) + 32;
+    let mut compressed = vec![0u8; max_out];
 
     for stream_idx in 0..nstreams {
         let stream_start = stream_idx * neblock;
@@ -516,8 +578,6 @@ fn compress_pre_filtered_block(
 
         all_zero_runs = false;
 
-        let max_out = neblock + (neblock / 255) + 32;
-        let mut compressed = vec![0u8; max_out];
         let cbytes = match dict {
             Some(dict) => codecs::compress_block_with_dict(
                 cparams.compcode,
@@ -565,6 +625,14 @@ fn filtered_blocks_for_dict(
             let block_data = &src[block_start..block_end];
             if filters_are_noop {
                 return block_data.to_vec();
+            }
+
+            if let Some(shuffle_typesize) =
+                single_shuffle_filter(&cparams.filters, &cparams.filters_meta, typesize)
+            {
+                let mut filtered = vec![0u8; bsize];
+                filters::shuffle(shuffle_typesize, block_data, &mut filtered);
+                return filtered;
             }
 
             let mut buf1 = vec![0u8; bsize];
@@ -790,12 +858,19 @@ pub fn compress(src: &[u8], cparams: &CParams) -> Result<Vec<u8>, &'static str> 
     } else {
         // Serial path: pre-allocate buffers once, write directly to output
         let max_compressed = nbytes as usize + header_len + bstarts_len + nblocks * 32;
-        output = vec![0u8; max_compressed];
+        output = Vec::with_capacity(max_compressed);
+        output.resize(header_len + bstarts_len, 0);
         output_pos = header_len + bstarts_len;
         all_zero_runs = true;
 
         let mut buf1 = vec![0u8; blocksize];
-        let mut buf2 = vec![0u8; blocksize];
+        let single_shuffle =
+            single_shuffle_filter(&cparams.filters, &cparams.filters_meta, typesize);
+        let mut buf2 = if single_shuffle.is_some() {
+            Vec::new()
+        } else {
+            vec![0u8; blocksize]
+        };
         let dref_end = blocksize.min(src.len());
         let mut compress_buf = vec![0u8; blocksize + (blocksize / 255) + 64];
 
@@ -814,6 +889,9 @@ pub fn compress(src: &[u8], cparams: &CParams) -> Result<Vec<u8>, &'static str> 
             // Get filtered data — skip pipeline if filters are no-ops
             let filtered: &[u8] = if filters_are_noop {
                 block_data
+            } else if let Some(shuffle_typesize) = single_shuffle {
+                filters::shuffle(shuffle_typesize, block_data, &mut buf1[..bsize]);
+                &buf1[..bsize]
             } else {
                 let fb = filters::pipeline_forward(
                     block_data,
@@ -962,9 +1040,6 @@ fn validate_vl_inputs(blocks: &[&[u8]], cparams: &CParams) -> Result<usize, &'st
             return Err("Dictionary VL-block chunks require compression");
         }
     }
-    if cparams.typesize != 1 {
-        return Err("VL-block compression currently requires typesize 1");
-    }
     if cparams.filters.contains(&BLOSC_DELTA) {
         return Err("VL-block compression does not support delta filters");
     }
@@ -993,6 +1068,14 @@ fn filtered_vl_blocks(blocks: &[&[u8]], cparams: &CParams) -> Vec<Vec<u8>> {
         .map(|block| {
             if filters_are_noop {
                 return block.to_vec();
+            }
+
+            if let Some(shuffle_typesize) =
+                single_shuffle_filter(&cparams.filters, &cparams.filters_meta, typesize)
+            {
+                let mut filtered = vec![0u8; block.len()];
+                filters::shuffle(shuffle_typesize, block, &mut filtered);
+                return filtered;
             }
 
             let mut buf1 = vec![0u8; block.len()];
@@ -1053,7 +1136,8 @@ fn compress_vl_block(block: &[u8], cparams: &CParams) -> Vec<u8> {
 
 /// Compress independent variable-length blocks into one Blosc2 VL-block chunk.
 ///
-/// This currently supports `typesize = 1`; dictionary mode is Zstd-only.
+/// Each VL block is filtered and compressed independently with block offset 0.
+/// Dictionary mode is Zstd-only.
 pub fn vlcompress(blocks: &[&[u8]], cparams: &CParams) -> Result<Vec<u8>, &'static str> {
     let total_nbytes = validate_vl_inputs(blocks, cparams)?;
     let header_len = BLOSC_EXTENDED_HEADER_LENGTH;
@@ -1887,21 +1971,32 @@ pub fn replace_aligned_blocks(
         }
 
         let mut buf1 = vec![0u8; bsize];
-        let mut buf2 = vec![0u8; bsize];
-        let filtered_buf = filters::pipeline_forward(
-            &block_data,
-            &mut buf1,
-            &mut buf2,
+        let single_shuffle = single_shuffle_filter(
             &header.filters,
             &header.filters_meta,
             header.typesize as usize,
-            block_start,
-            delta_ref.as_deref(),
         );
-        let filtered = if filtered_buf == 1 {
+        let mut buf2 = Vec::new();
+        let filtered = if let Some(shuffle_typesize) = single_shuffle {
+            filters::shuffle(shuffle_typesize, &block_data, &mut buf1);
             &buf1[..bsize]
         } else {
-            &buf2[..bsize]
+            buf2.resize(bsize, 0);
+            let filtered_buf = filters::pipeline_forward(
+                &block_data,
+                &mut buf1,
+                &mut buf2,
+                &header.filters,
+                &header.filters_meta,
+                header.typesize as usize,
+                block_start,
+                delta_ref.as_deref(),
+            );
+            if filtered_buf == 1 {
+                &buf1[..bsize]
+            } else {
+                &buf2[..bsize]
+            }
         };
         let (block_payload, _) = compress_pre_filtered_block(
             filtered,
@@ -2323,13 +2418,21 @@ mod tests {
             .copied()
             .collect();
 
-        for compcode in [
-            BLOSC_BLOSCLZ,
-            BLOSC_LZ4,
-            BLOSC_LZ4HC,
-            BLOSC_ZLIB,
-            BLOSC_ZSTD,
-        ] {
+        let codecs = {
+            let codecs = vec![BLOSC_BLOSCLZ, BLOSC_LZ4, BLOSC_ZLIB, BLOSC_ZSTD];
+            #[cfg(feature = "lz4hc-sys")]
+            {
+                let mut codecs = codecs;
+                codecs.insert(2, BLOSC_LZ4HC);
+                codecs
+            }
+            #[cfg(not(feature = "lz4hc-sys"))]
+            {
+                codecs
+            }
+        };
+
+        for compcode in codecs {
             let cparams = CParams {
                 compcode,
                 clevel: 5,
@@ -2346,6 +2449,22 @@ mod tests {
                 "Roundtrip failed for compcode={compcode}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(not(feature = "lz4hc-sys"))]
+    fn test_lz4hc_compression_requires_sys_feature() {
+        let data = b"high-level LZ4HC compression should fail without lz4hc-sys";
+        let cparams = CParams {
+            compcode: BLOSC_LZ4HC,
+            clevel: 9,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            compress(data, &cparams).unwrap_err(),
+            "LZ4HC compression requires the lz4hc-sys feature"
+        );
     }
 
     #[test]
@@ -2757,6 +2876,67 @@ mod tests {
             b"red\0green-green\0blue-blue-blue-blue\0"
         );
         assert_eq!(getitem(&compressed, 2, 16).unwrap(), b"d\0green-green\0bl");
+    }
+
+    #[test]
+    fn test_vlblocks_typesize4_shuffle_and_bitshuffle_roundtrip() {
+        let blocks: Vec<Vec<u8>> = [
+            (0..64u32).collect::<Vec<_>>(),
+            (1000..1137u32).collect::<Vec<_>>(),
+            (9000..9131u32).map(|value| value ^ 0x55aa_3300).collect(),
+        ]
+        .into_iter()
+        .map(|values| values.into_iter().flat_map(u32::to_le_bytes).collect())
+        .collect();
+        let block_refs: Vec<&[u8]> = blocks.iter().map(Vec::as_slice).collect();
+        let expected_concat: Vec<u8> = blocks
+            .iter()
+            .flat_map(|block| block.iter())
+            .copied()
+            .collect();
+
+        for filter in [BLOSC_SHUFFLE, BLOSC_BITSHUFFLE] {
+            let cparams = CParams {
+                compcode: BLOSC_LZ4,
+                clevel: 5,
+                typesize: 4,
+                nthreads: 4,
+                filters: [0, 0, 0, 0, 0, filter],
+                ..Default::default()
+            };
+
+            let compressed = vlcompress(&block_refs, &cparams).unwrap();
+            let header = ChunkHeader::read(&compressed).unwrap();
+            assert!(header.vl_blocks());
+            assert_eq!(header.typesize, 4);
+            assert_eq!(vldecompress(&compressed).unwrap(), blocks);
+            assert_eq!(decompress(&compressed).unwrap(), expected_concat);
+            assert_eq!(
+                getitem(&compressed, 60, 24).unwrap(),
+                expected_concat[60 * 4..84 * 4]
+            );
+        }
+    }
+
+    #[test]
+    fn test_vlblocks_allow_non_typesize_multiple_block_sizes() {
+        let blocks: [&[u8]; 3] = [b"abcde", b"123456789", b"tail-bytes-not-aligned"];
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 4,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            ..Default::default()
+        };
+
+        let compressed = vlcompress(&blocks, &cparams).unwrap();
+        let expected_concat: Vec<u8> = blocks
+            .iter()
+            .flat_map(|block| block.iter())
+            .copied()
+            .collect();
+        assert_eq!(vldecompress(&compressed).unwrap(), blocks);
+        assert_eq!(decompress(&compressed).unwrap(), expected_concat);
     }
 
     #[test]

@@ -19,13 +19,29 @@ fn hash_function(seq: u32, hashlog: u8) -> u32 {
 #[inline(always)]
 fn readu32(p: &[u8], pos: usize) -> u32 {
     debug_assert!(pos + 4 <= p.len());
-    u32::from_ne_bytes(p[pos..pos + 4].try_into().expect("readu32 bounds checked"))
+    // SAFETY: All callers check the 4-byte window before calling. Unaligned
+    // loads match BloscLZ's byte-oriented format and avoid per-byte assembly in
+    // the compression hot path.
+    unsafe { std::ptr::read_unaligned(p.as_ptr().add(pos).cast::<u32>()) }
 }
 
 #[inline(always)]
 fn readu64(p: &[u8], pos: usize) -> u64 {
     debug_assert!(pos + 8 <= p.len());
-    u64::from_ne_bytes(p[pos..pos + 8].try_into().expect("readu64 bounds checked"))
+    // SAFETY: All callers check the 8-byte window before calling. Unaligned
+    // loads are intentional for fast match scanning over arbitrary byte slices.
+    unsafe { std::ptr::read_unaligned(p.as_ptr().add(pos).cast::<u64>()) }
+}
+
+#[inline(always)]
+fn matching_prefix_len(a: u64, b: u64) -> usize {
+    let diff = a ^ b;
+    debug_assert_ne!(diff, 0);
+    if cfg!(target_endian = "little") {
+        (diff.trailing_zeros() as usize) / 8
+    } else {
+        (diff.leading_zeros() as usize) / 8
+    }
 }
 
 /// Find a run of identical bytes starting from `ip`, comparing against `refp`.
@@ -36,12 +52,10 @@ fn get_run(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usize) -> usiz
     let x8 = u64::from_ne_bytes([x; 8]);
 
     while ip + 8 <= ip_bound && refp + 8 <= data.len() {
-        if readu64(data, refp) != x8 {
-            while ip < ip_bound && refp < data.len() && data[refp] == x {
-                ip += 1;
-                refp += 1;
-            }
-            return ip;
+        let ref_word = readu64(data, refp);
+        if ref_word != x8 {
+            let matched = matching_prefix_len(ref_word, x8);
+            return (ip + matched).min(ip_bound);
         }
         ip += 8;
         refp += 8;
@@ -63,12 +77,11 @@ fn get_match(data: &[u8], ip: usize, ip_bound: usize, refp: usize) -> usize {
 #[inline]
 fn get_match_generic(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usize) -> usize {
     while ip + 8 <= ip_bound && refp + 8 <= data.len() {
-        if readu64(data, ip) != readu64(data, refp) {
-            while ip < ip_bound && refp < data.len() && data[refp] == data[ip] {
-                ip += 1;
-                refp += 1;
-            }
-            return ip;
+        let ip_word = readu64(data, ip);
+        let ref_word = readu64(data, refp);
+        if ip_word != ref_word {
+            let matched = matching_prefix_len(ip_word, ref_word);
+            return (ip + matched).min(ip_bound);
         }
         ip += 8;
         refp += 8;

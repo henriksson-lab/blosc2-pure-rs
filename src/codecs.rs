@@ -132,6 +132,7 @@ fn lz4_compress(src: &[u8], dest: &mut [u8]) -> i32 {
     }
 }
 
+#[cfg(feature = "lz4hc-sys")]
 fn lz4hc_compress(clevel: u8, src: &[u8], dest: &mut [u8]) -> i32 {
     let Ok(src_len) = i32::try_from(src.len()) else {
         return 0;
@@ -153,6 +154,11 @@ fn lz4hc_compress(clevel: u8, src: &[u8], dest: &mut [u8]) -> i32 {
     };
 
     written.max(0)
+}
+
+#[cfg(not(feature = "lz4hc-sys"))]
+fn lz4hc_compress(_clevel: u8, _src: &[u8], _dest: &mut [u8]) -> i32 {
+    0
 }
 
 fn lz4_decompress(src: &[u8], dest: &mut [u8]) -> i32 {
@@ -232,6 +238,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "lz4hc-sys")]
     fn lz4hc_roundtrips_via_lz4_decoder() {
         let data: Vec<u8> = (0..8192u32).flat_map(|i| (i % 64).to_le_bytes()).collect();
         let mut compressed = vec![0; data.len() + 1024];
@@ -248,5 +255,16 @@ mod tests {
 
         assert_eq!(dsize as usize, data.len());
         assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    #[cfg(not(feature = "lz4hc-sys"))]
+    fn lz4hc_compression_is_unavailable_without_sys_feature() {
+        let data = b"lz4hc requires the optional lz4hc-sys feature";
+        let mut compressed = vec![0; data.len() + 1024];
+
+        let csize = compress_block(BLOSC_LZ4HC, 9, data, &mut compressed);
+
+        assert_eq!(csize, 0);
     }
 }
