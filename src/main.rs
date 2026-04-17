@@ -4,7 +4,7 @@ use blosc2_pure_rs::schunk::Schunk;
 use blosc2_pure_rs::{Codec, Filter};
 use clap::{Parser, Subcommand};
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -162,7 +162,7 @@ fn decompress_file(input: &Path, output: &Path, nthreads: i16) -> io::Result<()>
     }
 
     let start = Instant::now();
-    let mut foutput = File::create(output)?;
+    let mut foutput = BufWriter::new(File::create(output)?);
 
     for i in 0..schunk.nchunks() {
         let data = schunk
@@ -170,6 +170,7 @@ fn decompress_file(input: &Path, output: &Path, nthreads: i16) -> io::Result<()>
             .map_err(|e| io::Error::other(format!("Decompression error: {e}")))?;
         foutput.write_all(&data)?;
     }
+    foutput.flush()?;
 
     let nbytes = schunk.nbytes;
     let cbytes = schunk.cbytes;

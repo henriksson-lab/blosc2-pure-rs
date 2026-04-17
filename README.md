@@ -76,7 +76,7 @@ The CLI binary is named `blosc2` and requires the `cli` feature.
 blosc2 compress input.bin output.b2frame
 blosc2 compress input.bin output.b2frame --codec zstd --clevel 9
 blosc2 compress input.bin output.b2frame -c lz4 -l 5 -t 4 -f shuffle
-blosc2 compress floats.bin floats.b2frame -c zstd -l 7 -t 4 -b 262144 --chunksize 1000000 --splitmode forward
+blosc2 compress floats.bin floats.b2frame -c zstd -l 7 -t 4 -b 262144 --chunksize 4194304 --splitmode forward
 blosc2 compress floats.bin floats-trunc.b2frame -f truncprec --filter-meta 16 -t 4
 ```
 
@@ -85,11 +85,13 @@ Options:
 - `-l, --clevel`: Compression level (0-9). Default: `9`
 - `-t, --typesize`: Element type size in bytes. Default: `1`
 - `-b, --blocksize`: Explicit block size in bytes (`0` = automatic). Default: `0`
-- `--chunksize`: Input bytes per frame chunk. Default: `1000000`
+- `--chunksize`: Input bytes per frame chunk. Default: `4194304` (4 MiB). For large files, local CLI benchmarks favored 4 MiB over 1 MiB and much larger single-chunk settings.
 - `-s, --splitmode`: Split mode (`always`, `never`, `auto`, `forward`). Default: `forward`
 - `-n, --nthreads`: Number of threads. Default: `4`
 - `-f, --filter`: Filter (`nofilter`, `shuffle`, `bitshuffle`, `delta`, `truncprec`). Default: `shuffle`
 - `--filter-meta`: Filter metadata byte. For `truncprec`, this is the retained precision in bits. Default: `0`
+
+Chunk-size guidance: keep the default for general file compression. On a local 64 MiB `u32` signal benchmark with `typesize=4`, one thread, and shuffle enabled, `--chunksize 4194304` improved BloscLZ, LZ4, and Zstd compression throughput versus the old 1,000,000-byte default while avoiding the decompression slowdown seen with one huge chunk.
 
 ### Decompress
 
@@ -248,7 +250,7 @@ bitshuffle/bitunshuffle wrappers and specialized safe shuffle/unshuffle paths wi
 | BloscLZ | Fast | Moderate | General purpose |
 | LZ4 | Fastest | Moderate | Speed-critical |
 | LZ4HC | Slow | Good | Optional `lz4hc-sys` shim; pure-Rust LZ4HC is out of scope |
-| Zlib | Slow | Good | Balanced |
+| Zlib | Slow | Good | Compatibility with zlib/deflate users |
 | Zstd | Moderate | Best | Storage-critical |
 
 ## Building
@@ -267,9 +269,12 @@ For benchmarks, compile with native CPU optimizations:
 RUSTFLAGS="-C target-cpu=native" cargo build --release --features cli
 ```
 
-The default zlib backend is `flate2`'s pure-Rust miniz backend. The `zlib-rs` feature is also
+The default zlib backend is `flate2`'s pure-Rust miniz backend. That keeps the default build
+fully Rust and avoids adding native zlib or zlib-ng requirements. The `zlib-rs` feature is also
 pure Rust and can be tested locally; in the current benchmark workload it was slightly slower
-than the default, so it is not enabled by default.
+than the default, so it is not enabled by default. Native zlib-style backends are treated as
+future opt-in work only. When zlib/deflate compatibility is not required, prefer LZ4 for speed
+or Zstd for stronger compression.
 
 ## Testing
 

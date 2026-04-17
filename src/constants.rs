@@ -104,8 +104,9 @@ pub const BLOSC2_MAX_DIM: usize = 8;
 pub const L1_CACHE: usize = 32 * 1024;
 pub const L2_CACHE: usize = 256 * 1024;
 
-// Default chunk size for file I/O
-pub const DEFAULT_CHUNKSIZE: usize = 1_000_000;
+// Default chunk size for file I/O. A 4 MiB default keeps CLI frame
+// overhead modest without turning large files into single huge chunks.
+pub const DEFAULT_CHUNKSIZE: usize = 4 * 1024 * 1024;
 
 /// Map compcode to the format code stored in header flags bits 5-7.
 pub fn compcode_to_compformat(compcode: u8) -> u8 {

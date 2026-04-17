@@ -3,6 +3,172 @@ use crate::constants::*;
 use crate::filters;
 use crate::header::ChunkHeader;
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicU8, Ordering};
+
+/// Process-wide default codec used by the Blosc1 API (`blosc1_compress`).
+/// Mirrors C-Blosc2's `g_compressor` state.
+static GLOBAL_COMPRESSOR: AtomicU8 = AtomicU8::new(BLOSC_BLOSCLZ);
+
+/// Process-wide override blocksize. 0 means "automatic". Mirrors `g_force_blocksize`.
+static GLOBAL_BLOCKSIZE: AtomicI32 = AtomicI32::new(0);
+
+/// Process-wide splitmode. Mirrors `g_splitmode`.
+static GLOBAL_SPLITMODE: AtomicI32 = AtomicI32::new(BLOSC_FORWARD_COMPAT_SPLIT);
+
+/// Process-wide thread count used by the Blosc1 API. Mirrors `g_nthreads`.
+static GLOBAL_NTHREADS: AtomicI16 = AtomicI16::new(1);
+
+/// Whether to prepend a delta filter in the Blosc1 API pipeline. Mirrors `g_delta`.
+static GLOBAL_DELTA: AtomicBool = AtomicBool::new(false);
+
+/// Set the process-wide default codec used by `blosc1_compress` by name.
+/// Returns the previous codec code, or an error if the name is unknown.
+///
+/// Recognized names: `blosclz`, `lz4`, `lz4hc`, `zlib`, `zstd` (case-insensitive).
+pub fn blosc1_set_compressor(name: &str) -> Result<u8, &'static str> {
+    let code = match name.to_ascii_lowercase().as_str() {
+        "blosclz" => BLOSC_BLOSCLZ,
+        "lz4" => BLOSC_LZ4,
+        "lz4hc" => BLOSC_LZ4HC,
+        "zlib" => BLOSC_ZLIB,
+        "zstd" => BLOSC_ZSTD,
+        _ => return Err("Unrecognized compressor name"),
+    };
+    Ok(GLOBAL_COMPRESSOR.swap(code, Ordering::Relaxed))
+}
+
+/// Set the process-wide default codec by numeric code. Returns the previous code.
+pub fn blosc1_set_compressor_code(code: u8) -> u8 {
+    GLOBAL_COMPRESSOR.swap(code, Ordering::Relaxed)
+}
+
+/// Get the process-wide default codec currently used by `blosc1_compress`.
+pub fn blosc1_get_compressor() -> u8 {
+    GLOBAL_COMPRESSOR.load(Ordering::Relaxed)
+}
+
+/// Force a specific blocksize for `blosc1_compress`. Pass 0 to restore automatic sizing.
+/// Returns the previous value. Mirrors `blosc1_set_blocksize`.
+pub fn blosc1_set_blocksize(blocksize: i32) -> i32 {
+    GLOBAL_BLOCKSIZE.swap(blocksize, Ordering::Relaxed)
+}
+
+/// Get the forced blocksize; 0 means automatic. Mirrors `blosc1_get_blocksize`.
+pub fn blosc1_get_blocksize() -> i32 {
+    GLOBAL_BLOCKSIZE.load(Ordering::Relaxed)
+}
+
+/// Set the splitmode used by `blosc1_compress`. Returns the previous value.
+/// Valid values: `BLOSC_ALWAYS_SPLIT`, `BLOSC_NEVER_SPLIT`, `BLOSC_AUTO_SPLIT`,
+/// `BLOSC_FORWARD_COMPAT_SPLIT`. Mirrors `blosc1_set_splitmode`.
+pub fn blosc1_set_splitmode(splitmode: i32) -> i32 {
+    GLOBAL_SPLITMODE.swap(splitmode, Ordering::Relaxed)
+}
+
+/// Get the current splitmode. Mirrors `blosc1_get_splitmode`.
+pub fn blosc1_get_splitmode() -> i32 {
+    GLOBAL_SPLITMODE.load(Ordering::Relaxed)
+}
+
+/// Set the number of threads used by `blosc1_compress`. Returns the previous value.
+/// Mirrors `blosc2_set_nthreads`.
+pub fn blosc2_set_nthreads(nthreads: i16) -> i16 {
+    // Clamp to at least 1 to match C's "invalid value is ignored" behavior
+    // more defensively (C trusts the caller but asserts >= 1 in practice).
+    let n = nthreads.max(1);
+    GLOBAL_NTHREADS.swap(n, Ordering::Relaxed)
+}
+
+/// Get the current thread count used by `blosc1_compress`. Mirrors `blosc2_get_nthreads`.
+pub fn blosc2_get_nthreads() -> i16 {
+    GLOBAL_NTHREADS.load(Ordering::Relaxed)
+}
+
+/// Enable or disable the delta filter for `blosc1_compress`. Mirrors `blosc2_set_delta`.
+pub fn blosc2_set_delta(enabled: bool) {
+    GLOBAL_DELTA.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether the delta filter is currently enabled.
+pub fn blosc2_get_delta() -> bool {
+    GLOBAL_DELTA.load(Ordering::Relaxed)
+}
+
+/// Apply the `BLOSC_*` environment-variable overrides documented by C-Blosc2.
+/// Values are only overwritten when the corresponding env var is present and
+/// parses successfully — invalid values are ignored (matching C behavior).
+///
+/// Some env vars mutate process-wide state via the public setter functions
+/// (matching C's `blosc2_compress`), so calling this has durable side effects.
+fn apply_blosc_env_overrides(
+    clevel: &mut u8,
+    doshuffle: &mut u8,
+    typesize: &mut i32,
+    compcode: &mut u8,
+) {
+    if let Ok(v) = std::env::var("BLOSC_CLEVEL") {
+        if let Ok(parsed) = v.parse::<i32>() {
+            if (0..=9).contains(&parsed) {
+                *clevel = parsed as u8;
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("BLOSC_SHUFFLE") {
+        match v.as_str() {
+            "NOSHUFFLE" => *doshuffle = BLOSC_NOFILTER,
+            "SHUFFLE" => *doshuffle = BLOSC_SHUFFLE,
+            "BITSHUFFLE" => *doshuffle = BLOSC_BITSHUFFLE,
+            _ => {}
+        }
+    }
+    if let Ok(v) = std::env::var("BLOSC_DELTA") {
+        match v.as_str() {
+            "1" => blosc2_set_delta(true),
+            "0" => blosc2_set_delta(false),
+            _ => {}
+        }
+    }
+    if let Ok(v) = std::env::var("BLOSC_TYPESIZE") {
+        if let Ok(parsed) = v.parse::<i32>() {
+            if parsed > 0 {
+                *typesize = parsed;
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("BLOSC_COMPRESSOR") {
+        // Match C semantics: BLOSC_COMPRESSOR mutates the process-wide compressor
+        // (via blosc1_set_compressor) and the new value is what gets used.
+        if blosc1_set_compressor(&v).is_ok() {
+            *compcode = blosc1_get_compressor();
+        }
+    }
+    if let Ok(v) = std::env::var("BLOSC_BLOCKSIZE") {
+        if let Ok(parsed) = v.parse::<i32>() {
+            if parsed > 0 {
+                blosc1_set_blocksize(parsed);
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("BLOSC_NTHREADS") {
+        if let Ok(parsed) = v.parse::<i16>() {
+            if parsed > 0 {
+                blosc2_set_nthreads(parsed);
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("BLOSC_SPLITMODE") {
+        let splitmode = match v.as_str() {
+            "ALWAYS" => Some(BLOSC_ALWAYS_SPLIT),
+            "NEVER" => Some(BLOSC_NEVER_SPLIT),
+            "AUTO" => Some(BLOSC_AUTO_SPLIT),
+            "FORWARD_COMPAT" => Some(BLOSC_FORWARD_COMPAT_SPLIT),
+            _ => None,
+        };
+        if let Some(sm) = splitmode {
+            blosc1_set_splitmode(sm);
+        }
+    }
+}
 
 pub(crate) fn with_thread_pool<T: Send>(nthreads: i16, op: impl FnOnce() -> T + Send) -> T {
     if nthreads <= 1 {
@@ -449,9 +615,8 @@ fn get_run(data: &[u8]) -> Option<u8> {
     Some(val)
 }
 
-/// Compress a single block. Returns the compressed block data (including stream size headers).
 #[allow(clippy::too_many_arguments)]
-fn compress_block(
+fn compress_block_with_scratch(
     src: &[u8],
     block_data: &[u8],
     block_start: usize,
@@ -460,6 +625,9 @@ fn compress_block(
     cparams: &CParams,
     dont_split: bool,
     typesize: usize,
+    buf1: &mut Vec<u8>,
+    buf2: &mut Vec<u8>,
+    compress_buf: &mut Vec<u8>,
 ) -> (Vec<u8>, bool) {
     let bsize = block_data.len();
     let filters_are_noop = cparams
@@ -467,40 +635,48 @@ fn compress_block(
         .iter()
         .all(|&f| f == BLOSC_NOFILTER || (f == BLOSC_SHUFFLE && typesize <= 1));
     if filters_are_noop {
-        return compress_pre_filtered_block(
+        return compress_pre_filtered_block_with_scratch(
             block_data,
             cparams,
             dont_split,
             typesize,
             is_leftover,
             None,
+            compress_buf,
         );
     }
 
     if let Some(shuffle_typesize) =
         single_shuffle_filter(&cparams.filters, &cparams.filters_meta, typesize)
     {
-        let mut filtered = vec![0u8; bsize];
-        filters::shuffle(shuffle_typesize, block_data, &mut filtered);
-        return compress_pre_filtered_block(
-            &filtered,
+        if buf1.len() < bsize {
+            buf1.resize(bsize, 0);
+        }
+        filters::shuffle(shuffle_typesize, block_data, &mut buf1[..bsize]);
+        return compress_pre_filtered_block_with_scratch(
+            &buf1[..bsize],
             cparams,
             dont_split,
             typesize,
             is_leftover,
             None,
+            compress_buf,
         );
     }
 
-    let mut buf1 = vec![0u8; bsize];
-    let mut buf2 = vec![0u8; bsize];
+    if buf1.len() < bsize {
+        buf1.resize(bsize, 0);
+    }
+    if buf2.len() < bsize {
+        buf2.resize(bsize, 0);
+    }
 
     // Apply forward filter pipeline
     let dref_end = blocksize.min(src.len());
     let filtered_buf = filters::pipeline_forward(
         block_data,
-        &mut buf1,
-        &mut buf2,
+        &mut buf1[..bsize],
+        &mut buf2[..bsize],
         &cparams.filters,
         &cparams.filters_meta,
         typesize,
@@ -514,7 +690,15 @@ fn compress_block(
         &buf2[..bsize]
     };
 
-    compress_pre_filtered_block(filtered, cparams, dont_split, typesize, is_leftover, None)
+    compress_pre_filtered_block_with_scratch(
+        filtered,
+        cparams,
+        dont_split,
+        typesize,
+        is_leftover,
+        None,
+        compress_buf,
+    )
 }
 
 fn single_shuffle_filter(
@@ -551,15 +735,37 @@ fn compress_pre_filtered_block(
     is_leftover: bool,
     dict: Option<&[u8]>,
 ) -> (Vec<u8>, bool) {
+    let mut compressed = Vec::new();
+    compress_pre_filtered_block_with_scratch(
+        filtered,
+        cparams,
+        dont_split,
+        typesize,
+        is_leftover,
+        dict,
+        &mut compressed,
+    )
+}
+
+fn compress_pre_filtered_block_with_scratch(
+    filtered: &[u8],
+    cparams: &CParams,
+    dont_split: bool,
+    typesize: usize,
+    is_leftover: bool,
+    dict: Option<&[u8]>,
+    compressed: &mut Vec<u8>,
+) -> (Vec<u8>, bool) {
     let bsize = filtered.len();
-    // Determine number of streams
     let nstreams = stream_count(dont_split, is_leftover, typesize, bsize);
     let neblock = bsize / nstreams;
 
     let mut result = Vec::with_capacity(bsize);
     let mut all_zero_runs = true;
     let max_out = neblock + (neblock / 255) + 32;
-    let mut compressed = vec![0u8; max_out];
+    if compressed.len() < max_out {
+        compressed.resize(max_out, 0);
+    }
 
     for stream_idx in 0..nstreams {
         let stream_start = stream_idx * neblock;
@@ -583,7 +789,7 @@ fn compress_pre_filtered_block(
                 cparams.compcode,
                 cparams.clevel,
                 stream_data,
-                &mut compressed,
+                &mut compressed[..max_out],
                 dict,
             ),
             None => codecs::compress_block_with_meta(
@@ -591,12 +797,11 @@ fn compress_pre_filtered_block(
                 cparams.clevel,
                 cparams.compcode_meta,
                 stream_data,
-                &mut compressed,
+                &mut compressed[..max_out],
             ),
         };
 
         if cbytes == 0 || cbytes as usize >= neblock {
-            // Incompressible: store as memcpy
             result.extend_from_slice(&(neblock as i32).to_le_bytes());
             result.extend_from_slice(stream_data);
         } else {
@@ -825,18 +1030,30 @@ pub fn compress(src: &[u8], cparams: &CParams) -> Result<Vec<u8>, &'static str> 
         let compressed_blocks: Vec<(Vec<u8>, bool)> = with_thread_pool(cparams.nthreads, || {
             block_infos
                 .par_iter()
-                .map(|&(start, end, is_leftover)| {
-                    compress_block(
-                        src,
-                        &src[start..end],
-                        start,
-                        blocksize,
-                        is_leftover,
-                        cparams,
-                        dont_split,
-                        typesize,
-                    )
-                })
+                .map_init(
+                    || {
+                        (
+                            vec![0u8; blocksize],
+                            vec![0u8; blocksize],
+                            vec![0u8; blocksize + (blocksize / 255) + 64],
+                        )
+                    },
+                    |(buf1, buf2, compress_buf), &(start, end, is_leftover)| {
+                        compress_block_with_scratch(
+                            src,
+                            &src[start..end],
+                            start,
+                            blocksize,
+                            is_leftover,
+                            cparams,
+                            dont_split,
+                            typesize,
+                            buf1,
+                            buf2,
+                            compress_buf,
+                        )
+                    },
+                )
                 .collect()
         });
 
@@ -1392,6 +1609,189 @@ fn decompress_block_data(
         &buf2[..bsize]
     };
     Ok(result.to_vec())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decompress_block_into(
+    chunk: &[u8],
+    block_idx: usize,
+    block_start: usize,
+    dest: &mut [u8],
+    blocksize: usize,
+    is_leftover: bool,
+    header: &ChunkHeader,
+    dref: Option<&[u8]>,
+    dict: Option<&[u8]>,
+    scratch1: &mut [u8],
+    scratch2: &mut [u8],
+) -> Result<(), &'static str> {
+    let bsize = dest.len();
+    if scratch1.len() < bsize || scratch2.len() < bsize {
+        return Err("Scratch buffer too small");
+    }
+
+    let typesize = header.typesize as usize;
+    let dont_split = header.dont_split();
+    let compcode = header.compcode();
+    let header_len = header.header_len();
+    let chunk_limit = header.cbytes as usize;
+    let nblocks = if header.vl_blocks() {
+        header.blocksize as usize
+    } else {
+        header.nblocks()
+    };
+
+    let bstart_pos = header_len + block_idx * 4;
+    let bstart_end = bstart_pos
+        .checked_add(4)
+        .ok_or("Invalid block table offset")?;
+    if bstart_end > chunk_limit {
+        return Err("Chunk too small for bstarts");
+    }
+    let src_pos_i32 = i32::from_le_bytes(chunk[bstart_pos..bstart_end].try_into().unwrap());
+    if src_pos_i32 < 0 {
+        return Err("Invalid negative block offset");
+    }
+    let mut src_pos = src_pos_i32 as usize;
+    if src_pos > chunk_limit {
+        return Err("Invalid block offset");
+    }
+    if let Some(dict) = dict {
+        let min_block_start = header_len
+            .checked_add(nblocks.checked_mul(4).ok_or("Invalid block table size")?)
+            .and_then(|pos| pos.checked_add(4))
+            .and_then(|pos| pos.checked_add(dict.len()))
+            .ok_or("Invalid dictionary size")?;
+        if src_pos < min_block_start {
+            return Err("Invalid dictionary block offset");
+        }
+    }
+
+    let block_limit = if block_idx + 1 < nblocks {
+        let next_bstart_pos = header_len + (block_idx + 1) * 4;
+        let next_bstart_end = next_bstart_pos
+            .checked_add(4)
+            .ok_or("Invalid block table offset")?;
+        if next_bstart_end > chunk_limit {
+            return Err("Chunk too small for bstarts");
+        }
+        let next_src_pos_i32 =
+            i32::from_le_bytes(chunk[next_bstart_pos..next_bstart_end].try_into().unwrap());
+        if next_src_pos_i32 < 0 {
+            return Err("Invalid negative block offset");
+        }
+        let next_src_pos = next_src_pos_i32 as usize;
+        if next_src_pos < src_pos || next_src_pos > chunk_limit {
+            return Err("Invalid block offset order");
+        }
+        next_src_pos
+    } else {
+        chunk_limit
+    };
+
+    let nstreams = stream_count(dont_split, is_leftover, typesize, bsize);
+    let neblock = bsize / nstreams;
+    let filters_are_noop = header
+        .filters
+        .iter()
+        .all(|&f| f == BLOSC_NOFILTER || (f == BLOSC_SHUFFLE && typesize <= 1));
+    let single_shuffle = single_shuffle_filter(&header.filters, &header.filters_meta, typesize);
+    let filtered = if filters_are_noop {
+        &mut dest[..bsize]
+    } else {
+        &mut scratch1[..bsize]
+    };
+
+    for stream_idx in 0..nstreams {
+        let dest_start = stream_idx * neblock;
+
+        let stream_size_end = src_pos.checked_add(4).ok_or("Invalid stream size offset")?;
+        if stream_size_end > block_limit {
+            return Err("Chunk truncated reading stream size");
+        }
+        let cbytes = i32::from_le_bytes(chunk[src_pos..stream_size_end].try_into().unwrap());
+        src_pos = stream_size_end;
+
+        if cbytes == 0 {
+            filtered[dest_start..dest_start + neblock].fill(0);
+        } else if cbytes < 0 {
+            let val = (-cbytes) as u8;
+            if src_pos < block_limit && chunk[src_pos] & 0x01 != 0 {
+                filtered[dest_start..dest_start + neblock].fill(val);
+                src_pos += 1;
+            } else {
+                return Err("Invalid run encoding");
+            }
+        } else if cbytes as usize == neblock {
+            let block_end = src_pos
+                .checked_add(neblock)
+                .ok_or("Invalid memcpyed block size")?;
+            if block_end > block_limit {
+                return Err("Chunk truncated reading memcpyed block");
+            }
+            filtered[dest_start..dest_start + neblock].copy_from_slice(&chunk[src_pos..block_end]);
+            src_pos = block_end;
+        } else {
+            let block_end = src_pos
+                .checked_add(cbytes as usize)
+                .ok_or("Invalid compressed block size")?;
+            if block_end > block_limit {
+                return Err("Chunk truncated reading compressed block");
+            }
+            let cdata = &chunk[src_pos..block_end];
+            let dsize = match dict {
+                Some(dict) => codecs::decompress_block_with_dict(
+                    compcode,
+                    cdata,
+                    &mut filtered[dest_start..dest_start + neblock],
+                    dict,
+                ),
+                None => codecs::decompress_block_with_meta(
+                    compcode,
+                    header.compcode_meta,
+                    cdata,
+                    &mut filtered[dest_start..dest_start + neblock],
+                ),
+            };
+            if dsize < 0 || dsize as usize != neblock {
+                return Err("Codec decompression failed");
+            }
+            src_pos += cbytes as usize;
+        }
+    }
+    if src_pos != block_limit {
+        return Err("Invalid block stream length");
+    }
+
+    if filters_are_noop {
+        return Ok(());
+    }
+
+    if let Some(shuffle_typesize) = single_shuffle {
+        filters::unshuffle(shuffle_typesize, &scratch1[..bsize], dest);
+        return Ok(());
+    }
+
+    let dref_end = blocksize.min(dref.map_or(0, |d| d.len()));
+    let actual_dref = dref.map(|d| &d[..dref_end]);
+    let result_buf = filters::pipeline_backward(
+        &mut scratch1[..bsize],
+        &mut scratch2[..bsize],
+        bsize,
+        &header.filters,
+        &header.filters_meta,
+        typesize,
+        block_start,
+        actual_dref,
+        1,
+    );
+
+    match result_buf {
+        1 => dest.copy_from_slice(&scratch1[..bsize]),
+        2 => dest.copy_from_slice(&scratch2[..bsize]),
+        _ => return Err("Filter pipeline failed"),
+    }
+    Ok(())
 }
 
 fn embedded_dictionary<'a>(
@@ -2035,7 +2435,13 @@ pub fn replace_aligned_blocks(
     Ok(Some(output))
 }
 
-/// Blosc1-style compression wrapper using the default BloscLZ codec.
+/// Blosc1-style compression wrapper.
+///
+/// The codec defaults to the process-wide value set via [`blosc1_set_compressor`]
+/// (initially `BLOSC_BLOSCLZ`). Caller arguments `clevel`, `doshuffle`, and
+/// `typesize` can be overridden by the `BLOSC_CLEVEL`, `BLOSC_SHUFFLE`, and
+/// `BLOSC_TYPESIZE` environment variables respectively; the `BLOSC_COMPRESSOR`
+/// env var can override the codec (case-insensitive codec name).
 ///
 /// `doshuffle` accepts `BLOSC_NOFILTER`, `BLOSC_SHUFFLE`, or
 /// `BLOSC_BITSHUFFLE`. The compressed chunk is written into `dest`, and the
@@ -2047,16 +2453,32 @@ pub fn blosc1_compress(
     src: &[u8],
     dest: &mut [u8],
 ) -> Result<usize, &'static str> {
+    let mut clevel = clevel;
+    let mut doshuffle = doshuffle;
+    let mut typesize = typesize;
+    let mut compcode = blosc1_get_compressor();
+    apply_blosc_env_overrides(&mut clevel, &mut doshuffle, &mut typesize, &mut compcode);
+
     if !matches!(doshuffle, BLOSC_NOFILTER | BLOSC_SHUFFLE | BLOSC_BITSHUFFLE) {
         return Err("Unsupported Blosc1 shuffle mode");
     }
 
+    // Build the filter pipeline the way C's `build_filters` does: terminal
+    // shuffle at slot 5, optional delta at slot 4 when `g_delta` is set.
+    let mut filters = [0u8; BLOSC2_MAX_FILTERS];
+    filters[BLOSC2_MAX_FILTERS - 1] = doshuffle;
+    if blosc2_get_delta() {
+        filters[BLOSC2_MAX_FILTERS - 2] = BLOSC_DELTA;
+    }
+
     let cparams = CParams {
-        compcode: BLOSC_BLOSCLZ,
+        compcode,
         clevel,
         typesize,
-        splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
-        filters: [0, 0, 0, 0, 0, doshuffle],
+        blocksize: blosc1_get_blocksize(),
+        splitmode: blosc1_get_splitmode(),
+        nthreads: blosc2_get_nthreads(),
+        filters,
         ..Default::default()
     };
     let compressed = compress(src, &cparams)?;
@@ -2129,99 +2551,107 @@ pub fn decompress_with_threads(chunk: &[u8], nthreads: i16) -> Result<Vec<u8>, &
     let mut output = vec![0u8; nbytes];
 
     if has_delta {
-        // Delta filter requires block 0 decoded first (used as reference)
-        // Decode block 0 first
+        // Delta filter requires block 0 decoded first because later blocks
+        // reference it. Reuse scratch buffers while writing finished blocks
+        // directly into the final output buffer.
+        let mut scratch1 = vec![0u8; blocksize];
+        let mut scratch2 = vec![0u8; blocksize];
         let block0_end = blocksize.min(nbytes);
-        let block0_data = decompress_block_data(
+        decompress_block_into(
             chunk,
             0,
             0,
-            block0_end,
+            &mut output[..block0_end],
             blocksize,
             nblocks == 1 && block0_end < blocksize,
             &header,
-            Some(&output[..blocksize.min(output.len())]),
+            None,
             dict,
+            &mut scratch1,
+            &mut scratch2,
         )?;
-        output[..block0_end].copy_from_slice(&block0_data);
 
-        // Remaining blocks can reference block 0 but must be sequential for delta
         for block_idx in 1..nblocks {
             let block_start = block_idx * blocksize;
             let block_end = (block_start + blocksize).min(nbytes);
             let bsize = block_end - block_start;
             let is_leftover = block_idx == nblocks - 1 && bsize < blocksize;
+            let (before, tail) = output.split_at_mut(block_start);
+            let dref_end = blocksize.min(before.len());
+            let dref = &before[..dref_end];
 
-            let block_data = decompress_block_data(
+            decompress_block_into(
                 chunk,
                 block_idx,
                 block_start,
-                bsize,
+                &mut tail[..bsize],
                 blocksize,
                 is_leftover,
                 &header,
-                Some(&output[..blocksize.min(output.len())]),
+                Some(dref),
                 dict,
+                &mut scratch1,
+                &mut scratch2,
             )?;
-            output[block_start..block_end].copy_from_slice(&block_data);
         }
     } else if nthreads > 1 && nblocks > 1 {
-        // Parallel decompression (no delta filter)
-        let block_infos: Vec<(usize, usize, usize, bool)> = (0..nblocks)
-            .map(|i| {
-                let start = i * blocksize;
-                let end = (start + blocksize).min(nbytes);
-                let bsize = end - start;
-                let is_leftover = i == nblocks - 1 && bsize < blocksize;
-                (i, start, bsize, is_leftover)
-            })
-            .collect();
-
-        let results: Vec<Result<(usize, Vec<u8>), &'static str>> =
-            with_thread_pool(nthreads, || {
-                block_infos
-                    .par_iter()
-                    .map(|&(idx, start, bsize, is_leftover)| {
-                        let data = decompress_block_data(
+        // Parallel decompression (no delta filter). Each Rayon job keeps its
+        // own scratch buffers and writes directly into disjoint output chunks.
+        let results: Vec<Result<(), &'static str>> = with_thread_pool(nthreads, || {
+            output
+                .par_chunks_mut(blocksize)
+                .enumerate()
+                .map_init(
+                    || (vec![0u8; blocksize], vec![0u8; blocksize]),
+                    |(scratch1, scratch2), (block_idx, block_out)| {
+                        let block_start = block_idx * blocksize;
+                        let bsize = block_out.len();
+                        let is_leftover = block_idx == nblocks - 1 && bsize < blocksize;
+                        decompress_block_into(
                             chunk,
-                            idx,
-                            start,
-                            bsize,
+                            block_idx,
+                            block_start,
+                            block_out,
                             blocksize,
                             is_leftover,
                             &header,
                             None,
                             dict,
-                        )?;
-                        Ok((start, data))
-                    })
-                    .collect()
-            });
+                            scratch1,
+                            scratch2,
+                        )
+                    },
+                )
+                .collect()
+        });
 
         for result in results {
-            let (start, data) = result?;
-            output[start..start + data.len()].copy_from_slice(&data);
+            result?;
         }
     } else {
-        // Sequential decompression
+        // Sequential decompression: reuse scratch buffers and write finished
+        // blocks directly into the final output buffer.
+        let mut scratch1 = vec![0u8; blocksize];
+        let mut scratch2 = vec![0u8; blocksize];
         for block_idx in 0..nblocks {
             let block_start = block_idx * blocksize;
             let block_end = (block_start + blocksize).min(nbytes);
             let bsize = block_end - block_start;
             let is_leftover = block_idx == nblocks - 1 && bsize < blocksize;
 
-            let block_data = decompress_block_data(
+            decompress_block_into(
                 chunk,
                 block_idx,
                 block_start,
-                bsize,
+                &mut output[block_start..block_end],
                 blocksize,
                 is_leftover,
                 &header,
                 None,
                 dict,
+                &mut scratch1,
+                &mut scratch2,
             )?;
-            output[block_start..block_end].copy_from_slice(&block_data);
         }
     }
 
@@ -2388,6 +2818,9 @@ mod tests {
 
     #[test]
     fn test_blosc1_wrappers_roundtrip_and_validate_buffers() {
+        // blosc1_compress reads process-wide globals (compressor/blocksize/etc.)
+        // that other tests mutate; hold BLOSC_ENV_LOCK so they don't race.
+        let _lock = BLOSC_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let data: Vec<u8> = (0..1024u32).flat_map(|i| i.to_le_bytes()).collect();
         let mut compressed = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD + 1024];
         let csize = blosc1_compress(5, BLOSC_SHUFFLE, 4, &data, &mut compressed).unwrap();
@@ -2407,6 +2840,379 @@ mod tests {
         let mut short_restored = vec![0u8; data.len() - 1];
         assert!(blosc1_decompress(&compressed[..csize], &mut short_restored).is_err());
         assert!(blosc1_compress(5, BLOSC_DELTA, 4, &data, &mut compressed).is_err());
+    }
+
+    // Env-var tests mutate the process environment, so they must run serially.
+    // We also restore the prior value on exit to avoid cross-test bleed.
+    static BLOSC_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            // Safety: test runs under BLOSC_ENV_LOCK; no other thread reads/writes this var concurrently.
+            unsafe { std::env::set_var(key, value) };
+            EnvGuard { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // Safety: same as set; guarded by BLOSC_ENV_LOCK.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_blosc1_compress_honors_blosc_compressor_env() {
+        let _lock = BLOSC_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let data: Vec<u8> = (0..1024u32).flat_map(|i| i.to_le_bytes()).collect();
+        let mut compressed = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD + 1024];
+
+        let _g = EnvGuard::set("BLOSC_COMPRESSOR", "LZ4");
+        let csize = blosc1_compress(5, BLOSC_SHUFFLE, 4, &data, &mut compressed).unwrap();
+
+        let (_, compcode, _) = cbuffer_metainfo(&compressed[..csize]).unwrap();
+        assert_eq!(
+            compcode, BLOSC_LZ4,
+            "BLOSC_COMPRESSOR=LZ4 should have selected LZ4, got compcode={compcode}"
+        );
+
+        // Roundtrip still works regardless of codec choice.
+        let mut restored = vec![0u8; data.len()];
+        let dsize = blosc1_decompress(&compressed[..csize], &mut restored).unwrap();
+        assert_eq!(dsize, data.len());
+        assert_eq!(restored, data);
+    }
+
+    #[test]
+    fn test_blosc1_compress_honors_blosc_clevel_env() {
+        let _lock = BLOSC_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Use somewhat compressible data so level differences are observable.
+        let data: Vec<u8> = (0..8192u32).flat_map(|i| (i % 37).to_le_bytes()).collect();
+        let mut a = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD + 1024];
+
+        // clevel=0 → roundtrip must still succeed; we test that the env var is applied
+        // by verifying output differs from a default caller-level run.
+        let csize_default = blosc1_compress(5, BLOSC_SHUFFLE, 4, &data, &mut a).unwrap();
+
+        let _g = EnvGuard::set("BLOSC_CLEVEL", "0");
+        let mut b = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD + 1024];
+        let csize_env = blosc1_compress(5, BLOSC_SHUFFLE, 4, &data, &mut b).unwrap();
+
+        assert_ne!(
+            csize_env, csize_default,
+            "BLOSC_CLEVEL=0 should change output size compared to caller-requested clevel=5"
+        );
+
+        let mut restored = vec![0u8; data.len()];
+        let dsize = blosc1_decompress(&b[..csize_env], &mut restored).unwrap();
+        assert_eq!(dsize, data.len());
+        assert_eq!(restored, data);
+    }
+
+    #[test]
+    fn test_blosc1_compress_honors_blosc_shuffle_env() {
+        let _lock = BLOSC_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let data: Vec<u8> = (0..1024u32).flat_map(|i| i.to_le_bytes()).collect();
+        let mut compressed = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD + 1024];
+
+        let _g = EnvGuard::set("BLOSC_SHUFFLE", "BITSHUFFLE");
+        // Caller asks for BLOSC_SHUFFLE; env should override to BITSHUFFLE.
+        let csize = blosc1_compress(5, BLOSC_SHUFFLE, 4, &data, &mut compressed).unwrap();
+
+        let (_, _, filters) = cbuffer_metainfo(&compressed[..csize]).unwrap();
+        // Last filter slot is the primary filter in blosc1 wrappers.
+        assert_eq!(
+            filters[BLOSC2_MAX_FILTERS - 1],
+            BLOSC_BITSHUFFLE,
+            "BLOSC_SHUFFLE=BITSHUFFLE env should override caller-specified SHUFFLE"
+        );
+    }
+
+    #[test]
+    fn test_blosc1_set_compressor_changes_codec() {
+        let _lock = BLOSC_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Ensure env override isn't also in play.
+        let _unset = EnvGuard {
+            key: "BLOSC_COMPRESSOR",
+            prev: std::env::var_os("BLOSC_COMPRESSOR"),
+        };
+        unsafe { std::env::remove_var("BLOSC_COMPRESSOR") };
+
+        let data: Vec<u8> = (0..1024u32).flat_map(|i| i.to_le_bytes()).collect();
+        let mut compressed = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD + 1024];
+
+        let prev = blosc1_set_compressor("zstd").expect("zstd is a recognized codec name");
+        let csize = blosc1_compress(5, BLOSC_SHUFFLE, 4, &data, &mut compressed).unwrap();
+        let (_, compcode, _) = cbuffer_metainfo(&compressed[..csize]).unwrap();
+        assert_eq!(compcode, BLOSC_ZSTD);
+
+        // Restore.
+        blosc1_set_compressor_code(prev);
+    }
+
+    #[test]
+    fn test_blosc1_compress_honors_blosc_delta_env() {
+        let _lock = BLOSC_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_delta = blosc2_get_delta();
+        let data: Vec<u8> = (0..2048u32).flat_map(|i| i.to_le_bytes()).collect();
+        let mut compressed = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD + 1024];
+
+        // Ensure the global starts off.
+        blosc2_set_delta(false);
+
+        let _g = EnvGuard::set("BLOSC_DELTA", "1");
+        let csize = blosc1_compress(5, BLOSC_SHUFFLE, 4, &data, &mut compressed).unwrap();
+
+        // Env var should have flipped the global on, and the chunk header
+        // should reflect a BLOSC_DELTA filter at slot 4.
+        assert!(blosc2_get_delta(), "BLOSC_DELTA=1 must set the global");
+        let (_, _, filters) = cbuffer_metainfo(&compressed[..csize]).unwrap();
+        assert_eq!(
+            filters[BLOSC2_MAX_FILTERS - 2],
+            BLOSC_DELTA,
+            "delta filter must land in slot 4 of the chunk filters array"
+        );
+
+        // Roundtrip must still work.
+        let mut restored = vec![0u8; data.len()];
+        let dsize = blosc1_decompress(&compressed[..csize], &mut restored).unwrap();
+        assert_eq!(dsize, data.len());
+        assert_eq!(restored, data);
+
+        // Restore.
+        blosc2_set_delta(prev_delta);
+    }
+
+    #[test]
+    fn test_blosc1_compress_honors_blosc_blocksize_env() {
+        let _lock = BLOSC_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_bs = blosc1_get_blocksize();
+        blosc1_set_blocksize(0); // start from automatic
+
+        let data: Vec<u8> = (0..16384u32).flat_map(|i| i.to_le_bytes()).collect();
+        let mut compressed = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD + 1024];
+
+        let _g = EnvGuard::set("BLOSC_BLOCKSIZE", "4096");
+        let csize = blosc1_compress(5, BLOSC_SHUFFLE, 4, &data, &mut compressed).unwrap();
+
+        let (_, _, blocksize) = cbuffer_sizes(&compressed[..csize]).unwrap();
+        assert_eq!(
+            blocksize, 4096,
+            "BLOSC_BLOCKSIZE=4096 must be reflected in the chunk header"
+        );
+
+        blosc1_set_blocksize(prev_bs);
+    }
+
+    #[test]
+    fn test_blosc1_compress_honors_blosc_splitmode_env() {
+        let _lock = BLOSC_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_sm = blosc1_get_splitmode();
+        // Sanity: `NEVER` is observable via the `BLOSC_DONT_SPLIT` flag in the header.
+        // Use a codec/typesize combination that *would* otherwise split.
+        let data: Vec<u8> = (0..16384u32).flat_map(|i| i.to_le_bytes()).collect();
+        let mut compressed = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD + 1024];
+
+        let _g = EnvGuard::set("BLOSC_SPLITMODE", "NEVER");
+        let csize = blosc1_compress(5, BLOSC_SHUFFLE, 4, &data, &mut compressed).unwrap();
+
+        let header = ChunkHeader::read(&compressed[..csize]).unwrap();
+        assert!(
+            header.dont_split(),
+            "BLOSC_SPLITMODE=NEVER must set the DONT_SPLIT flag"
+        );
+
+        blosc1_set_splitmode(prev_sm);
+    }
+
+    #[test]
+    fn test_blosc1_compress_honors_blosc_nthreads_env() {
+        let _lock = BLOSC_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev_nt = blosc2_get_nthreads();
+        blosc2_set_nthreads(1);
+
+        let data: Vec<u8> = (0..32768u32).flat_map(|i| i.to_le_bytes()).collect();
+        let mut compressed = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD + 1024];
+
+        let _g = EnvGuard::set("BLOSC_NTHREADS", "4");
+        let csize = blosc1_compress(5, BLOSC_SHUFFLE, 4, &data, &mut compressed).unwrap();
+
+        // Observable effect: the env var mutated the global.
+        assert_eq!(blosc2_get_nthreads(), 4, "BLOSC_NTHREADS=4 must set the global");
+
+        // And the data still roundtrips regardless of thread count.
+        let mut restored = vec![0u8; data.len()];
+        let dsize = blosc1_decompress(&compressed[..csize], &mut restored).unwrap();
+        assert_eq!(dsize, data.len());
+        assert_eq!(restored, data);
+
+        blosc2_set_nthreads(prev_nt);
+    }
+
+    #[test]
+    fn test_blosc2_setters_roundtrip_previous_values() {
+        let _lock = BLOSC_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // blosc2_set_nthreads returns previous.
+        let n0 = blosc2_set_nthreads(3);
+        let n1 = blosc2_set_nthreads(7);
+        assert_eq!(n1, 3, "second set must see first set's value as previous");
+        blosc2_set_nthreads(n0); // restore
+
+        // blosc1_set_blocksize returns previous.
+        let b0 = blosc1_set_blocksize(16384);
+        let b1 = blosc1_set_blocksize(8192);
+        assert_eq!(b1, 16384);
+        blosc1_set_blocksize(b0);
+
+        // blosc1_set_splitmode returns previous.
+        let s0 = blosc1_set_splitmode(BLOSC_ALWAYS_SPLIT);
+        let s1 = blosc1_set_splitmode(BLOSC_NEVER_SPLIT);
+        assert_eq!(s1, BLOSC_ALWAYS_SPLIT);
+        blosc1_set_splitmode(s0);
+
+        // blosc2_set_nthreads clamps 0/negative to 1.
+        let _ = blosc2_set_nthreads(0);
+        assert_eq!(blosc2_get_nthreads(), 1);
+        blosc2_set_nthreads(n0); // restore
+    }
+
+    // Fuzz-style: mutate every byte of the first 32 (header) and ensure public
+    // decompress/validate/getitem entry points return Err instead of panicking.
+    #[test]
+    fn test_header_mutation_never_panics() {
+        let data: Vec<u8> = (0..2048u32).flat_map(|i| i.to_le_bytes()).collect();
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 4,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            ..Default::default()
+        };
+        let good = compress(&data, &cparams).unwrap();
+        let header_bytes = 32.min(good.len());
+
+        for i in 0..header_bytes {
+            for v in [0u8, 0xff, 0x7f, 0x80, 0xAA, 0x55] {
+                let mut bad = good.clone();
+                bad[i] = v;
+                // None of these must panic — they must return a Result.
+                let _ = std::panic::catch_unwind(|| decompress(&bad))
+                    .unwrap_or_else(|_| panic!("decompress panicked at byte={i} val={v:#x}"));
+                let _ = std::panic::catch_unwind(|| cbuffer_validate(&bad))
+                    .unwrap_or_else(|_| panic!("cbuffer_validate panicked at byte={i} val={v:#x}"));
+                let _ = std::panic::catch_unwind(|| cbuffer_sizes(&bad))
+                    .unwrap_or_else(|_| panic!("cbuffer_sizes panicked at byte={i} val={v:#x}"));
+                let _ = std::panic::catch_unwind(|| cbuffer_metainfo(&bad))
+                    .unwrap_or_else(|_| panic!("cbuffer_metainfo panicked at byte={i} val={v:#x}"));
+                let _ = std::panic::catch_unwind(|| getitem(&bad, 10, 5))
+                    .unwrap_or_else(|_| panic!("getitem panicked at byte={i} val={v:#x}"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_body_mutation_never_panics() {
+        let data: Vec<u8> = (0..2048u32).flat_map(|i| i.to_le_bytes()).collect();
+        // Mix of codecs and filter combinations — exercises different
+        // decompression paths (splits, shuffle, bitshuffle, memcpy fallback).
+        let cparam_matrix = [
+            (BLOSC_LZ4, BLOSC_SHUFFLE, BLOSC_NEVER_SPLIT),
+            (BLOSC_LZ4, BLOSC_BITSHUFFLE, BLOSC_ALWAYS_SPLIT),
+            (BLOSC_BLOSCLZ, BLOSC_SHUFFLE, BLOSC_FORWARD_COMPAT_SPLIT),
+            (BLOSC_ZSTD, BLOSC_NOFILTER, BLOSC_NEVER_SPLIT),
+            (BLOSC_ZLIB, BLOSC_BITSHUFFLE, BLOSC_NEVER_SPLIT),
+        ];
+        // Simple deterministic PRNG — xorshift — so the test is reproducible
+        // without pulling in a dependency.
+        let mut state: u64 = 0xdead_beef_cafe_babe;
+        let mut rand_u32 = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u32
+        };
+
+        for (codec, filter, split) in cparam_matrix {
+            let cparams = CParams {
+                compcode: codec,
+                clevel: 5,
+                typesize: 4,
+                splitmode: split,
+                filters: [0, 0, 0, 0, 0, filter],
+                ..Default::default()
+            };
+            let good = match compress(&data, &cparams) {
+                Ok(c) => c,
+                Err(_) => continue, // skip if compression not available
+            };
+
+            for _ in 0..200 {
+                let mut bad = good.clone();
+                // Flip 1..=4 random bytes anywhere in the chunk.
+                let n = (rand_u32() % 4 + 1) as usize;
+                for _ in 0..n {
+                    let idx = rand_u32() as usize % bad.len();
+                    bad[idx] ^= (rand_u32() & 0xFF) as u8;
+                }
+                // None of these must panic.
+                let _ = std::panic::catch_unwind(|| decompress(&bad)).unwrap_or_else(|_| {
+                    panic!("decompress panicked for codec={codec} filter={filter}")
+                });
+                let _ =
+                    std::panic::catch_unwind(|| cbuffer_validate(&bad)).unwrap_or_else(|_| {
+                        panic!("cbuffer_validate panicked for codec={codec} filter={filter}")
+                    });
+                let _ = std::panic::catch_unwind(|| getitem(&bad, 0, 10))
+                    .unwrap_or_else(|_| panic!("getitem panicked for codec={codec} filter={filter}"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_truncation_never_panics() {
+        let data: Vec<u8> = (0..2048u32).flat_map(|i| i.to_le_bytes()).collect();
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 4,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            ..Default::default()
+        };
+        let good = compress(&data, &cparams).unwrap();
+
+        let mut cuts: Vec<usize> = (0..=good.len()).collect();
+        cuts.extend_from_slice(&[0, 1, 3, 15, 16, 17, 31, 32, 33]);
+        cuts.sort();
+        cuts.dedup();
+
+        for &take in &cuts {
+            if take > good.len() {
+                continue;
+            }
+            let bad = &good[..take];
+            let _ = std::panic::catch_unwind(|| decompress(bad))
+                .unwrap_or_else(|_| panic!("decompress panicked at truncation={take}"));
+            let _ = std::panic::catch_unwind(|| cbuffer_validate(bad))
+                .unwrap_or_else(|_| panic!("cbuffer_validate panicked at truncation={take}"));
+            let _ = std::panic::catch_unwind(|| cbuffer_sizes(bad))
+                .unwrap_or_else(|_| panic!("cbuffer_sizes panicked at truncation={take}"));
+            let _ = std::panic::catch_unwind(|| getitem(bad, 0, 1))
+                .unwrap_or_else(|_| panic!("getitem panicked at truncation={take}"));
+        }
     }
 
     #[test]

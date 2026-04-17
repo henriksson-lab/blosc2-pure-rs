@@ -68,5 +68,5 @@ impl std::str::FromStr for Filter {
     }
 }
 
-/// Default chunk size used for file compression (1 MB).
-pub const DEFAULT_CHUNKSIZE: usize = 1_000_000;
+/// Default chunk size used for file compression (4 MiB).
+pub const DEFAULT_CHUNKSIZE: usize = 4 * 1024 * 1024;

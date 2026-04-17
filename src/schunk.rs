@@ -2,6 +2,7 @@ use crate::compress::{self, CParams, DParams};
 use crate::constants::*;
 use crate::header::ChunkHeader;
 use rayon::prelude::*;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// Named fixed-size metadata stored in a super-chunk frame header.
@@ -724,8 +725,10 @@ impl Schunk {
 
     /// Write to a file in b2frame format.
     pub fn to_file(&self, path: &str) -> std::io::Result<()> {
-        let frame_data = self.to_frame();
-        std::fs::write(path, frame_data)
+        let file = std::fs::File::create(path)?;
+        let mut writer = BufWriter::new(file);
+        frame::write_frame_to_writer(self, &mut writer)?;
+        writer.flush()
     }
 
     /// Write to a sparse frame directory.
@@ -951,6 +954,38 @@ pub mod frame {
         frame[16..24].copy_from_slice(&actual_size.to_be_bytes());
 
         frame
+    }
+
+    /// Write a frame directly to a writer without materializing the whole frame.
+    pub fn write_frame_to_writer<W: Write>(schunk: &Schunk, writer: &mut W) -> std::io::Result<()> {
+        let nbytes: i64 = schunk
+            .chunks
+            .iter()
+            .filter_map(|chunk| ChunkHeader::read(chunk).ok())
+            .map(|header| i64::from(header.nbytes))
+            .sum();
+        let cbytes: i64 = schunk.chunks.iter().map(|chunk| chunk.len() as i64).sum();
+        let chunksize = derive_frame_chunksize(schunk);
+
+        let mut header = build_header(schunk, nbytes, cbytes, chunksize);
+        let offsets_data = build_offsets(schunk, header.len());
+        let offsets_chunk = if offsets_data.is_empty() {
+            Vec::new()
+        } else {
+            build_offsets_chunk(&offsets_data)
+        };
+        let trailer = build_trailer(schunk);
+
+        let frame_size = header.len() + cbytes as usize + offsets_chunk.len() + trailer.len();
+        header[16..24].copy_from_slice(&(frame_size as u64).to_be_bytes());
+
+        writer.write_all(&header)?;
+        for chunk in &schunk.chunks {
+            writer.write_all(chunk)?;
+        }
+        writer.write_all(&offsets_chunk)?;
+        writer.write_all(&trailer)?;
+        Ok(())
     }
 
     /// Write a sparse frame directory with c-blosc2-compatible chunk files.

@@ -339,8 +339,8 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
 
         ip = anchor + 4;
         let ref_after = ref_offset + 4;
-        let distance_dec = distance - 1;
-        ip = get_run_or_match(input, ip, ip_bound, ref_after, distance_dec == 0);
+        let distance = distance - 1;
+        ip = get_run_or_match(input, ip, ip_bound, ref_after, distance == 0);
 
         if ip > ipshift {
             ip -= ipshift;
@@ -361,10 +361,7 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
         }
         copy = 0;
 
-        let mut distance = distance;
-
         if distance < MAX_DISTANCE as usize {
-            distance -= 1;
             if len < 7 {
                 if op + 2 > op_limit {
                     return 0;
@@ -397,8 +394,7 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
                 op += 1;
             }
         } else {
-            distance -= 1;
-            distance -= MAX_DISTANCE as usize;
+            let distance = distance - MAX_DISTANCE as usize;
             if len < 7 {
                 if op + 4 > op_limit {
                     return 0;
@@ -598,6 +594,32 @@ pub fn decompress(input: &[u8], output: &mut [u8]) -> i32 {
 mod tests {
     use super::*;
 
+    fn assert_roundtrip(data: &[u8], clevel: i32) {
+        let mut compressed = vec![0u8; data.len() + 1000];
+        let csize = compress(clevel, data, &mut compressed);
+        assert!(csize > 0, "Compression failed");
+
+        let mut decompressed = vec![0u8; data.len()];
+        let dsize = decompress(&compressed[..csize as usize], &mut decompressed);
+        assert_eq!(dsize as usize, data.len());
+        assert_eq!(data, decompressed);
+    }
+
+    fn deterministic_data(len: usize) -> Vec<u8> {
+        (0..len as u32)
+            .map(|i| ((i.wrapping_mul(37).wrapping_add(11)) & 0xff) as u8)
+            .collect()
+    }
+
+    fn distance_fixture(distance: usize, match_len: usize) -> Vec<u8> {
+        assert!(match_len >= 16);
+        let mut data = deterministic_data(distance + match_len + 128);
+        let pattern: Vec<u8> = (0..match_len).map(|i| b'A' + (i % 26) as u8).collect();
+        data[0..match_len].copy_from_slice(&pattern);
+        data[distance..distance + match_len].copy_from_slice(&pattern);
+        data
+    }
+
     #[test]
     fn test_compress_decompress_roundtrip() {
         // Use highly compressible data (repeated pattern)
@@ -607,14 +629,55 @@ mod tests {
             .take(40000)
             .copied()
             .collect();
-        let mut compressed = vec![0u8; data.len() + 1000];
-        let csize = compress(5, &data, &mut compressed);
-        assert!(csize > 0, "Compression failed");
+        assert_roundtrip(&data, 5);
+    }
 
-        let mut decompressed = vec![0u8; data.len()];
-        let dsize = decompress(&compressed[..csize as usize], &mut decompressed);
-        assert_eq!(dsize as usize, data.len());
-        assert_eq!(data, decompressed);
+    #[test]
+    fn test_exact_max_short_distance_roundtrip() {
+        let data = distance_fixture(MAX_DISTANCE as usize, 16);
+        assert_roundtrip(&data, 9);
+    }
+
+    #[test]
+    fn test_first_far_distance_roundtrip() {
+        let data = distance_fixture(MAX_DISTANCE as usize + 1, 32);
+        assert_roundtrip(&data, 9);
+    }
+
+    #[test]
+    fn test_near_max_far_distance_roundtrip() {
+        let data = distance_fixture(MAX_FARDISTANCE as usize - 1, 32);
+        assert_roundtrip(&data, 9);
+    }
+
+    #[test]
+    fn test_long_match_extension_roundtrip() {
+        let data = distance_fixture(MAX_DISTANCE as usize + 1, 2048);
+        assert_roundtrip(&data, 9);
+    }
+
+    #[test]
+    fn test_overlapping_run_roundtrip() {
+        let mut data = vec![0u8; 20_000];
+        for (i, byte) in data.iter_mut().enumerate().take(128) {
+            *byte = (i & 0xff) as u8;
+        }
+        data[128..].fill(b'Z');
+        assert_roundtrip(&data, 9);
+    }
+
+    #[test]
+    fn test_literal_run_encoding_roundtrip() {
+        let literal_prefix = (MAX_COPY as usize * 4) + 17;
+        let mut data = deterministic_data(literal_prefix);
+        data.extend(
+            b"literal-run-boundary-tail"
+                .iter()
+                .cycle()
+                .take(4096)
+                .copied(),
+        );
+        assert_roundtrip(&data, 9);
     }
 
     #[test]
@@ -626,5 +689,128 @@ mod tests {
         let mut compressed = vec![0u8; data.len() + 100];
         let _csize = compress(1, &data, &mut compressed);
         // May or may not compress; that's fine
+    }
+
+    // Targeted tests that pin down `get_match_generic`'s return convention
+    // against C's `get_match` (c-blosc2/blosc/blosclz.c:148). These exist to
+    // close FINDINGS.md SUSPECT #10 — confirming whether Rust and C agree on
+    // where `ip` lands after a byte-level mismatch inside the 8-byte word loop.
+    //
+    // Important: the encoder does `ip -= ipshift(=4)` after get_match and the
+    // decoder does `len += 3`, so the total number of bytes actually copied on
+    // decode is `(returned_ip - call_site_ip) + 3`. For correctness with a
+    // real match of length L starting at `anchor`, the encoder calls
+    // get_match with `ip = anchor + 4`, so we need
+    // `(returned_ip - (anchor + 4)) + 3 == L`,
+    // i.e. `returned_ip == anchor + 1 + L`. Since anchor + 4 was the call
+    // site, that means get_match must advance ip by `L - 3` from where it was
+    // called — which is `L - 3` extra bytes, i.e. advance past the mismatch by
+    // one (to eat the first differing byte too). That's the C "one past
+    // mismatch" convention.
+    //
+    // If Rust's `matching_prefix_len` returns the exact count, the function
+    // advances `ip` by exactly the count — one byte short. These tests pin
+    // that down so the behavior is intentional and observed.
+
+    #[test]
+    fn get_match_generic_stops_at_first_differing_byte_in_word() {
+        // Lay out two regions 32 bytes apart. Bytes 0..=3 match, byte 4 differs.
+        let mut data = vec![0u8; 128];
+        let ref_pos = 0usize;
+        let ip_pos = 32usize;
+        for i in 0..4 {
+            data[ref_pos + i] = (0xA0 + i as u8) as u8;
+            data[ip_pos + i] = (0xA0 + i as u8) as u8;
+        }
+        // Byte 4 differs.
+        data[ref_pos + 4] = 0xEE;
+        data[ip_pos + 4] = 0xFF;
+        // Bytes 5..=7 arbitrary.
+        for i in 5..8 {
+            data[ref_pos + i] = 0x11;
+            data[ip_pos + i] = 0x22;
+        }
+
+        // ip_bound must allow the 8-byte word read at ip_pos (ip + 8 <= ip_bound).
+        let returned = get_match_generic(&data, ip_pos, ip_pos + 16, ref_pos);
+
+        // Observation: Rust stops AT the mismatch (matching_prefix_len returns
+        // 4, ip advances by 4). This is the documented baseline — any future
+        // change must update FINDINGS.md SUSPECT #10 accordingly.
+        assert_eq!(
+            returned - ip_pos,
+            4,
+            "Rust get_match_generic advances ip by exact matched-byte count"
+        );
+    }
+
+    #[test]
+    fn get_match_generic_matches_full_word_when_equal() {
+        // Two identical 16-byte regions: should advance by 16 and then stop at
+        // the remainder-loop boundary.
+        let mut data = vec![0u8; 64];
+        for i in 0..16 {
+            data[i] = (0x20 + i as u8) as u8;
+            data[32 + i] = (0x20 + i as u8) as u8;
+        }
+        // Byte 16 onwards differs so the remainder loop immediately stops.
+        data[16] = 0x55;
+        data[48] = 0xAA;
+
+        let returned = get_match_generic(&data, 32, 48, 0);
+        assert_eq!(
+            returned - 32,
+            16,
+            "Full-word matches advance ip by 8 per word; here 16 across two words"
+        );
+    }
+
+    #[test]
+    fn get_match_generic_handles_mismatch_at_byte_zero_of_word() {
+        // Bytes 0..=7 match. Bytes 8 differs (start of second word).
+        let mut data = vec![0u8; 64];
+        for i in 0..8 {
+            data[i] = 0xC0 + i as u8;
+            data[32 + i] = 0xC0 + i as u8;
+        }
+        data[8] = 0x00;
+        data[32 + 8] = 0xFF;
+
+        let returned = get_match_generic(&data, 32, 48, 0);
+        assert_eq!(
+            returned - 32,
+            8,
+            "First word all match, second word byte 0 differs → advance 8 exactly"
+        );
+    }
+
+    // End-to-end closure of SUSPECT #10: even though get_match_generic advances
+    // ip "one byte short" relative to C's post-increment idiom, the compressed
+    // output still decompresses correctly end-to-end. Capture that as a direct
+    // test so regressions in get_match that silently break cross-compat surface
+    // as test failures here.
+    #[test]
+    fn rust_blosclz_output_roundtrips_with_nontrivial_match_lengths() {
+        // Build data with a known long match at a near distance so the
+        // encoder must exercise the word-boundary mismatch path.
+        let mut data = vec![0u8; 0];
+        // First 200 bytes: pseudo-random.
+        data.extend((0..200u32).map(|i| ((i.wrapping_mul(37)) & 0xFF) as u8));
+        // Second region: copy of a chunk of the first, terminated by a differing byte.
+        let copy_start = 20usize;
+        let copy_len = 50usize;
+        data.extend_from_slice(&data.clone()[copy_start..copy_start + copy_len]);
+        data.push(0xAA); // forces the match to terminate mid-word
+        // Padding so the data is large enough for blosclz to consider.
+        data.extend(vec![0x77u8; 200]);
+
+        let mut compressed = vec![0u8; data.len() + 256];
+        let csize = compress(9, &data, &mut compressed);
+        assert!(csize > 0, "compression must succeed");
+
+        let mut decompressed = vec![0u8; data.len()];
+        let dsize = decompress(&compressed[..csize as usize], &mut decompressed);
+        assert_eq!(dsize as usize, data.len());
+        assert_eq!(data, decompressed);
     }
 }

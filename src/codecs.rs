@@ -199,16 +199,31 @@ fn zlib_decompress(src: &[u8], dest: &mut [u8]) -> i32 {
     }
 }
 
+/// Map blosc clevel (0..=9) to the underlying zstd compression level,
+/// matching `zstd_wrap_compress` in c-blosc2/blosc/blosc2.c:543.
+///
+/// C formula: `clevel = (clevel < 9) ? clevel * 2 - 1 : ZSTD_maxCLevel();`
+/// which gives: 0→-1, 1→1, 2→3, 3→5, 4→7, 5→9, 6→11, 7→13, 8→15, 9→22.
+fn blosc_clevel_to_zstd(clevel: u8) -> i32 {
+    if clevel < 9 {
+        // Signed to accommodate blosc 0 → zstd -1 (fastest / negative-level).
+        (clevel as i32) * 2 - 1
+    } else {
+        // ZSTD_maxCLevel() is 22 in upstream zstd (has been stable since 1.0).
+        22
+    }
+}
+
 fn zstd_compress(src: &[u8], dest: &mut [u8], clevel: u8) -> i32 {
     // Use compress_to_buffer to write directly into dest
-    match zstd::bulk::compress_to_buffer(src, dest, clevel as i32) {
+    match zstd::bulk::compress_to_buffer(src, dest, blosc_clevel_to_zstd(clevel)) {
         Ok(n) => n as i32,
         Err(_) => 0,
     }
 }
 
 fn zstd_compress_with_dict(src: &[u8], dest: &mut [u8], clevel: u8, dict: &[u8]) -> i32 {
-    match zstd::bulk::Compressor::with_dictionary(clevel as i32, dict)
+    match zstd::bulk::Compressor::with_dictionary(blosc_clevel_to_zstd(clevel), dict)
         .and_then(|mut compressor| compressor.compress_to_buffer(src, dest))
     {
         Ok(n) => n as i32,
@@ -236,6 +251,51 @@ fn zstd_decompress_with_dict(src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blosc_clevel_to_zstd_matches_c_library_mapping() {
+        // Table from c-blosc2/blosc/blosc2.c zstd_wrap_compress.
+        // Blosc level → zstd level.
+        let expected = [
+            (0, -1),
+            (1, 1),
+            (2, 3),
+            (3, 5),
+            (4, 7),
+            (5, 9),
+            (6, 11),
+            (7, 13),
+            (8, 15),
+            (9, 22),
+        ];
+        for (blosc, zstd) in expected {
+            assert_eq!(
+                blosc_clevel_to_zstd(blosc),
+                zstd,
+                "blosc {blosc} must map to zstd {zstd}"
+            );
+        }
+    }
+
+    #[test]
+    fn zstd_at_higher_blosc_level_compresses_better() {
+        // A quick sanity check: after the mapping fix, blosc level 9 should
+        // produce a significantly smaller or equal output than level 1 on
+        // repetitive data. With the old identity mapping, level 9 used zstd
+        // level 9; with the fix, level 9 uses zstd level 22 (maxCLevel).
+        let data: Vec<u8> = (0..16384u32).flat_map(|i| (i % 17).to_le_bytes()).collect();
+        let mut buf1 = vec![0u8; data.len() + 256];
+        let mut buf9 = vec![0u8; data.len() + 256];
+
+        let csize1 = zstd_compress(&data, &mut buf1, 1);
+        let csize9 = zstd_compress(&data, &mut buf9, 9);
+
+        assert!(csize1 > 0 && csize9 > 0, "compression must not fail");
+        assert!(
+            csize9 <= csize1,
+            "level 9 must compress at least as well as level 1 (got {csize9} vs {csize1})"
+        );
+    }
 
     #[test]
     #[cfg(feature = "lz4hc-sys")]

@@ -19,6 +19,64 @@ fn init_blosc2() -> common::Blosc2 {
     common::Blosc2::new()
 }
 
+const BLOSCLZ_MAX_COPY: usize = 32;
+const BLOSCLZ_MAX_DISTANCE: usize = 8191;
+const BLOSCLZ_MAX_FARDISTANCE: usize = 65535 + BLOSCLZ_MAX_DISTANCE - 1;
+
+fn blosclz_deterministic_data(len: usize) -> Vec<u8> {
+    (0..len as u32)
+        .map(|i| ((i.wrapping_mul(37).wrapping_add(11)) & 0xff) as u8)
+        .collect()
+}
+
+fn blosclz_distance_fixture(distance: usize, match_len: usize) -> Vec<u8> {
+    assert!(match_len >= 16);
+    let mut data = blosclz_deterministic_data(distance + match_len + 128);
+    let pattern: Vec<u8> = (0..match_len).map(|i| b'A' + (i % 26) as u8).collect();
+    data[0..match_len].copy_from_slice(&pattern);
+    data[distance..distance + match_len].copy_from_slice(&pattern);
+    data
+}
+
+fn blosclz_optimization_fixtures() -> Vec<(&'static str, Vec<u8>)> {
+    let mut overlapping_run = vec![0u8; 20_000];
+    for (i, byte) in overlapping_run.iter_mut().enumerate().take(128) {
+        *byte = (i & 0xff) as u8;
+    }
+    overlapping_run[128..].fill(b'Z');
+
+    let literal_prefix = (BLOSCLZ_MAX_COPY * 4) + 17;
+    let mut literal_run = blosclz_deterministic_data(literal_prefix);
+    literal_run.extend(
+        b"literal-run-boundary-tail"
+            .iter()
+            .cycle()
+            .take(4096)
+            .copied(),
+    );
+
+    vec![
+        (
+            "exact_max_short_distance",
+            blosclz_distance_fixture(BLOSCLZ_MAX_DISTANCE, 16),
+        ),
+        (
+            "first_far_distance",
+            blosclz_distance_fixture(BLOSCLZ_MAX_DISTANCE + 1, 32),
+        ),
+        (
+            "near_max_far_distance",
+            blosclz_distance_fixture(BLOSCLZ_MAX_FARDISTANCE - 1, 32),
+        ),
+        (
+            "long_match_extension",
+            blosclz_distance_fixture(BLOSCLZ_MAX_DISTANCE + 1, 2048),
+        ),
+        ("overlapping_run", overlapping_run),
+        ("literal_run_encoding", literal_run),
+    ]
+}
+
 /// Compress with C FFI, decompress with pure Rust engine
 #[test]
 fn test_c_compress_rust_decompress() {
@@ -107,6 +165,44 @@ fn test_rust_compress_c_decompress() {
             "C decompress size mismatch for codec={compcode}: got {dsize}"
         );
         assert_eq!(data, c_decompressed, "Rust→C mismatch for codec={compcode}");
+    }
+}
+
+#[test]
+fn test_blosclz_optimization_fixtures_c_decompress() {
+    let _b = init_blosc2();
+
+    for (name, data) in blosclz_optimization_fixtures() {
+        let cparams = CParams {
+            compcode: BLOSC_BLOSCLZ,
+            clevel: 9,
+            typesize: 1,
+            blocksize: data.len() as i32,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0; BLOSC2_MAX_FILTERS],
+            ..Default::default()
+        };
+        let compressed = compress(&data, &cparams)
+            .unwrap_or_else(|e| panic!("Rust BloscLZ compress failed for {name}: {e}"));
+
+        let mut c_decompressed = vec![0u8; data.len()];
+        let dsize = unsafe {
+            ffi::blosc2_decompress(
+                compressed.as_ptr() as *const _,
+                compressed.len() as i32,
+                c_decompressed.as_mut_ptr() as *mut _,
+                c_decompressed.len() as i32,
+            )
+        };
+        assert_eq!(
+            dsize,
+            data.len() as i32,
+            "C decompress size mismatch for {name}: got {dsize}"
+        );
+        assert_eq!(
+            data, c_decompressed,
+            "Rust BloscLZ -> C mismatch for {name}"
+        );
     }
 }
 

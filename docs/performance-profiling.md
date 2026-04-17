@@ -17,6 +17,26 @@ perf report --stdio -n --no-children -i /tmp/blosc2-rs-perf-lz4.data
 
 Kernel symbols were restricted by the local system settings, but user-space symbols were resolved.
 
+## Benchmark Discipline
+
+Use two separate benchmark classes:
+
+| Class | Purpose | Command |
+|------|---------|---------|
+| Hot-path/library benchmarks | Drive codec, filter, chunk, and frame optimization decisions | `RUSTFLAGS="-C target-cpu=native" cargo bench --bench perf --features lz4hc-sys` |
+| CLI/process-level benchmarks | Estimate end-user command-line behavior, including process startup, file I/O, frame writing, allocation, and argument parsing | release `target/release/blosc2` compared with local C helper binaries |
+
+Do not use process-level CLI timings to justify low-level codec or filter changes. They are useful for checking the whole command-line path, but they include work outside the compression hot path and vary more across runs.
+
+Every benchmark result should record:
+
+- command line and feature flags
+- build flags, especially `RUSTFLAGS`
+- input shape and data generator
+- codec, level, filter, typesize, chunk size, block size, and thread count
+- whether timings are library-level Criterion measurements or process-level CLI/helper measurements
+- whether decompressed bytes were verified against the original input
+
 ## Top Hotspots
 
 | Case | Top user-space samples |
@@ -61,4 +81,8 @@ scratch allocation entirely for no-op filter pipelines.
 
 For zlib, `flate2`'s optional `zlib-rs` backend was tested as an opt-in pure-Rust alternative.
 On `zlib-t4-signal-compress` with 8 iterations, the default miniz backend took about 3.03s
-and `zlib-rs` took about 3.27s on this machine, so the default remains unchanged.
+and `zlib-rs` took about 3.27s on this machine, so the default remains unchanged. Keep the
+published default pure Rust unless the benchmark harness shows a faster pure-Rust backend.
+Treat native zlib/zlib-ng-style backends as future opt-in work, not default behavior. For
+performance-focused users that do not need zlib/deflate compatibility, recommend LZ4 for
+speed or Zstd for stronger compression.

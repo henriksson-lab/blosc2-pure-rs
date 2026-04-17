@@ -231,6 +231,51 @@ These test functionality we already implement but don't test:
   - [x] Benchmark current `flate2`/miniz path against available pure-Rust alternatives
   - [x] Add opt-in `zlib-rs` feature for local comparison
   - [x] Keep C/zlib-ng parity as a documented non-goal unless a faster pure-Rust path is available
+- [x] Separate CLI/process-level benchmarks from hot-path optimization benchmarks
+  - [x] Keep process-level C-vs-Rust tables for end-user CLI behavior only
+  - [x] Use Criterion/library-level benchmarks for codec, filter, chunk, and frame hot-path decisions
+  - [x] Record benchmark command lines, feature flags, input shape, chunk size, thread count, and build flags with every result
+- [x] Optimize sequential full chunk decompression throughput
+  - [x] Add a decompression workspace that reuses filter and codec scratch buffers across blocks
+  - [x] Add an internal path that writes decompressed blocks directly into the final output buffer
+  - [x] Avoid per-block `Vec` allocation for regular sequential full-chunk decompression
+  - [x] Fast-path no-op filters by decoding directly into the final output block
+  - [x] Fast-path single `SHUFFLE` by unshuffling directly into the final output block
+  - [x] Preserve block-local partial decompression behavior for `getitem` and slice helpers
+  - [x] Extend scratch-buffer reuse to parallel decompression workers without regressing scheduling
+  - [x] Avoid per-block result vectors and result-copy pass in non-delta parallel full-chunk decompression
+- [ ] Reuse compression scratch buffers more broadly
+  - [x] Reuse worker-local filter buffers and codec output buffers in parallel block compression
+  - [ ] Share per-call filter buffers, codec output buffers, and block assembly buffers across blocks/chunks where lifetimes allow
+  - [ ] Audit remaining filtered-data copies and remove them only when tests cover aliasing and leftover cases
+  - [ ] Keep safe initialized-buffer boundaries unless unsafe handling has a narrow wrapper and dedicated tests
+  - Deferred: parallel compressed block assembly still needs owned per-block buffers because block sizes are variable before frame assembly
+- [ ] Improve unshuffle performance for decompression-heavy workloads
+  - [x] Profile `typesize=4` LZ4 and BloscLZ decompression with `perf`
+  - [x] Tune common-width unshuffle loops for `typesize` 2, 4, and 8
+  - [x] Benchmark shuffle and unshuffle separately so compression and decompression regressions are visible
+  - [x] Keep scalar-first shuffle dispatch for now; existing AVX2/SSE2 shuffle/unshuffle path benchmarked slower than the common-width scalar path on `typesize=4`
+  - [x] `perf` showed `filters::unshuffle` as the top resolved user-space symbol for 64 MiB LZ4 and BloscLZ CLI decompression after file-write kernel time
+  - [x] Use narrow unaligned integer stores for common-width unshuffle; `filters/unshuffle/4` improved to about 697 us for 1 MiB on the local Criterion run
+- [ ] Add further audited SIMD only behind safe wrappers
+  - [ ] Add runtime-dispatched SSE2/AVX2 implementations for the dominant `typesize=4` shuffle/unshuffle paths if scalar profiling shows a clear ceiling
+  - [ ] Keep scalar fallback and dispatch equivalence tests for supported widths and leftovers
+  - [ ] Avoid compile-time-only CPU assumptions in published builds
+- [ ] Continue BloscLZ tuning conservatively
+  - [x] Add boundary tests for distances 8191, 8192, far-distance limits, long match extension, overlapping copies, and run encoding
+  - [x] Compare Rust-compressed chunks against C decompression for each new BloscLZ optimization fixture
+  - [ ] Avoid changing C distance-bias and match-length ordering without trace-backed evidence
+  - [ ] Use `/home/mahogny/github/claude/newhmmer/tracehash` for hard-to-track BloscLZ divergence cases
+- [x] Keep zlib backend strategy explicit
+  - [x] Keep pure-Rust default unless a faster pure-Rust backend is demonstrated on the benchmark harness
+  - [x] Treat optional native zlib backends as future opt-in work, not default publish behavior
+  - [x] Recommend LZ4/Zstd for performance-focused users when zlib compatibility is not required
+- [ ] Improve CLI-specific throughput separately from library hot paths
+  - [x] Profile file I/O, frame buffering, allocation, and process-level overhead separately from compression work
+  - [x] Add buffered file output for frame writing and CLI decompression output after `perf` showed substantial write-side system time
+  - [x] Evaluate larger default or documented `--chunksize` guidance for large files
+  - [x] Raise CLI/library default chunk size to 4 MiB after local 64 MiB CLI benchmarks showed better compression throughput than 1,000,000-byte chunks without the decompression penalty of one huge chunk
+  - [x] Avoid unnecessary intermediate frame buffers when streaming chunks to disk
 
 ## Phase 8: Documentation
 - [x] Create README.md with benchmark results, CLI usage, library API examples

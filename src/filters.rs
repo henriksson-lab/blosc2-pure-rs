@@ -167,9 +167,14 @@ fn unshuffle2(src: &[u8], dest: &mut [u8]) {
     let nelements = src.len() / 2;
     let main_len = nelements * 2;
     let (s0, s1) = src[..main_len].split_at(nelements);
-    for (i, element) in dest[..main_len].chunks_exact_mut(2).enumerate() {
-        element[0] = s0[i];
-        element[1] = s1[i];
+    // SAFETY: main_len is derived from src.len() and dest was checked by
+    // unshuffle(), so every unaligned element write lands within dest.
+    unsafe {
+        let out = dest.as_mut_ptr();
+        for i in 0..nelements {
+            let value = u16::from_ne_bytes([s0[i], s1[i]]);
+            std::ptr::write_unaligned(out.add(i * 2).cast::<u16>(), value);
+        }
     }
     dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
 }
@@ -195,11 +200,14 @@ fn unshuffle4(src: &[u8], dest: &mut [u8]) {
     let (s0, rest) = src[..main_len].split_at(nelements);
     let (s1, rest) = rest.split_at(nelements);
     let (s2, s3) = rest.split_at(nelements);
-    for (i, element) in dest[..main_len].chunks_exact_mut(4).enumerate() {
-        element[0] = s0[i];
-        element[1] = s1[i];
-        element[2] = s2[i];
-        element[3] = s3[i];
+    // SAFETY: main_len is derived from src.len() and dest was checked by
+    // unshuffle(), so every unaligned element write lands within dest.
+    unsafe {
+        let out = dest.as_mut_ptr();
+        for i in 0..nelements {
+            let value = u32::from_ne_bytes([s0[i], s1[i], s2[i], s3[i]]);
+            std::ptr::write_unaligned(out.add(i * 4).cast::<u32>(), value);
+        }
     }
     dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
 }
@@ -237,15 +245,15 @@ fn unshuffle8(src: &[u8], dest: &mut [u8]) {
     let (s4, rest) = rest.split_at(nelements);
     let (s5, rest) = rest.split_at(nelements);
     let (s6, s7) = rest.split_at(nelements);
-    for (i, element) in dest[..main_len].chunks_exact_mut(8).enumerate() {
-        element[0] = s0[i];
-        element[1] = s1[i];
-        element[2] = s2[i];
-        element[3] = s3[i];
-        element[4] = s4[i];
-        element[5] = s5[i];
-        element[6] = s6[i];
-        element[7] = s7[i];
+    // SAFETY: main_len is derived from src.len() and dest was checked by
+    // unshuffle(), so every unaligned element write lands within dest.
+    unsafe {
+        let out = dest.as_mut_ptr();
+        for i in 0..nelements {
+            let value =
+                u64::from_ne_bytes([s0[i], s1[i], s2[i], s3[i], s4[i], s5[i], s6[i], s7[i]]);
+            std::ptr::write_unaligned(out.add(i * 8).cast::<u64>(), value);
+        }
     }
     dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
 }
@@ -894,20 +902,26 @@ pub fn delta_encode(
     if typesize == 0 || src.len() < nbytes || dest.len() < nbytes {
         return;
     }
-    // Use byte-level XOR for simplicity — the C code optimizes by typesize
-    // but the result is identical since XOR is byte-wise
+    // Match C delta_encoder: 1, 2, 4, 8 use that element width; everything else
+    // degrades to 8 (when a multiple of 8) or 1. Using the requested typesize
+    // directly would produce output incompatible with the C library.
+    let effective_typesize = match typesize {
+        1 | 2 | 4 | 8 => typesize,
+        n if n % 8 == 0 => 8,
+        _ => 1,
+    };
     if offset == 0 {
-        // Reference block: delta against previous elements in dref
-        let head = typesize.min(nbytes);
+        // Reference block: delta against previous elements in dref.
+        let head = effective_typesize.min(nbytes);
         if dref.len() < nbytes.max(head) {
             return;
         }
         dest[..head].copy_from_slice(&dref[..head]);
-        for i in typesize..nbytes {
-            dest[i] = src[i] ^ dref[i - typesize];
+        for i in effective_typesize..nbytes {
+            dest[i] = src[i] ^ dref[i - effective_typesize];
         }
     } else {
-        // Non-reference block: delta against dref
+        // Non-reference block: delta against dref.
         if dref.len() < nbytes {
             return;
         }
@@ -930,10 +944,15 @@ pub fn delta_decode(
     if typesize == 0 || dest.len() < nbytes {
         return;
     }
+    let effective_typesize = match typesize {
+        1 | 2 | 4 | 8 => typesize,
+        n if n % 8 == 0 => 8,
+        _ => 1,
+    };
     if offset == 0 {
         // Reference block: self-referential decode (dest[i] ^= dest[i-typesize])
-        for i in typesize..nbytes {
-            dest[i] ^= dest[i - typesize];
+        for i in effective_typesize..nbytes {
+            dest[i] ^= dest[i - effective_typesize];
         }
     } else if let Some(dref) = dref {
         // Non-reference block: undo delta against dref
@@ -1006,7 +1025,9 @@ pub fn pipeline_forward(
                 delta_encode(actual_dref, block_offset, bsize, typesize, inp, out);
             }
             BLOSC_TRUNC_PREC => {
-                let prec = filters_meta[i] as usize;
+                // C treats filters_meta as int8_t — negative values have Python-style
+                // "drop this many mantissa bits" semantics.
+                let prec = filters_meta[i] as i8;
                 trunc_prec_forward(inp, out, typesize, prec);
             }
             _ => {
@@ -1103,41 +1124,71 @@ pub fn pipeline_backward(
 }
 
 /// Truncate precision: zero out least-significant bits of floating-point values.
-fn trunc_prec_forward(src: &[u8], dest: &mut [u8], typesize: usize, prec_bits: usize) {
-    if prec_bits == 0 || typesize == 0 {
-        dest[..src.len()].copy_from_slice(src);
+// See c-blosc2/blosc/trunc-prec.c. The filter zeros *mantissa* bits of IEEE-754
+// floats — sign and exponent are preserved. Only typesize 4 (f32) and 8 (f64)
+// are supported by the C library. The `prec_bits` value is signed:
+//   > 0 → absolute mantissa bits to keep (python-index-from-start semantics)
+//   < 0 → mantissa bits to drop (python-negative-index semantics)
+//   = 0 → the C library treats this as "keep 0 bits" (i.e. drop all mantissa).
+const BITS_MANTISSA_F32: i32 = 23;
+const BITS_MANTISSA_F64: i32 = 52;
+
+fn trunc_prec_forward(src: &[u8], dest: &mut [u8], typesize: usize, prec_bits: i8) {
+    let len = src.len();
+    if dest.len() < len {
+        return;
+    }
+    // Rust's wider typesize support: C returns error for anything but 4 or 8.
+    // We pass the data through unchanged to avoid producing cross-incompatible
+    // output that C would not have been able to generate.
+    if !matches!(typesize, 4 | 8) {
+        dest[..len].copy_from_slice(src);
         return;
     }
 
-    let total_bits = typesize * 8;
-    if prec_bits >= total_bits {
-        dest[..src.len()].copy_from_slice(src);
+    let (mantissa_bits, n_elements) = match typesize {
+        4 => (BITS_MANTISSA_F32, len / 4),
+        8 => (BITS_MANTISSA_F64, len / 8),
+        _ => unreachable!(),
+    };
+
+    let p = prec_bits as i32;
+    if p.abs() > mantissa_bits {
+        // C logs an error and returns -1. We mirror by passing through.
+        dest[..len].copy_from_slice(src);
+        return;
+    }
+    let zeroed_bits = if p >= 0 { mantissa_bits - p } else { -p };
+    if zeroed_bits >= mantissa_bits {
+        // C returns -1 in this case too.
+        dest[..len].copy_from_slice(src);
         return;
     }
 
-    let bits_to_clear = total_bits - prec_bits;
-    let bytes_to_clear = bits_to_clear / 8;
-    let remaining_bits = bits_to_clear % 8;
-
-    let n_elements = src.len() / typesize;
-    for i in 0..n_elements {
-        let off = i * typesize;
-        // Copy the element
-        dest[off..off + typesize].copy_from_slice(&src[off..off + typesize]);
-        // Zero out least-significant bytes
-        for b in 0..bytes_to_clear {
-            dest[off + b] = 0;
+    match typesize {
+        4 => {
+            let mask = !((1u32 << zeroed_bits) - 1);
+            for i in 0..n_elements {
+                let off = i * 4;
+                let v = u32::from_le_bytes(src[off..off + 4].try_into().unwrap());
+                dest[off..off + 4].copy_from_slice(&(v & mask).to_le_bytes());
+            }
         }
-        // Mask remaining bits in the partial byte
-        if remaining_bits > 0 {
-            let mask = !((1u8 << remaining_bits) - 1);
-            dest[off + bytes_to_clear] &= mask;
+        8 => {
+            let mask = !((1u64 << zeroed_bits) - 1);
+            for i in 0..n_elements {
+                let off = i * 8;
+                let v = u64::from_le_bytes(src[off..off + 8].try_into().unwrap());
+                dest[off..off + 8].copy_from_slice(&(v & mask).to_le_bytes());
+            }
         }
+        _ => unreachable!(),
     }
 
+    // Copy any leftover bytes that don't form a complete element.
     let tail_start = n_elements * typesize;
-    if tail_start < src.len() {
-        dest[tail_start..src.len()].copy_from_slice(&src[tail_start..]);
+    if tail_start < len {
+        dest[tail_start..len].copy_from_slice(&src[tail_start..]);
     }
 }
 
@@ -1399,6 +1450,62 @@ mod tests {
         assert_eq!(src, decoded);
     }
 
+    // C's delta_{encoder,decoder} (c-blosc2/blosc/delta.c) falls back to typesize=1
+    // for non-power-of-two typesizes that are not multiples of 8, and to typesize=8
+    // for multiples of 8. Rust must match for cross-compatibility.
+    #[test]
+    fn test_delta_falls_back_to_byte_level_for_typesize_3() {
+        // Reference block (offset=0). C's encoder at typesize=3 degrades to typesize=1
+        // which means dest[0]=dref[0], and dest[i]=src[i]^dref[i-1] for i>=1.
+        let src: Vec<u8> = vec![
+            0xA0, 0xA1, 0xA2, 0xB0, 0xB1, 0xB2, 0xC0, 0xC1, 0xC2, 0xD0, 0xD1, 0xD2,
+        ];
+        let mut encoded = vec![0u8; 12];
+        // dref=src for offset==0 per pipeline_forward convention.
+        delta_encode(&src, 0, 12, 3, &src, &mut encoded);
+
+        // Expected (what C does): typesize=1 fallback.
+        let mut expected = vec![0u8; 12];
+        expected[0] = src[0];
+        for i in 1..12 {
+            expected[i] = src[i] ^ src[i - 1];
+        }
+
+        assert_eq!(
+            encoded, expected,
+            "delta_encode with typesize=3 must degrade to byte-level (C-compatible)"
+        );
+
+        // Symmetric check for decode.
+        let mut dest = encoded.clone();
+        delta_decode(None, 0, 12, 3, &mut dest);
+        assert_eq!(dest, src, "decode must roundtrip after C-compatible encode");
+    }
+
+    #[test]
+    fn test_delta_falls_back_to_u64_for_typesize_16() {
+        // typesize=16 is a multiple of 8 → C falls back to typesize=8.
+        let src: Vec<u8> = (0..32).map(|i| i as u8 ^ 0xA5).collect();
+        let mut encoded = vec![0u8; 32];
+        delta_encode(&src, 0, 32, 16, &src, &mut encoded);
+
+        // Expected: typesize=8 behavior. Copy first 8, then XOR 8-byte blocks.
+        let mut expected = vec![0u8; 32];
+        expected[..8].copy_from_slice(&src[..8]);
+        for i in 8..32 {
+            expected[i] = src[i] ^ src[i - 8];
+        }
+
+        assert_eq!(
+            encoded, expected,
+            "delta_encode with typesize=16 must degrade to 8-byte granularity (C-compatible)"
+        );
+
+        let mut dest = encoded.clone();
+        delta_decode(None, 0, 32, 16, &mut dest);
+        assert_eq!(dest, src);
+    }
+
     #[test]
     fn test_delta_rejects_invalid_buffers() {
         let src: Vec<u8> = (0..16).collect();
@@ -1507,8 +1614,60 @@ mod tests {
         let src = [0xFFu8, 0xFF, 0xFF, 0xFF, 0xAA, 0xBB];
         let mut dest = [0u8; 6];
 
+        // prec_bits=16 > BITS_MANTISSA_F32(23), valid. Zero low 7 mantissa bits.
         trunc_prec_forward(&src, &mut dest, 4, 16);
 
         assert_eq!(&dest[4..], &src[4..]);
+    }
+
+    // C's truncate_precision32 (c-blosc2/blosc/trunc-prec.c) only zeros mantissa
+    // bits (BITS_MANTISSA_FLOAT = 23) — the sign and 8-bit exponent are preserved
+    // so the result is still a valid IEEE-754 approximation of the input.
+    // Rust must match.
+    #[test]
+    fn test_trunc_prec_f32_preserves_sign_and_exponent() {
+        // 1.333... = 0x3FAAAAAB in IEEE-754. prec_bits = 10 → clear low 13 mantissa bits.
+        let original: f32 = 1.3333333;
+        let src = original.to_le_bytes();
+        let mut dest = [0u8; 4];
+
+        trunc_prec_forward(&src, &mut dest, 4, 10);
+
+        let out = f32::from_le_bytes(dest);
+        let out_bits = out.to_bits();
+        let orig_bits = original.to_bits();
+        // Sign and exponent (top 9 bits) must be preserved.
+        assert_eq!(
+            out_bits & 0xFF800000,
+            orig_bits & 0xFF800000,
+            "trunc_prec must preserve sign+exponent: original={:#x} got={:#x}",
+            orig_bits,
+            out_bits
+        );
+        // The output must be a reasonable approximation of the input (within 1%).
+        let rel_err = ((out - original) / original).abs();
+        assert!(
+            rel_err < 0.01,
+            "trunc_prec should approximate the input (got {out} for input {original}, rel err {rel_err})"
+        );
+    }
+
+    #[test]
+    fn test_trunc_prec_f64_preserves_sign_and_exponent() {
+        let original: f64 = 1.3333333333333;
+        let src = original.to_le_bytes();
+        let mut dest = [0u8; 8];
+
+        trunc_prec_forward(&src, &mut dest, 8, 20);
+
+        let out = f64::from_le_bytes(dest);
+        let out_bits = out.to_bits();
+        let orig_bits = original.to_bits();
+        // Sign and 11-bit exponent (top 12 bits) must be preserved.
+        assert_eq!(
+            out_bits & 0xFFF0_0000_0000_0000u64,
+            orig_bits & 0xFFF0_0000_0000_0000u64,
+            "trunc_prec must preserve sign+exponent for f64"
+        );
     }
 }

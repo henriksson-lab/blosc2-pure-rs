@@ -144,7 +144,12 @@ fn bench_codec_blocks(c: &mut Criterion) {
             let maxout = data.len() + BLOSC2_MAX_OVERHEAD;
             let mut compressed = vec![0; maxout];
             let csize = codecs::compress_block(compcode, 9, data, &mut compressed);
-            assert!(csize > 0, "{name} failed to prepare compressed block");
+            if csize <= 0 {
+                eprintln!(
+                    "skipping codec_blocks/{dataset}/{name}: codec did not compress benchmark input"
+                );
+                continue;
+            }
             compressed.truncate(csize as usize);
 
             group.bench_function(format!("{dataset}/{name}/compress"), |b| {
