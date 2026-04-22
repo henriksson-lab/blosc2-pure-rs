@@ -8,6 +8,31 @@ const MAX_DISTANCE: u32 = 8191;
 const MAX_FARDISTANCE: u32 = 65535 + MAX_DISTANCE - 1;
 const HASH_LOG: u8 = 14;
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const COPY_MATCH_16_SHIFTS: [u8; 17] = [0, 1, 2, 1, 4, 1, 4, 2, 8, 7, 6, 5, 4, 3, 2, 1, 16];
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const fn copy_match_16_masks() -> [[u8; 16]; 17] {
+    let mut masks = [[0u8; 16]; 17];
+    let mut offset = 1usize;
+    while offset <= 16 {
+        let mut i = 0usize;
+        while i < 16 {
+            masks[offset][i] = if offset == 16 {
+                i as u8
+            } else {
+                (i % offset) as u8
+            };
+            i += 1;
+        }
+        offset += 1;
+    }
+    masks
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const COPY_MATCH_16_MASKS: [[u8; 16]; 17] = copy_match_16_masks();
+
 #[inline]
 fn hash_function(seq: u32, hashlog: u8) -> u32 {
     if hashlog == 0 {
@@ -74,6 +99,58 @@ fn get_match(data: &[u8], ip: usize, ip_bound: usize, refp: usize) -> usize {
     get_match_generic(data, ip, ip_bound, refp)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn get_match_16_x86_64(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usize) -> usize {
+    use std::arch::x86_64::{__m128i, _mm_cmpeq_epi32, _mm_loadu_si128, _mm_movemask_epi8};
+
+    while ip + 16 <= ip_bound && refp + 16 <= data.len() {
+        let lhs = _mm_loadu_si128(data.as_ptr().add(ip) as *const __m128i);
+        let rhs = _mm_loadu_si128(data.as_ptr().add(refp) as *const __m128i);
+        let cmp = _mm_cmpeq_epi32(lhs, rhs);
+        if _mm_movemask_epi8(cmp) != 0xFFFF {
+            while ip < ip_bound && refp < data.len() && *data.get_unchecked(refp) == *data.get_unchecked(ip) {
+                ip += 1;
+                refp += 1;
+            }
+            return ip;
+        }
+        ip += 16;
+        refp += 16;
+    }
+    while ip < ip_bound && refp < data.len() && *data.get_unchecked(refp) == *data.get_unchecked(ip) {
+        ip += 1;
+        refp += 1;
+    }
+    ip
+}
+
+#[cfg(target_arch = "x86")]
+#[target_feature(enable = "sse2")]
+unsafe fn get_match_16_x86(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usize) -> usize {
+    use std::arch::x86::{__m128i, _mm_cmpeq_epi32, _mm_loadu_si128, _mm_movemask_epi8};
+
+    while ip + 16 <= ip_bound && refp + 16 <= data.len() {
+        let lhs = _mm_loadu_si128(data.as_ptr().add(ip) as *const __m128i);
+        let rhs = _mm_loadu_si128(data.as_ptr().add(refp) as *const __m128i);
+        let cmp = _mm_cmpeq_epi32(lhs, rhs);
+        if _mm_movemask_epi8(cmp) != 0xFFFF {
+            while ip < ip_bound && refp < data.len() && *data.get_unchecked(refp) == *data.get_unchecked(ip) {
+                ip += 1;
+                refp += 1;
+            }
+            return ip;
+        }
+        ip += 16;
+        refp += 16;
+    }
+    while ip < ip_bound && refp < data.len() && *data.get_unchecked(refp) == *data.get_unchecked(ip) {
+        ip += 1;
+        refp += 1;
+    }
+    ip
+}
+
 #[inline]
 fn get_match_generic(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usize) -> usize {
     while ip + 8 <= ip_bound && refp + 8 <= data.len() {
@@ -93,11 +170,232 @@ fn get_match_generic(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usiz
     ip
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn copy_match_repeat_16_x86_64(
+    base: *mut u8,
+    mut op: usize,
+    mut ref_pos: usize,
+    mut len: usize,
+) -> usize {
+    use std::arch::x86_64::{
+        __m128i, _mm_load_si128, _mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128,
+    };
+
+    let distance = op - ref_pos;
+    debug_assert!((1..=16).contains(&distance));
+    let shift = usize::from(COPY_MATCH_16_SHIFTS[distance]);
+    let mask = COPY_MATCH_16_MASKS[distance].as_ptr() as *const __m128i;
+
+    while len >= 16 {
+        let src = _mm_loadu_si128(base.add(ref_pos) as *const __m128i);
+        let block = _mm_shuffle_epi8(src, _mm_load_si128(mask));
+        _mm_storeu_si128(base.add(op) as *mut __m128i, block);
+        ref_pos += shift;
+        op += 16;
+        len -= 16;
+    }
+
+    for i in 0..len {
+        *base.add(op + i) = *base.add(ref_pos + i);
+    }
+    op + len
+}
+
+#[cfg(target_arch = "x86")]
+#[target_feature(enable = "ssse3")]
+unsafe fn copy_match_repeat_16_x86(
+    base: *mut u8,
+    mut op: usize,
+    mut ref_pos: usize,
+    mut len: usize,
+) -> usize {
+    use std::arch::x86::{
+        __m128i, _mm_load_si128, _mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128,
+    };
+
+    let distance = op - ref_pos;
+    debug_assert!((1..=16).contains(&distance));
+    let shift = usize::from(COPY_MATCH_16_SHIFTS[distance]);
+    let mask = COPY_MATCH_16_MASKS[distance].as_ptr() as *const __m128i;
+
+    while len >= 16 {
+        let src = _mm_loadu_si128(base.add(ref_pos) as *const __m128i);
+        let block = _mm_shuffle_epi8(src, _mm_load_si128(mask));
+        _mm_storeu_si128(base.add(op) as *mut __m128i, block);
+        ref_pos += shift;
+        op += 16;
+        len -= 16;
+    }
+
+    for i in 0..len {
+        *base.add(op + i) = *base.add(ref_pos + i);
+    }
+    op + len
+}
+
+#[inline(always)]
+unsafe fn copy_match_overlap_exact(
+    base: *mut u8,
+    mut op: usize,
+    mut ref_pos: usize,
+    mut len: usize,
+) -> usize {
+    let distance = op - ref_pos;
+
+    #[inline(always)]
+    unsafe fn copy2(base: *mut u8, op: usize, from: usize) -> usize {
+        let v = std::ptr::read_unaligned(base.add(from) as *const u16);
+        std::ptr::write_unaligned(base.add(op) as *mut u16, v);
+        op + 2
+    }
+
+    #[inline(always)]
+    unsafe fn copy4(base: *mut u8, op: usize, from: usize) -> usize {
+        let v = std::ptr::read_unaligned(base.add(from) as *const u32);
+        std::ptr::write_unaligned(base.add(op) as *mut u32, v);
+        op + 4
+    }
+
+    #[inline(always)]
+    unsafe fn copy8(base: *mut u8, op: usize, from: usize) -> usize {
+        let v = std::ptr::read_unaligned(base.add(from) as *const u64);
+        std::ptr::write_unaligned(base.add(op) as *mut u64, v);
+        op + 8
+    }
+
+    #[inline(always)]
+    unsafe fn copy16(base: *mut u8, op: usize, from: usize) -> usize {
+        let v = std::ptr::read_unaligned(base.add(from) as *const u128);
+        std::ptr::write_unaligned(base.add(op) as *mut u128, v);
+        op + 16
+    }
+
+    match distance {
+        32 => {
+            while len >= 32 {
+                op = copy16(base, op, ref_pos);
+                op = copy16(base, op, ref_pos + 16);
+                len -= 32;
+            }
+        }
+        30 => {
+            while len >= 30 {
+                op = copy16(base, op, ref_pos);
+                op = copy8(base, op, ref_pos + 16);
+                op = copy4(base, op, ref_pos + 24);
+                op = copy2(base, op, ref_pos + 28);
+                len -= 30;
+            }
+        }
+        28 => {
+            while len >= 28 {
+                op = copy16(base, op, ref_pos);
+                op = copy8(base, op, ref_pos + 16);
+                op = copy4(base, op, ref_pos + 24);
+                len -= 28;
+            }
+        }
+        26 => {
+            while len >= 26 {
+                op = copy16(base, op, ref_pos);
+                op = copy8(base, op, ref_pos + 16);
+                op = copy2(base, op, ref_pos + 24);
+                len -= 26;
+            }
+        }
+        24 => {
+            while len >= 24 {
+                op = copy16(base, op, ref_pos);
+                op = copy8(base, op, ref_pos + 16);
+                len -= 24;
+            }
+        }
+        22 => {
+            while len >= 22 {
+                op = copy16(base, op, ref_pos);
+                op = copy4(base, op, ref_pos + 16);
+                op = copy2(base, op, ref_pos + 20);
+                len -= 22;
+            }
+        }
+        20 => {
+            while len >= 20 {
+                op = copy16(base, op, ref_pos);
+                op = copy4(base, op, ref_pos + 16);
+                len -= 20;
+            }
+        }
+        18 => {
+            while len >= 18 {
+                op = copy16(base, op, ref_pos);
+                op = copy2(base, op, ref_pos + 16);
+                len -= 18;
+            }
+        }
+        16 => {
+            while len >= 16 {
+                op = copy16(base, op, ref_pos);
+                len -= 16;
+            }
+        }
+        d if d > 16 => {
+            while len >= 16 {
+                op = copy16(base, op, ref_pos);
+                ref_pos += 16;
+                len -= 16;
+            }
+        }
+        8 => {
+            while len >= 8 {
+                op = copy8(base, op, ref_pos);
+                len -= 8;
+            }
+        }
+        4 => {
+            while len >= 4 {
+                op = copy4(base, op, ref_pos);
+                len -= 4;
+            }
+        }
+        2 => {
+            while len >= 2 {
+                op = copy2(base, op, ref_pos);
+                len -= 2;
+            }
+        }
+        _ => {}
+    }
+
+    for i in 0..len {
+        *base.add(op + i) = *base.add(ref_pos + i);
+    }
+    op + len
+}
+
+#[inline(always)]
+unsafe fn wild_copy_8(base: *mut u8, mut op: usize, mut ref_pos: usize, end: usize) {
+    while op < end {
+        let v = std::ptr::read_unaligned(base.add(ref_pos) as *const u64);
+        std::ptr::write_unaligned(base.add(op) as *mut u64, v);
+        op += 8;
+        ref_pos += 8;
+    }
+}
+
 #[inline(always)]
 fn get_run_or_match(data: &[u8], ip: usize, ip_bound: usize, refp: usize, run: bool) -> usize {
     if run {
         get_run(data, ip, ip_bound, refp)
     } else {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("sse2") {
+            return unsafe { get_match_16_x86_64(data, ip, ip_bound, refp) };
+        }
+        #[cfg(target_arch = "x86")]
+        if std::arch::is_x86_feature_detected!("sse2") {
+            return unsafe { get_match_16_x86(data, ip, ip_bound, refp) };
+        }
         get_match(data, ip, ip_bound, refp)
     }
 }
@@ -300,19 +598,37 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
     output[op..op + 4].copy_from_slice(&input[..4]);
     op += 4;
 
+    let input_ptr = input.as_ptr();
+    let output_ptr = output.as_mut_ptr();
+
+    // Unchecked writes for output[op] = v, assuming a prior explicit
+    // `op + N > op_limit` check has proven op+N <= output.len().
+    // SAFETY: `output_ptr` points into the `output` slice; the caller must
+    // have checked the window before invoking.
+    macro_rules! write_u8 {
+        ($v:expr) => {{
+            unsafe { *output_ptr.add(op) = $v; }
+            op += 1;
+        }};
+    }
+
     macro_rules! emit_literal {
         ($anchor:expr) => {{
             if op + 2 > op_limit {
                 return 0;
             }
-            output[op] = input[$anchor];
+            // SAFETY: op < op_limit <= output.len() by the check above;
+            // $anchor <= ip_bound < length, so input read is in-bounds.
+            unsafe {
+                *output_ptr.add(op) = *input_ptr.add($anchor);
+            }
             op += 1;
             ip = $anchor + 1;
             copy += 1;
             if copy == MAX_COPY as u8 {
                 copy = 0;
-                output[op] = MAX_COPY as u8 - 1;
-                op += 1;
+                // op was just advanced, still < op_limit by the check above.
+                write_u8!(MAX_COPY as u8 - 1);
             }
         }};
     }
@@ -332,7 +648,7 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
             continue;
         }
 
-        if ref_offset + 4 > length || readu32(input, ref_offset) != readu32(input, ip) {
+        if ref_offset + 4 > length || readu32(input, ref_offset) != seq {
             emit_literal!(anchor);
             continue;
         }
@@ -355,7 +671,9 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
         }
 
         if copy > 0 {
-            output[op - copy as usize - 1] = copy - 1;
+            unsafe {
+                *output_ptr.add(op - copy as usize - 1) = copy - 1;
+            }
         } else {
             op -= 1;
         }
@@ -366,32 +684,26 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
                 if op + 2 > op_limit {
                     return 0;
                 }
-                output[op] = ((len << 5) + (distance >> 8)) as u8;
-                op += 1;
-                output[op] = (distance & 255) as u8;
-                op += 1;
+                write_u8!(((len << 5) + (distance >> 8)) as u8);
+                write_u8!((distance & 255) as u8);
             } else {
                 if op + 1 > op_limit {
                     return 0;
                 }
-                output[op] = ((7 << 5) + (distance >> 8)) as u8;
-                op += 1;
+                write_u8!(((7 << 5) + (distance >> 8)) as u8);
                 let mut remaining = len - 7;
                 while remaining >= 255 {
                     if op + 1 > op_limit {
                         return 0;
                     }
-                    output[op] = 255;
-                    op += 1;
+                    write_u8!(255);
                     remaining -= 255;
                 }
                 if op + 2 > op_limit {
                     return 0;
                 }
-                output[op] = remaining as u8;
-                op += 1;
-                output[op] = (distance & 255) as u8;
-                op += 1;
+                write_u8!(remaining as u8);
+                write_u8!((distance & 255) as u8);
             }
         } else {
             let distance = distance - MAX_DISTANCE as usize;
@@ -399,40 +711,30 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
                 if op + 4 > op_limit {
                     return 0;
                 }
-                output[op] = ((len << 5) + 31) as u8;
-                op += 1;
-                output[op] = 255;
-                op += 1;
-                output[op] = (distance >> 8) as u8;
-                op += 1;
-                output[op] = (distance & 255) as u8;
-                op += 1;
+                write_u8!(((len << 5) + 31) as u8);
+                write_u8!(255);
+                write_u8!((distance >> 8) as u8);
+                write_u8!((distance & 255) as u8);
             } else {
                 if op + 1 > op_limit {
                     return 0;
                 }
-                output[op] = (7 << 5) + 31;
-                op += 1;
+                write_u8!((7 << 5) + 31);
                 let mut remaining = len - 7;
                 while remaining >= 255 {
                     if op + 1 > op_limit {
                         return 0;
                     }
-                    output[op] = 255;
-                    op += 1;
+                    write_u8!(255);
                     remaining -= 255;
                 }
                 if op + 4 > op_limit {
                     return 0;
                 }
-                output[op] = remaining as u8;
-                op += 1;
-                output[op] = 255;
-                op += 1;
-                output[op] = (distance >> 8) as u8;
-                op += 1;
-                output[op] = (distance & 255) as u8;
-                op += 1;
+                write_u8!(remaining as u8);
+                write_u8!(255);
+                write_u8!((distance >> 8) as u8);
+                write_u8!((distance & 255) as u8);
             }
         }
 
@@ -457,8 +759,7 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
         if op + 1 > op_limit {
             return 0;
         }
-        output[op] = MAX_COPY as u8 - 1;
-        op += 1;
+        write_u8!(MAX_COPY as u8 - 1);
     }
 
     // Left-over as literal copy
@@ -493,8 +794,16 @@ pub fn decompress(input: &[u8], output: &mut [u8]) -> i32 {
     let ip_limit = length;
     let mut op: usize = 0;
     let op_limit = maxout;
+    let input_ptr = input.as_ptr();
 
-    let mut ctrl = (input[ip] & 31) as u32;
+    // SAFETY: all pointer reads below are guarded by explicit `ip + N >= ip_limit`
+    // bounds checks before the reads, matching the original safe-slice indexing.
+    // `input_ptr` points to `input.as_ptr()`, so `input_ptr.add(k)` is in-bounds
+    // whenever `k < ip_limit`.
+    let read = |ip: usize| -> u8 { unsafe { *input_ptr.add(ip) } };
+
+    // `length > 0` guarantees index 0 is in bounds.
+    let mut ctrl = (read(0) & 31) as u32;
     ip += 1;
 
     loop {
@@ -508,7 +817,7 @@ pub fn decompress(input: &[u8], output: &mut [u8]) -> i32 {
                     if ip + 1 >= ip_limit {
                         return 0;
                     }
-                    let code = input[ip];
+                    let code = read(ip);
                     ip += 1;
                     len += code as i32;
                     if code != 255 {
@@ -519,7 +828,7 @@ pub fn decompress(input: &[u8], output: &mut [u8]) -> i32 {
                 return 0;
             }
 
-            let code = input[ip];
+            let code = read(ip);
             ip += 1;
             len += 3;
             let mut ref_offset = op as i32 - ofs - code as i32;
@@ -529,9 +838,9 @@ pub fn decompress(input: &[u8], output: &mut [u8]) -> i32 {
                 if ip + 1 >= ip_limit {
                     return 0;
                 }
-                ofs = (input[ip] as i32) << 8;
+                ofs = (read(ip) as i32) << 8;
                 ip += 1;
-                ofs += input[ip] as i32;
+                ofs += read(ip) as i32;
                 ip += 1;
                 ref_offset = op as i32 - ofs - MAX_DISTANCE as i32;
             }
@@ -547,42 +856,126 @@ pub fn decompress(input: &[u8], output: &mut [u8]) -> i32 {
             if ip >= ip_limit {
                 break;
             }
-            ctrl = input[ip] as u32;
+            ctrl = read(ip) as u32;
             ip += 1;
 
             let ref_pos = ref_offset as usize;
+            let match_len = len as usize;
 
             if ref_pos == op - 1 {
                 // Run: fill with repeated byte
                 let val = output[ref_pos];
-                output[op..op + len as usize].fill(val);
-                op += len as usize;
-            } else {
-                // Copy match, handling overlap correctly.
-                // Each byte reads from ref_pos+i, which may overlap with output being written.
-                for i in 0..len as usize {
-                    output[op + i] = output[ref_pos + i];
+                output[op..op + match_len].fill(val);
+                op += match_len;
+            } else if op - ref_pos >= 8 && op + match_len + 8 <= op_limit {
+                // C uses a single 8-byte wild-copy loop for medium/large match
+                // distances. Keeping one inline path here is closer to that
+                // structure and avoids Rust-only branch stratification.
+                unsafe {
+                    wild_copy_8(output.as_mut_ptr(), op, ref_pos, op + match_len);
                 }
-                op += len as usize;
+                op += match_len;
+            } else {
+                // Small-overlap case (distance ∈ [2, 7]). Distances 2 and 4 are
+                // common in shuffled data and benefit from an explicit u64
+                // broadcast. Other distances fall back to byte-by-byte (LLVM may
+                // lower to memmove, which is still correct under LZ77 overlap).
+                let distance = op - ref_pos;
+                let has_16_slack = op + match_len + 16 <= op_limit;
+                let has_8_slack = op + match_len + 8 <= op_limit;
+                if has_8_slack && distance == 4 {
+                    // SAFETY: distance==4, seed is a u32 at ref_pos.
+                    unsafe {
+                        let base = output.as_mut_ptr();
+                        let seed =
+                            std::ptr::read_unaligned(base.add(ref_pos) as *const u32) as u64;
+                        let pat = seed | (seed << 32);
+                        let mut d = base.add(op);
+                        let end = base.add(op + match_len);
+                        while d < end {
+                            std::ptr::write_unaligned(d as *mut u64, pat);
+                            d = d.add(8);
+                        }
+                    }
+                    op += match_len;
+                } else if has_8_slack && distance == 2 {
+                    // SAFETY: distance==2, seed is a u16, broadcast to u64.
+                    unsafe {
+                        let base = output.as_mut_ptr();
+                        let seed =
+                            std::ptr::read_unaligned(base.add(ref_pos) as *const u16) as u64;
+                        let pat = seed.wrapping_mul(0x0001_0001_0001_0001);
+                        let mut d = base.add(op);
+                        let end = base.add(op + match_len);
+                        while d < end {
+                            std::ptr::write_unaligned(d as *mut u64, pat);
+                            d = d.add(8);
+                        }
+                    }
+                    op += match_len;
+                } else if has_16_slack && match_len >= 16 && distance <= 16 {
+                    #[cfg(target_arch = "x86_64")]
+                    if std::arch::is_x86_feature_detected!("ssse3") {
+                        unsafe {
+                            op = copy_match_repeat_16_x86_64(
+                                output.as_mut_ptr(),
+                                op,
+                                ref_pos,
+                                match_len,
+                            );
+                        }
+                        continue;
+                    }
+                    #[cfg(target_arch = "x86")]
+                    if std::arch::is_x86_feature_detected!("ssse3") {
+                        unsafe {
+                            op = copy_match_repeat_16_x86(
+                                output.as_mut_ptr(),
+                                op,
+                                ref_pos,
+                                match_len,
+                            );
+                        }
+                        continue;
+                    }
+                    unsafe {
+                        op = copy_match_overlap_exact(output.as_mut_ptr(), op, ref_pos, match_len);
+                    }
+                } else {
+                    // General case (distance ∈ {3,5,6,7} or not enough slack).
+                    // SAFETY: `ref_pos < op`, `op + match_len <= op_limit`.
+                    unsafe {
+                        op = copy_match_overlap_exact(output.as_mut_ptr(), op, ref_pos, match_len);
+                    }
+                }
             }
         } else {
             // Literal
             ctrl += 1;
-            if op + ctrl as usize > op_limit {
+            let run_len = ctrl as usize;
+            if op + run_len > op_limit {
                 return 0;
             }
-            if ip + ctrl as usize > ip_limit {
+            if ip + run_len > ip_limit {
                 return 0;
             }
 
-            output[op..op + ctrl as usize].copy_from_slice(&input[ip..ip + ctrl as usize]);
+            // Match C's literal path structure: copy exactly `run_len` bytes.
+            // The source and destination are disjoint (`input` vs `output`).
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    input_ptr.add(ip),
+                    output.as_mut_ptr().add(op),
+                    run_len,
+                );
+            }
             op += ctrl as usize;
             ip += ctrl as usize;
 
             if ip >= ip_limit {
                 break;
             }
-            ctrl = input[ip] as u32;
+            ctrl = read(ip) as u32;
             ip += 1;
         }
     }
@@ -719,8 +1112,8 @@ mod tests {
         let ref_pos = 0usize;
         let ip_pos = 32usize;
         for i in 0..4 {
-            data[ref_pos + i] = (0xA0 + i as u8) as u8;
-            data[ip_pos + i] = (0xA0 + i as u8) as u8;
+            data[ref_pos + i] = 0xA0 + i as u8;
+            data[ip_pos + i] = 0xA0 + i as u8;
         }
         // Byte 4 differs.
         data[ref_pos + 4] = 0xEE;
@@ -750,8 +1143,8 @@ mod tests {
         // the remainder-loop boundary.
         let mut data = vec![0u8; 64];
         for i in 0..16 {
-            data[i] = (0x20 + i as u8) as u8;
-            data[32 + i] = (0x20 + i as u8) as u8;
+            data[i] = 0x20 + i as u8;
+            data[32 + i] = 0x20 + i as u8;
         }
         // Byte 16 onwards differs so the remainder loop immediately stops.
         data[16] = 0x55;

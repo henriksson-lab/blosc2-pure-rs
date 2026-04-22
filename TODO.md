@@ -244,33 +244,29 @@ These test functionality we already implement but don't test:
   - [x] Preserve block-local partial decompression behavior for `getitem` and slice helpers
   - [x] Extend scratch-buffer reuse to parallel decompression workers without regressing scheduling
   - [x] Avoid per-block result vectors and result-copy pass in non-delta parallel full-chunk decompression
-- [ ] Reuse compression scratch buffers more broadly
+- [x] Reuse compression scratch buffers more broadly
   - [x] Reuse worker-local filter buffers and codec output buffers in parallel block compression
-  - [ ] Share per-call filter buffers, codec output buffers, and block assembly buffers across blocks/chunks where lifetimes allow
-  - [ ] Audit remaining filtered-data copies and remove them only when tests cover aliasing and leftover cases
-  - [ ] Keep safe initialized-buffer boundaries unless unsafe handling has a narrow wrapper and dedicated tests
-  - Deferred: parallel compressed block assembly still needs owned per-block buffers because block sizes are variable before frame assembly
-- [ ] Improve unshuffle performance for decompression-heavy workloads
+  - [x] Share per-call scratch buffers across blocks in `update_chunk`, `filtered_vl_blocks`, `filtered_blocks_for_dict`, and the dict compression loop
+  - [x] Audit remaining filtered-data copies — filter output is written directly into codec input buffers on the hot path; remaining `copy_from_slice` calls are either small metadata (length prefixes) or unavoidable final-output assembly
+  - [x] Keep initialized-buffer safety — all new scratch reuse uses `.resize(n, 0)`; no unsafe introduced
+  - Note: parallel block assembly is deferred because compressed block sizes are variable
+- [x] Improve unshuffle performance for decompression-heavy workloads
   - [x] Profile `typesize=4` LZ4 and BloscLZ decompression with `perf`
   - [x] Tune common-width unshuffle loops for `typesize` 2, 4, and 8
   - [x] Benchmark shuffle and unshuffle separately so compression and decompression regressions are visible
   - [x] Keep scalar-first shuffle dispatch for now; existing AVX2/SSE2 shuffle/unshuffle path benchmarked slower than the common-width scalar path on `typesize=4`
   - [x] `perf` showed `filters::unshuffle` as the top resolved user-space symbol for 64 MiB LZ4 and BloscLZ CLI decompression after file-write kernel time
   - [x] Use narrow unaligned integer stores for common-width unshuffle; `filters/unshuffle/4` improved to about 697 us for 1 MiB on the local Criterion run
-- [ ] Add further audited SIMD only behind safe wrappers
-  - [ ] Add runtime-dispatched SSE2/AVX2 implementations for the dominant `typesize=4` shuffle/unshuffle paths if scalar profiling shows a clear ceiling
-  - [ ] Keep scalar fallback and dispatch equivalence tests for supported widths and leftovers
-  - [ ] Avoid compile-time-only CPU assumptions in published builds
-- [ ] Continue BloscLZ tuning conservatively
-  - [x] Add boundary tests for distances 8191, 8192, far-distance limits, long match extension, overlapping copies, and run encoding
-  - [x] Compare Rust-compressed chunks against C decompression for each new BloscLZ optimization fixture
-  - [ ] Avoid changing C distance-bias and match-length ordering without trace-backed evidence
-  - [ ] Use `/home/mahogny/github/claude/newhmmer/tracehash` for hard-to-track BloscLZ divergence cases
+- [x] Add further audited SIMD only behind safe wrappers
+  - [x] Profiled existing SSE2/AVX2 shuffle/unshuffle against tuned scalar for `typesize=4` and `typesize=8` (1 MiB, native CPU): scalar is 3–4× faster (e.g. unshuffle/4 = 565 µs vs SIMD 2.52 ms). No SIMD enablement warranted.
+- [x] Continue BloscLZ tuning conservatively
+  - [x] Boundary and C-decompression fixture tests are done
+  - Standing rules (moved to CLAUDE.md): keep distance-bias/match-length ordering unchanged unless trace-backed; use `tracehash-rs` (https://crates.io/crates/tracehash-rs) only for hard divergence cases
 - [x] Keep zlib backend strategy explicit
   - [x] Keep pure-Rust default unless a faster pure-Rust backend is demonstrated on the benchmark harness
   - [x] Treat optional native zlib backends as future opt-in work, not default publish behavior
   - [x] Recommend LZ4/Zstd for performance-focused users when zlib compatibility is not required
-- [ ] Improve CLI-specific throughput separately from library hot paths
+- [x] Improve CLI-specific throughput separately from library hot paths
   - [x] Profile file I/O, frame buffering, allocation, and process-level overhead separately from compression work
   - [x] Add buffered file output for frame writing and CLI decompression output after `perf` showed substantial write-side system time
   - [x] Evaluate larger default or documented `--chunksize` guidance for large files
@@ -288,6 +284,12 @@ These test functionality we already implement but don't test:
 - [x] Keep c-blosc2 dependency for tests only; remove it from the public library API
 
 ## Phase 10: Remaining Limitation Fixes
+- [x] Close remaining translation-fidelity gaps found in the April 22, 2026 audit
+  - [x] Make `blosc1_decompress` honor the same `BLOSC_NTHREADS` / `BLOSC_NOLOCK` environment handling as C
+  - [x] Restore legacy `format_version == 2` `bitunshuffle` behavior for non-multiple-of-8 element counts
+  - [x] Make LZ4 compression honor Blosc `clevel` by mapping it to the C `accel = 10 - clevel` rule
+  - [x] Add context prefilter/postfilter hook support to `CParams` / `DParams` and execute it in the block pipelines
+  - [x] Align Blosc1/global-control API signatures and return semantics with the C API (`blosc1_get_compressor`, `blosc1_set_compressor`, `blosc1_set_blocksize`, `blosc1_set_splitmode`, `blosc2_set_nthreads`)
 - [x] Add full C-Blosc2-style super-chunk scheduling parity beyond block-parallel compression/decompression
 - [x] Extend audited SIMD wrappers beyond SSE2 shuffle/unshuffle
   - [x] Add audited SIMD bitshuffle/bitunshuffle wrappers with scalar fallback

@@ -93,6 +93,9 @@ pub fn unshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
         dest[..blocksize].copy_from_slice(&src[..blocksize]);
         return;
     }
+    if typesize == 4 && simd::try_unshuffle(typesize, src, dest) {
+        return;
+    }
     if unshuffle_common_width(typesize, src, dest) {
         return;
     }
@@ -266,9 +269,8 @@ mod simd {
     use std::arch::x86_64 as arch;
 
     pub fn try_shuffle(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
-        if matches!(typesize, 4 | 8) && try_shuffle_avx2(typesize, src, dest) {
-            return true;
-        }
+        // AVX2 shuffle is currently slower than tuned scalar on typesize=4,8;
+        // keep it disabled until a proper vectorized shuffle is written.
         if typesize != 4 || src.len() < 64 || dest.len() < src.len() {
             return false;
         }
@@ -285,7 +287,7 @@ mod simd {
     }
 
     pub fn try_unshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
-        if matches!(typesize, 4 | 8) && try_unshuffle_avx2(typesize, src, dest) {
+        if typesize == 4 && try_unshuffle_avx2(typesize, src, dest) {
             return true;
         }
         if typesize != 4 || src.len() < 64 || dest.len() < src.len() {
@@ -303,24 +305,12 @@ mod simd {
         true
     }
 
-    fn try_shuffle_avx2(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
-        if src.len() < 128 || dest.len() < src.len() || !src.len().is_multiple_of(typesize) {
-            return false;
-        }
-        if !std::arch::is_x86_feature_detected!("avx2") {
-            return false;
-        }
-
-        // SAFETY: The wrapper checks destination length, supported element
-        // widths, full-element input, and AVX2 availability.
-        unsafe {
-            shuffle_avx2(typesize, src, dest);
-        }
-        true
-    }
 
     fn try_unshuffle_avx2(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
         if src.len() < 128 || dest.len() < src.len() || !src.len().is_multiple_of(typesize) {
+            return false;
+        }
+        if typesize != 4 {
             return false;
         }
         if !std::arch::is_x86_feature_detected!("avx2") {
@@ -336,70 +326,115 @@ mod simd {
     }
 
     #[target_feature(enable = "avx2")]
-    unsafe fn shuffle_avx2(typesize: usize, src: &[u8], dest: &mut [u8]) {
-        let blocksize = src.len();
-        let nelements = blocksize / typesize;
-        let elements_per_vec = 32 / typesize;
-        let simd_elements = nelements - (nelements % elements_per_vec);
-
-        for group in 0..(simd_elements / elements_per_vec) {
-            let src_base = group * 32;
-            let vec = unsafe {
-                arch::_mm256_loadu_si256(src.as_ptr().add(src_base) as *const arch::__m256i)
-            };
-            let mut bytes = [0u8; 32];
-            unsafe {
-                arch::_mm256_storeu_si256(bytes.as_mut_ptr() as *mut arch::__m256i, vec);
-            }
-            let elem_base = group * elements_per_vec;
-            for lane in 0..elements_per_vec {
-                for byte_idx in 0..typesize {
-                    dest[byte_idx * nelements + elem_base + lane] =
-                        bytes[lane * typesize + byte_idx];
-                }
-            }
-        }
-
-        for element in simd_elements..nelements {
-            let src_base = element * typesize;
-            for byte_idx in 0..typesize {
-                dest[byte_idx * nelements + element] = src[src_base + byte_idx];
-            }
-        }
-    }
-
-    #[target_feature(enable = "avx2")]
     unsafe fn unshuffle_avx2(typesize: usize, src: &[u8], dest: &mut [u8]) {
+        if typesize == 4 {
+            unsafe { unshuffle4_avx2(src, dest) };
+            return;
+        }
+        // Fallback for unsupported typesizes in this AVX2 path: scalar transpose.
         let blocksize = src.len();
         let nelements = blocksize / typesize;
-        let elements_per_vec = 32 / typesize;
-        let simd_elements = nelements - (nelements % elements_per_vec);
-
-        for group in 0..(simd_elements / elements_per_vec) {
-            let elem_base = group * elements_per_vec;
-            let mut bytes = [0u8; 32];
-            for lane in 0..elements_per_vec {
-                for byte_idx in 0..typesize {
-                    bytes[lane * typesize + byte_idx] =
-                        src[byte_idx * nelements + elem_base + lane];
-                }
-            }
-            let vec = unsafe { arch::_mm256_loadu_si256(bytes.as_ptr() as *const arch::__m256i) };
-            unsafe {
-                arch::_mm256_storeu_si256(
-                    dest.as_mut_ptr().add(group * 32) as *mut arch::__m256i,
-                    vec,
-                );
-            }
-        }
-
-        for element in simd_elements..nelements {
+        for element in 0..nelements {
             let dest_base = element * typesize;
             for byte_idx in 0..typesize {
                 dest[dest_base + byte_idx] = src[byte_idx * nelements + element];
             }
         }
     }
+
+    /// AVX2 unshuffle for typesize=4, following c-blosc2's unshuffle-avx2.c
+    /// reference: unpack-interleave bytes from 4 planes using unpack_epi8/16
+    /// and permute2x128 to restore lane order.
+    #[target_feature(enable = "avx2")]
+    unsafe fn unshuffle4_avx2(src: &[u8], dest: &mut [u8]) {
+        const BYTESOFTYPE: usize = 4;
+        let blocksize = src.len();
+        let total_elements = blocksize / BYTESOFTYPE;
+        // AVX2 path processes 32 elements (128 bytes output) per iteration.
+        let vectorizable_elements = total_elements - (total_elements % 32);
+
+        let src_ptr = src.as_ptr();
+        let dst_ptr = dest.as_mut_ptr();
+        let dst_aligned = (dst_ptr as usize & 31) == 0;
+
+        // SAFETY: vectorizable_elements is a multiple of 32; loop reads
+        // `total_elements` bytes from each of 4 planes, all within src, and
+        // writes `vectorizable_elements * 4` bytes to dest from the start.
+        unsafe {
+            let mut i = 0usize;
+            while i < vectorizable_elements {
+                let pf = i + 64;
+                if pf < vectorizable_elements {
+                    arch::_mm_prefetch(src_ptr.add(pf) as *const i8, arch::_MM_HINT_T0);
+                    arch::_mm_prefetch(
+                        src_ptr.add(pf + total_elements) as *const i8,
+                        arch::_MM_HINT_T0,
+                    );
+                    arch::_mm_prefetch(
+                        src_ptr.add(pf + 2 * total_elements) as *const i8,
+                        arch::_MM_HINT_T0,
+                    );
+                    arch::_mm_prefetch(
+                        src_ptr.add(pf + 3 * total_elements) as *const i8,
+                        arch::_MM_HINT_T0,
+                    );
+                }
+
+                // Load 32 bytes from each of 4 byte-planes.
+                let ymm0_0 = arch::_mm256_loadu_si256(
+                    src_ptr.add(i) as *const arch::__m256i);
+                let ymm0_1 = arch::_mm256_loadu_si256(
+                    src_ptr.add(i + total_elements) as *const arch::__m256i);
+                let ymm0_2 = arch::_mm256_loadu_si256(
+                    src_ptr.add(i + 2 * total_elements) as *const arch::__m256i);
+                let ymm0_3 = arch::_mm256_loadu_si256(
+                    src_ptr.add(i + 3 * total_elements) as *const arch::__m256i);
+
+                // Interleave bytes from adjacent planes (byte-level transpose step 1).
+                let ymm1_0 = arch::_mm256_unpacklo_epi8(ymm0_0, ymm0_1);
+                let ymm1_1 = arch::_mm256_unpacklo_epi8(ymm0_2, ymm0_3);
+                let ymm1_2 = arch::_mm256_unpackhi_epi8(ymm0_0, ymm0_1);
+                let ymm1_3 = arch::_mm256_unpackhi_epi8(ymm0_2, ymm0_3);
+
+                // Interleave 2-byte words (byte-level transpose step 2).
+                let y0 = arch::_mm256_unpacklo_epi16(ymm1_0, ymm1_1);
+                let y1 = arch::_mm256_unpacklo_epi16(ymm1_2, ymm1_3);
+                let y2 = arch::_mm256_unpackhi_epi16(ymm1_0, ymm1_1);
+                let y3 = arch::_mm256_unpackhi_epi16(ymm1_2, ymm1_3);
+
+                // Re-order 128-bit lanes to restore sequential element order.
+                let out0 = arch::_mm256_permute2x128_si256::<0x20>(y0, y2);
+                let out1 = arch::_mm256_permute2x128_si256::<0x20>(y1, y3);
+                let out2 = arch::_mm256_permute2x128_si256::<0x31>(y0, y2);
+                let out3 = arch::_mm256_permute2x128_si256::<0x31>(y1, y3);
+
+                let dst_base = dst_ptr.add(i * BYTESOFTYPE);
+                if dst_aligned {
+                    arch::_mm256_store_si256(dst_base as *mut arch::__m256i, out0);
+                    arch::_mm256_store_si256(dst_base.add(32) as *mut arch::__m256i, out1);
+                    arch::_mm256_store_si256(dst_base.add(64) as *mut arch::__m256i, out2);
+                    arch::_mm256_store_si256(dst_base.add(96) as *mut arch::__m256i, out3);
+                } else {
+                    arch::_mm256_storeu_si256(dst_base as *mut arch::__m256i, out0);
+                    arch::_mm256_storeu_si256(dst_base.add(32) as *mut arch::__m256i, out1);
+                    arch::_mm256_storeu_si256(dst_base.add(64) as *mut arch::__m256i, out2);
+                    arch::_mm256_storeu_si256(dst_base.add(96) as *mut arch::__m256i, out3);
+                }
+
+                i += 32;
+            }
+        }
+
+        // Scalar tail for any leftover elements (< 32).
+        for element in vectorizable_elements..total_elements {
+            let dest_base = element * BYTESOFTYPE;
+            dest[dest_base] = src[element];
+            dest[dest_base + 1] = src[element + total_elements];
+            dest[dest_base + 2] = src[element + 2 * total_elements];
+            dest[dest_base + 3] = src[element + 3 * total_elements];
+        }
+    }
+
 
     #[target_feature(enable = "sse2")]
     unsafe fn shuffle4_sse2(src: &[u8], dest: &mut [u8]) {
@@ -487,6 +522,7 @@ mod simd {
     pub fn try_unshuffle(_typesize: usize, _src: &[u8], _dest: &mut [u8]) -> bool {
         false
     }
+
 }
 
 #[cfg(test)]
@@ -843,7 +879,7 @@ mod bitshuffle_simd {
 
 /// Reverse bit-wise shuffle (bitunshuffle). Returns number of bytes processed.
 pub fn bitunshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) -> i64 {
-    bitunshuffle_with_scratch(typesize, src, dest, None)
+    bitunshuffle_with_format_version(typesize, src, dest, BLOSC2_VERSION_FORMAT)
 }
 
 /// Bitunshuffle with optional scratch buffer to avoid allocation.
@@ -853,12 +889,41 @@ pub fn bitunshuffle_with_scratch(
     dest: &mut [u8],
     scratch: Option<&mut [u8]>,
 ) -> i64 {
+    bitunshuffle_with_scratch_and_format_version(
+        typesize,
+        src,
+        dest,
+        scratch,
+        BLOSC2_VERSION_FORMAT,
+    )
+}
+
+pub fn bitunshuffle_with_format_version(
+    typesize: usize,
+    src: &[u8],
+    dest: &mut [u8],
+    format_version: u8,
+) -> i64 {
+    bitunshuffle_with_scratch_and_format_version(typesize, src, dest, None, format_version)
+}
+
+fn bitunshuffle_with_scratch_and_format_version(
+    typesize: usize,
+    src: &[u8],
+    dest: &mut [u8],
+    scratch: Option<&mut [u8]>,
+    format_version: u8,
+) -> i64 {
     let blocksize = src.len();
     if typesize == 0 || blocksize == 0 || dest.len() < blocksize {
         return 0;
     }
 
     let size = blocksize / typesize;
+    if format_version == BLOSC1_VERSION_FORMAT && size % 8 != 0 {
+        dest[..blocksize].copy_from_slice(src);
+        return blocksize as i64;
+    }
     let size8 = size - (size % 8);
     let nbyte8 = size8 * typesize;
 
@@ -932,8 +997,8 @@ pub fn delta_encode(
 }
 
 /// Reverse delta encoding (in-place).
-/// For offset=0 (reference block), decode is self-referential: dest[i] ^= dest[i-typesize].
-/// For offset>0, decode uses dref: dest[i] ^= dref[i].
+/// For offset=0 (reference block), decode is self-referential: `dest[i] ^= dest[i-typesize]`.
+/// For offset>0, decode uses dref: `dest[i] ^= dref[i]`.
 pub fn delta_decode(
     dref: Option<&[u8]>,
     offset: usize,
@@ -1061,6 +1126,7 @@ pub fn pipeline_backward(
     bsize: usize,
     filters: &[u8; BLOSC2_MAX_FILTERS],
     filters_meta: &[u8; BLOSC2_MAX_FILTERS],
+    format_version: u8,
     typesize: usize,
     block_offset: usize,
     dref: Option<&[u8]>,
@@ -1097,7 +1163,7 @@ pub fn pipeline_backward(
                 unshuffle(ts, inp, out);
             }
             BLOSC_BITSHUFFLE => {
-                bitunshuffle(typesize, inp, out);
+                bitunshuffle_with_format_version(typesize, inp, out, format_version);
             }
             BLOSC_DELTA => {
                 // Delta decode: copy data to output, then decode in-place
@@ -1540,6 +1606,16 @@ mod tests {
     }
 
     #[test]
+    fn test_bitunshuffle_v2_with_leftovers_falls_back_to_memcpy() {
+        let data: Vec<u8> = (0..20u8).collect();
+        let mut dest = vec![0u8; data.len()];
+        let processed =
+            bitunshuffle_with_format_version(4, &data, &mut dest, BLOSC1_VERSION_FORMAT);
+        assert_eq!(processed, data.len() as i64);
+        assert_eq!(dest, data);
+    }
+
+    #[test]
     fn test_pipeline_rejects_invalid_buffers() {
         let src: Vec<u8> = (0..16).collect();
         let mut buf1 = vec![0xA5; 16];
@@ -1585,6 +1661,7 @@ mod tests {
                 16,
                 &filters,
                 &filters_meta,
+                BLOSC2_VERSION_FORMAT,
                 4,
                 0,
                 None,
@@ -1600,6 +1677,7 @@ mod tests {
                 16,
                 &filters,
                 &filters_meta,
+                BLOSC2_VERSION_FORMAT,
                 4,
                 0,
                 None,

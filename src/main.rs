@@ -96,9 +96,11 @@ fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::R
         filters_meta,
         use_dict: false,
         nthreads: options.nthreads,
+        ..Default::default()
     };
     let dparams = DParams {
         nthreads: options.nthreads,
+        ..Default::default()
     };
 
     let mut schunk = Schunk::new(cparams, dparams);

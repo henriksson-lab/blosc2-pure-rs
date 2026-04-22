@@ -61,7 +61,7 @@ pub fn compress_block_with_meta(
 ) -> i32 {
     match compcode {
         BLOSC_BLOSCLZ => blosclz::compress(clevel as i32, src, dest),
-        BLOSC_LZ4 => lz4_compress(src, dest),
+        BLOSC_LZ4 => lz4_compress(clevel, src, dest),
         BLOSC_LZ4HC => lz4hc_compress(clevel, src, dest),
         BLOSC_ZLIB => zlib_compress(src, dest, clevel),
         BLOSC_ZSTD => zstd_compress(src, dest, clevel),
@@ -113,56 +113,32 @@ pub fn decompress_block_with_dict(compcode: u8, src: &[u8], dest: &mut [u8], dic
     }
 }
 
-fn lz4_compress(src: &[u8], dest: &mut [u8]) -> i32 {
-    // compress_into requires dest.len() >= get_maximum_output_size(src.len())
-    // If dest is big enough, compress directly. Otherwise fall back to allocating.
-    let max_out = lz4_flex::block::get_maximum_output_size(src.len());
-    if dest.len() >= max_out {
-        match lz4_flex::block::compress_into(src, dest) {
-            Ok(n) => n as i32,
-            Err(_) => 0,
-        }
-    } else {
-        let compressed = lz4_flex::block::compress(src);
-        if compressed.len() > dest.len() {
-            return 0;
-        }
-        dest[..compressed.len()].copy_from_slice(&compressed);
-        compressed.len() as i32
+fn lz4_compress(clevel: u8, src: &[u8], dest: &mut [u8]) -> i32 {
+    use lz4_pure::block::CompressionMode;
+
+    let accel = (10 - i32::from(clevel.clamp(0, 9))).max(1);
+    match lz4_pure::block::compress_to_buffer(src, Some(CompressionMode::FAST(accel)), false, dest)
+    {
+        Ok(n) => n as i32,
+        Err(_) => 0,
     }
 }
 
-#[cfg(feature = "lz4hc-sys")]
 fn lz4hc_compress(clevel: u8, src: &[u8], dest: &mut [u8]) -> i32 {
-    let Ok(src_len) = i32::try_from(src.len()) else {
-        return 0;
-    };
-    let Ok(dst_cap) = i32::try_from(dest.len()) else {
-        return 0;
-    };
-
-    // SAFETY: lz4-sys only reads `src_len` bytes from `src` and writes at most
-    // `dst_cap` bytes to `dest`. Both lengths were checked to fit C `int`.
-    let written = unsafe {
-        lz4_sys::LZ4_compress_HC(
-            src.as_ptr().cast(),
-            dest.as_mut_ptr().cast(),
-            src_len,
-            dst_cap,
-            i32::from(clevel),
-        )
-    };
-
-    written.max(0)
-}
-
-#[cfg(not(feature = "lz4hc-sys"))]
-fn lz4hc_compress(_clevel: u8, _src: &[u8], _dest: &mut [u8]) -> i32 {
-    0
+    use lz4_pure::block::CompressionMode;
+    match lz4_pure::block::compress_to_buffer(
+        src,
+        Some(CompressionMode::HIGHCOMPRESSION(i32::from(clevel))),
+        false,
+        dest,
+    ) {
+        Ok(n) => n as i32,
+        Err(_) => 0,
+    }
 }
 
 fn lz4_decompress(src: &[u8], dest: &mut [u8]) -> i32 {
-    match lz4_flex::block::decompress_into(src, dest) {
+    match lz4_pure::block::decompress_to_buffer(src, Some(dest.len() as i32), dest) {
         Ok(n) => n as i32,
         Err(_) => -1,
     }
@@ -298,7 +274,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "lz4hc-sys")]
     fn lz4hc_roundtrips_via_lz4_decoder() {
         let data: Vec<u8> = (0..8192u32).flat_map(|i| (i % 64).to_le_bytes()).collect();
         let mut compressed = vec![0; data.len() + 1024];
@@ -315,16 +290,5 @@ mod tests {
 
         assert_eq!(dsize as usize, data.len());
         assert_eq!(decompressed, data);
-    }
-
-    #[test]
-    #[cfg(not(feature = "lz4hc-sys"))]
-    fn lz4hc_compression_is_unavailable_without_sys_feature() {
-        let data = b"lz4hc requires the optional lz4hc-sys feature";
-        let mut compressed = vec![0; data.len() + 1024];
-
-        let csize = compress_block(BLOSC_LZ4HC, 9, data, &mut compressed);
-
-        assert_eq!(csize, 0);
     }
 }

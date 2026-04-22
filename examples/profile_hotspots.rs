@@ -40,7 +40,24 @@ fn cparams(compcode: u8, typesize: i32) -> CParams {
         filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
         filters_meta: [0; BLOSC2_MAX_FILTERS],
         use_dict: false,
-        nthreads: 1,
+        nthreads: 4,
+        ..Default::default()
+    }
+}
+
+fn cparams_nofilter(compcode: u8, typesize: i32) -> CParams {
+    CParams {
+        compcode,
+        compcode_meta: 0,
+        clevel: 9,
+        typesize,
+        blocksize: 0,
+        splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
+        filters: [0; BLOSC2_MAX_FILTERS],
+        filters_meta: [0; BLOSC2_MAX_FILTERS],
+        use_dict: false,
+        nthreads: 4,
+        ..Default::default()
     }
 }
 
@@ -58,7 +75,8 @@ fn run_decompress(label: &str, data: &[u8], params: &CParams, iterations: usize)
     let compressed = compress::compress(data, params).unwrap();
     let mut total = 0usize;
     for _ in 0..iterations {
-        let decompressed = compress::decompress(black_box(&compressed)).unwrap();
+        let decompressed =
+            compress::decompress_with_threads(black_box(&compressed), params.nthreads).unwrap();
         total = total.wrapping_add(decompressed.len());
         black_box(&decompressed);
     }
@@ -74,6 +92,7 @@ fn print_usage(program: &str) {
     eprintln!("  random-blosclz-t1-compress");
     eprintln!("  random-lz4-t4-compress");
     eprintln!("  blosclz-t4-signal-decompress");
+    eprintln!("  blosclz-t4-signal-nofilter-decompress");
     eprintln!("  lz4-t4-signal-decompress");
 }
 
@@ -126,6 +145,12 @@ fn main() {
             &case,
             &signal_f32_bytes(DATA_SIZE),
             &cparams(BLOSC_BLOSCLZ, 4),
+            iterations,
+        ),
+        "blosclz-t4-signal-nofilter-decompress" => run_decompress(
+            &case,
+            &signal_f32_bytes(DATA_SIZE),
+            &cparams_nofilter(BLOSC_BLOSCLZ, 4),
             iterations,
         ),
         "lz4-t4-signal-decompress" => run_decompress(

@@ -12,6 +12,24 @@ pub struct Metalayer {
     pub content: Vec<u8>,
 }
 
+/// Borrowed view of a compressed chunk stored inside a [`Schunk`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompressedChunkView<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> CompressedChunkView<'a> {
+    /// Return the raw compressed chunk bytes.
+    pub fn as_slice(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Return `(nbytes, cbytes, blocksize)` from the chunk header.
+    pub fn sizes(&self) -> Result<(usize, usize, usize), &'static str> {
+        compress::cbuffer_sizes(self.bytes)
+    }
+}
+
 /// A super-chunk: a collection of compressed chunks with shared compression parameters.
 #[derive(Clone)]
 pub struct Schunk {
@@ -82,7 +100,7 @@ impl LazySchunk {
     /// Decompress a chunk by index, reading only that compressed chunk from the frame file.
     pub fn decompress_chunk(&self, nchunk: i64) -> Result<Vec<u8>, String> {
         let chunk = self.read_chunk_bytes(nchunk)?;
-        compress::decompress_with_threads(&chunk, self.dparams.nthreads).map_err(str::to_string)
+        compress::decompress_with_dparams(&chunk, &self.dparams).map_err(str::to_string)
     }
 
     /// Return decompressed bytes spanning the whole super-chunk.
@@ -315,7 +333,46 @@ impl Schunk {
         if idx >= self.chunks.len() {
             return Err("Chunk index out of range");
         }
-        compress::decompress_with_threads(&self.chunks[idx], self.dparams.nthreads)
+        compress::decompress_with_dparams(&self.chunks[idx], &self.dparams)
+    }
+
+    /// Borrow the raw compressed bytes for a chunk by index.
+    pub fn compressed_chunk(&self, nchunk: i64) -> Result<&[u8], &'static str> {
+        if nchunk < 0 {
+            return Err("Chunk index out of range");
+        }
+        let idx = nchunk as usize;
+        self.chunks
+            .get(idx)
+            .map(Vec::as_slice)
+            .ok_or("Chunk index out of range")
+    }
+
+    /// Borrow a view over the raw compressed bytes for a chunk by index.
+    pub fn compressed_chunk_view(
+        &self,
+        nchunk: i64,
+    ) -> Result<CompressedChunkView<'_>, &'static str> {
+        Ok(CompressedChunkView {
+            bytes: self.compressed_chunk(nchunk)?,
+        })
+    }
+
+    /// Decompress a chunk by index into a caller-provided destination buffer.
+    /// Returns the number of bytes written.
+    pub fn decompress_chunk_into(
+        &self,
+        nchunk: i64,
+        dest: &mut [u8],
+    ) -> Result<usize, &'static str> {
+        if nchunk < 0 {
+            return Err("Chunk index out of range");
+        }
+        let idx = nchunk as usize;
+        if idx >= self.chunks.len() {
+            return Err("Chunk index out of range");
+        }
+        compress::decompress_into_with_dparams(&self.chunks[idx], dest, &self.dparams)
     }
 
     /// Compress and insert a data buffer before `nchunk`.
@@ -484,7 +541,7 @@ impl Schunk {
             let chunks: Vec<Vec<u8>> = compress::with_thread_pool(self.dparams.nthreads, || {
                 self.chunks
                     .par_iter()
-                    .map(|chunk| compress::decompress_with_threads(chunk, 1))
+                    .map(|chunk| compress::decompress_with_dparams(chunk, &DParams::default()))
                     .collect::<Result<Vec<_>, _>>()
             })?;
             let mut out = Vec::with_capacity(capacity);
@@ -2281,9 +2338,11 @@ pub mod frame {
                 compcode_meta,
                 use_dict,
                 nthreads: nthreads_comp,
+                ..Default::default()
             },
             dparams: DParams {
                 nthreads: nthreads_decomp,
+                ..Default::default()
             },
             chunksize,
             nbytes,
@@ -2583,10 +2642,12 @@ pub mod frame {
             compcode_meta,
             use_dict,
             nthreads: nthreads_comp,
+            ..Default::default()
         };
 
         let dparams = DParams {
             nthreads: nthreads_decomp,
+            ..Default::default()
         };
 
         Ok(Schunk {
@@ -2648,7 +2709,10 @@ mod tests {
             filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
             ..Default::default()
         };
-        let dparams = DParams { nthreads: 4 };
+        let dparams = DParams {
+            nthreads: 4,
+            ..Default::default()
+        };
         let chunks: Vec<Vec<u8>> = (0..8)
             .map(|chunk| {
                 (0..4096u32)
@@ -2968,6 +3032,30 @@ mod tests {
     }
 
     #[test]
+    fn test_compressed_chunk_accessors_borrow_raw_chunk_bytes() {
+        let data: Vec<u8> = (0..4096u32).flat_map(|i| i.to_le_bytes()).collect();
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 4,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            ..Default::default()
+        };
+        let mut schunk = Schunk::new(cparams, DParams::default());
+        schunk.append_buffer(&data).unwrap();
+
+        let raw = schunk.compressed_chunk(0).unwrap();
+        assert_eq!(raw, schunk.chunks[0].as_slice());
+
+        let view = schunk.compressed_chunk_view(0).unwrap();
+        assert_eq!(view.as_slice(), raw);
+        let (nbytes, cbytes, blocksize) = view.sizes().unwrap();
+        assert_eq!(nbytes, data.len());
+        assert_eq!(cbytes, raw.len());
+        assert!(blocksize > 0);
+    }
+
+    #[test]
     fn test_schunk_append_rejects_overflowed_totals() {
         let cparams = CParams {
             compcode: BLOSC_LZ4,
@@ -3022,19 +3110,7 @@ mod tests {
 
     #[test]
     fn test_schunk_frame_roundtrip_matrix() {
-        let codecs = {
-            let codecs = vec![BLOSC_BLOSCLZ, BLOSC_LZ4, BLOSC_ZLIB, BLOSC_ZSTD];
-            #[cfg(feature = "lz4hc-sys")]
-            {
-                let mut codecs = codecs;
-                codecs.insert(2, BLOSC_LZ4HC);
-                codecs
-            }
-            #[cfg(not(feature = "lz4hc-sys"))]
-            {
-                codecs
-            }
-        };
+        let codecs = vec![BLOSC_BLOSCLZ, BLOSC_LZ4, BLOSC_LZ4HC, BLOSC_ZLIB, BLOSC_ZSTD];
 
         for compcode in codecs {
             let cparams = CParams {
