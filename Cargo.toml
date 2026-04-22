@@ -48,7 +48,7 @@ _ffi = ["dep:cmake", "dep:bindgen"]
 blosc2 = { package = "blosc2-rs", version = "0.4.0", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 rayon = "1"
-lz4-pure = { package = "lz4-pure-rs", version = "0.1.0", path = "/data/henriksson/github/claude/lz4-pure-rs" }
+lz4-pure = { package = "lz4-pure-rs", version = "0.1.0" }
 flate2 = { version = "1", default-features = false }
 zstd = "0.13"
 
