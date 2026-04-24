@@ -1,6 +1,7 @@
 pub mod blosclz;
 
 use crate::constants::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
@@ -14,6 +15,11 @@ struct UserCodec {
 }
 
 static USER_CODECS: OnceLock<RwLock<HashMap<u8, UserCodec>>> = OnceLock::new();
+
+thread_local! {
+    static ZSTD_DECOMPRESSOR: RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { RefCell::new(None) };
+}
 
 fn user_codecs() -> &'static RwLock<HashMap<u8, UserCodec>> {
     USER_CODECS.get_or_init(|| RwLock::new(HashMap::new()))
@@ -44,6 +50,10 @@ pub fn is_registered_codec(compcode: u8) -> bool {
     user_codecs()
         .read()
         .is_ok_and(|codecs| codecs.contains_key(&compcode))
+}
+
+pub fn codec_supports_dict(compcode: u8) -> bool {
+    matches!(compcode, BLOSC_LZ4 | BLOSC_LZ4HC | BLOSC_ZSTD)
 }
 
 /// Compress a block using the specified codec.
@@ -81,6 +91,8 @@ pub fn compress_block_with_dict(
     dict: &[u8],
 ) -> i32 {
     match compcode {
+        BLOSC_LZ4 => lz4_compress_with_dict(clevel, src, dest, dict),
+        BLOSC_LZ4HC => lz4hc_compress_with_dict(clevel, src, dest, dict),
         BLOSC_ZSTD => zstd_compress_with_dict(src, dest, clevel, dict),
         _ => compress_block(compcode, clevel, src, dest),
     }
@@ -108,6 +120,7 @@ pub fn decompress_block_with_meta(compcode: u8, meta: u8, src: &[u8], dest: &mut
 
 pub fn decompress_block_with_dict(compcode: u8, src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
     match compcode {
+        BLOSC_LZ4 | BLOSC_LZ4HC => lz4_decompress_with_dict(src, dest, dict),
         BLOSC_ZSTD => zstd_decompress_with_dict(src, dest, dict),
         _ => decompress_block(compcode, src, dest),
     }
@@ -141,6 +154,105 @@ fn lz4_decompress(src: &[u8], dest: &mut [u8]) -> i32 {
     match lz4_pure::block::decompress_to_buffer(src, Some(dest.len() as i32), dest) {
         Ok(n) => n as i32,
         Err(_) => -1,
+    }
+}
+
+fn len_as_c_int(len: usize) -> Option<lz4_pure::sys::c_int> {
+    lz4_pure::sys::c_int::try_from(len).ok()
+}
+
+fn lz4_compress_with_dict(clevel: u8, src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
+    use lz4_pure::sys::{
+        c_char, LZ4_compress_fast_continue, LZ4_createStream, LZ4_freeStream, LZ4_loadDict,
+    };
+
+    let Some(src_len) = len_as_c_int(src.len()) else {
+        return 0;
+    };
+    let Some(dest_len) = len_as_c_int(dest.len()) else {
+        return 0;
+    };
+    let Some(dict_len) = len_as_c_int(dict.len()) else {
+        return 0;
+    };
+    let accel = (10 - i32::from(clevel.clamp(0, 9))).max(1);
+
+    unsafe {
+        let stream = LZ4_createStream();
+        if stream.is_null() {
+            return 0;
+        }
+        LZ4_loadDict(stream, dict.as_ptr() as *const c_char, dict_len);
+        let written = LZ4_compress_fast_continue(
+            stream,
+            src.as_ptr() as *const c_char,
+            dest.as_mut_ptr() as *mut c_char,
+            src_len,
+            dest_len,
+            accel,
+        );
+        LZ4_freeStream(stream);
+        written
+    }
+}
+
+fn lz4hc_compress_with_dict(clevel: u8, src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
+    use lz4_pure::sys::{
+        c_char, LZ4_compress_HC_continue, LZ4_createStreamHC, LZ4_freeStreamHC, LZ4_loadDictHC,
+        LZ4_resetStreamHC_fast,
+    };
+
+    let Some(src_len) = len_as_c_int(src.len()) else {
+        return 0;
+    };
+    let Some(dest_len) = len_as_c_int(dest.len()) else {
+        return 0;
+    };
+    let Some(dict_len) = len_as_c_int(dict.len()) else {
+        return 0;
+    };
+
+    unsafe {
+        let stream = LZ4_createStreamHC();
+        if stream.is_null() {
+            return 0;
+        }
+        LZ4_resetStreamHC_fast(stream, i32::from(clevel));
+        LZ4_loadDictHC(stream, dict.as_ptr() as *const c_char, dict_len);
+        let written = LZ4_compress_HC_continue(
+            stream,
+            src.as_ptr() as *const c_char,
+            dest.as_mut_ptr() as *mut c_char,
+            src_len,
+            dest_len,
+        );
+        LZ4_freeStreamHC(stream);
+        written
+    }
+}
+
+fn lz4_decompress_with_dict(src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
+    use lz4_pure::sys::{c_char, LZ4_decompress_safe_usingDict};
+
+    let Some(src_len) = len_as_c_int(src.len()) else {
+        return -1;
+    };
+    let Some(dest_len) = len_as_c_int(dest.len()) else {
+        return -1;
+    };
+    let Some(dict_len) = len_as_c_int(dict.len()) else {
+        return -1;
+    };
+
+    unsafe {
+        LZ4_decompress_safe_usingDict(
+            src.as_ptr() as *const c_char,
+            dest.as_mut_ptr() as *mut c_char,
+            src_len,
+            dest_len,
+            dict.as_ptr() as *const c_char,
+            dict_len,
+        )
     }
 }
 
@@ -208,11 +320,19 @@ fn zstd_compress_with_dict(src: &[u8], dest: &mut [u8], clevel: u8, dict: &[u8])
 }
 
 fn zstd_decompress(src: &[u8], dest: &mut [u8]) -> i32 {
-    // Use decompress_to_buffer to write directly into dest
-    match zstd::bulk::decompress_to_buffer(src, dest) {
-        Ok(n) => n as i32,
-        Err(_) => -1,
-    }
+    ZSTD_DECOMPRESSOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = zstd::bulk::Decompressor::new().ok();
+        }
+        match slot
+            .as_mut()
+            .and_then(|decompressor| decompressor.decompress_to_buffer(src, dest).ok())
+        {
+            Some(n) => n as i32,
+            None => -1,
+        }
+    })
 }
 
 fn zstd_decompress_with_dict(src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
@@ -288,6 +408,38 @@ mod tests {
             &mut decompressed,
         );
 
+        assert_eq!(dsize as usize, data.len());
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn lz4_dictionary_paths_roundtrip() {
+        let dict = b"abcdefghijklmnop0123456789abcdefghijklmnop0123456789";
+        let data = b"abcdefghijklmnopabcdefghZZZZabcdefghijklmnop";
+        let mut compressed = vec![0; 256];
+        let mut decompressed = vec![0; data.len()];
+
+        let csize = lz4_compress_with_dict(5, data, &mut compressed, dict);
+        assert!(csize > 0);
+
+        let dsize =
+            lz4_decompress_with_dict(&compressed[..csize as usize], &mut decompressed, dict);
+        assert_eq!(dsize as usize, data.len());
+        assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn lz4hc_dictionary_paths_roundtrip() {
+        let dict = b"abcdefghijklmnop0123456789abcdefghijklmnop0123456789";
+        let data = b"abcdefghijklmnopabcdefghZZZZabcdefghijklmnop";
+        let mut compressed = vec![0; 256];
+        let mut decompressed = vec![0; data.len()];
+
+        let csize = lz4hc_compress_with_dict(9, data, &mut compressed, dict);
+        assert!(csize > 0);
+
+        let dsize =
+            lz4_decompress_with_dict(&compressed[..csize as usize], &mut decompressed, dict);
         assert_eq!(dsize as usize, data.len());
         assert_eq!(decompressed, data);
     }

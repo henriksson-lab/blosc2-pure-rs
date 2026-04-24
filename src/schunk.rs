@@ -1,3 +1,4 @@
+use crate::codecs;
 use crate::compress::{self, CParams, DParams};
 use crate::constants::*;
 use crate::header::ChunkHeader;
@@ -1473,8 +1474,11 @@ pub mod frame {
         if ch.use_dict() != spec.use_dict {
             return Err("Invalid frame: chunk dictionary flag does not match frame".into());
         }
-        if ch.use_dict() && ch.compcode() != BLOSC_ZSTD {
-            return Err("Invalid frame: dictionary compression is only supported for Zstd".into());
+        if ch.use_dict() && !codecs::codec_supports_dict(ch.compcode()) {
+            return Err(
+                "Invalid frame: dictionary compression is only supported for Zstd, LZ4, and LZ4HC"
+                    .into(),
+            );
         }
         if !matches!(
             ch.compcode(),
@@ -2232,8 +2236,11 @@ pub mod frame {
         filters.copy_from_slice(&header[71..71 + BLOSC2_MAX_FILTERS]);
         filters_meta.copy_from_slice(&header[79..79 + BLOSC2_MAX_FILTERS]);
         let use_dict = header[FRAME_OTHER_FLAGS2] & 0x01 != 0;
-        if use_dict && compcode != BLOSC_ZSTD {
-            return Err("Invalid frame: dictionary compression is only supported for Zstd".into());
+        if use_dict && !codecs::codec_supports_dict(compcode) {
+            return Err(
+                "Invalid frame: dictionary compression is only supported for Zstd, LZ4, and LZ4HC"
+                    .into(),
+            );
         }
         for &filter in &filters {
             if !matches!(
@@ -2524,8 +2531,11 @@ pub mod frame {
         filters.copy_from_slice(&data[71..71 + BLOSC2_MAX_FILTERS]);
         filters_meta.copy_from_slice(&data[79..79 + BLOSC2_MAX_FILTERS]);
         let use_dict = data[FRAME_OTHER_FLAGS2] & 0x01 != 0;
-        if use_dict && compcode != BLOSC_ZSTD {
-            return Err("Invalid frame: dictionary compression is only supported for Zstd".into());
+        if use_dict && !codecs::codec_supports_dict(compcode) {
+            return Err(
+                "Invalid frame: dictionary compression is only supported for Zstd, LZ4, and LZ4HC"
+                    .into(),
+            );
         }
         for &filter in &filters {
             if !matches!(
@@ -3005,6 +3015,32 @@ mod tests {
     }
 
     #[test]
+    fn test_lz4_dictionary_frame_roundtrip_preserves_flag() {
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 4,
+            blocksize: 4096,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            use_dict: true,
+            ..Default::default()
+        };
+        let mut schunk = Schunk::new(cparams, DParams::default());
+        let data: Vec<u8> = (0..200_000u32)
+            .flat_map(|i| (i % 4096).to_le_bytes())
+            .collect();
+
+        schunk.append_buffer(&data).unwrap();
+        let frame = schunk.to_frame();
+        assert_eq!(frame[85] & 0x01, 0x01);
+
+        let restored = Schunk::from_frame(&frame).unwrap();
+        assert!(restored.cparams.use_dict);
+        assert_eq!(restored.decompress_chunk(0).unwrap(), data);
+    }
+
+    #[test]
     fn test_fixed_chunks_keep_fixed_frame_flag() {
         let cparams = CParams {
             compcode: BLOSC_LZ4,
@@ -3110,7 +3146,13 @@ mod tests {
 
     #[test]
     fn test_schunk_frame_roundtrip_matrix() {
-        let codecs = vec![BLOSC_BLOSCLZ, BLOSC_LZ4, BLOSC_LZ4HC, BLOSC_ZLIB, BLOSC_ZSTD];
+        let codecs = vec![
+            BLOSC_BLOSCLZ,
+            BLOSC_LZ4,
+            BLOSC_LZ4HC,
+            BLOSC_ZLIB,
+            BLOSC_ZSTD,
+        ];
 
         for compcode in codecs {
             let cparams = CParams {

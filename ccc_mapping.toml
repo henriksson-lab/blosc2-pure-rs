@@ -1,0 +1,20 @@
+[[entries]]
+rust = "append_buffer"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_append_buffer"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "copy_schunk"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_copy"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "save"
+rust_path = "src/b2nd.rs"
+rust_class = "B2ndArray"
+other = "b2nd_save"
+other_path = "c-blosc2/blosc/b2nd.c"

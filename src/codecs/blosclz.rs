@@ -33,29 +33,27 @@ const fn copy_match_16_masks() -> [[u8; 16]; 17] {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const COPY_MATCH_16_MASKS: [[u8; 16]; 17] = copy_match_16_masks();
 
-#[inline]
-fn hash_function(seq: u32, hashlog: u8) -> u32 {
-    if hashlog == 0 {
-        return 0;
-    }
-    (seq.wrapping_mul(2654435761)) >> (32 - hashlog as u32)
+#[inline(always)]
+fn hash_function_shift_nonzero(seq: u32, hash_shift: u32) -> u32 {
+    debug_assert!(hash_shift < 32);
+    seq.wrapping_mul(2654435761) >> hash_shift
 }
 
 #[inline(always)]
-fn readu32(p: &[u8], pos: usize) -> u32 {
-    debug_assert!(pos + 4 <= p.len());
-    // SAFETY: All callers check the 4-byte window before calling. Unaligned
-    // loads match BloscLZ's byte-oriented format and avoid per-byte assembly in
-    // the compression hot path.
-    unsafe { std::ptr::read_unaligned(p.as_ptr().add(pos).cast::<u32>()) }
+unsafe fn readu32_ptr(base: *const u8, pos: usize) -> u32 {
+    std::ptr::read_unaligned(base.add(pos).cast::<u32>())
 }
 
 #[inline(always)]
-fn readu64(p: &[u8], pos: usize) -> u64 {
-    debug_assert!(pos + 8 <= p.len());
-    // SAFETY: All callers check the 8-byte window before calling. Unaligned
-    // loads are intentional for fast match scanning over arbitrary byte slices.
-    unsafe { std::ptr::read_unaligned(p.as_ptr().add(pos).cast::<u64>()) }
+unsafe fn htab_get(htab: &[u32], idx: usize) -> u32 {
+    debug_assert!(idx < htab.len());
+    *htab.get_unchecked(idx)
+}
+
+#[inline(always)]
+unsafe fn htab_set(htab: &mut [u32], idx: usize, value: u32) {
+    debug_assert!(idx < htab.len());
+    *htab.get_unchecked_mut(idx) = value;
 }
 
 #[inline(always)]
@@ -75,9 +73,10 @@ fn get_run(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usize) -> usiz
     debug_assert!(ip > 0 && ip <= data.len());
     let x = data[ip - 1];
     let x8 = u64::from_ne_bytes([x; 8]);
+    let base = data.as_ptr();
 
     while ip + 8 <= ip_bound && refp + 8 <= data.len() {
-        let ref_word = readu64(data, refp);
+        let ref_word = unsafe { std::ptr::read_unaligned(base.add(refp).cast::<u64>()) };
         if ref_word != x8 {
             let matched = matching_prefix_len(ref_word, x8);
             return (ip + matched).min(ip_bound);
@@ -86,9 +85,12 @@ fn get_run(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usize) -> usiz
         refp += 8;
     }
 
-    while ip < ip_bound && refp < data.len() && data[refp] == x {
-        ip += 1;
-        refp += 1;
+    let end = ip + (ip_bound - ip).min(data.len() - refp);
+    unsafe {
+        while ip < end && *base.add(refp) == x {
+            ip += 1;
+            refp += 1;
+        }
     }
     ip
 }
@@ -101,24 +103,28 @@ fn get_match(data: &[u8], ip: usize, ip_bound: usize, refp: usize) -> usize {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn get_match_16_x86_64(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usize) -> usize {
-    use std::arch::x86_64::{__m128i, _mm_cmpeq_epi32, _mm_loadu_si128, _mm_movemask_epi8};
+unsafe fn get_match_16_x86_64(
+    data: &[u8],
+    mut ip: usize,
+    ip_bound: usize,
+    mut refp: usize,
+) -> usize {
+    use std::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+    let base = data.as_ptr();
 
     while ip + 16 <= ip_bound && refp + 16 <= data.len() {
-        let lhs = _mm_loadu_si128(data.as_ptr().add(ip) as *const __m128i);
-        let rhs = _mm_loadu_si128(data.as_ptr().add(refp) as *const __m128i);
-        let cmp = _mm_cmpeq_epi32(lhs, rhs);
-        if _mm_movemask_epi8(cmp) != 0xFFFF {
-            while ip < ip_bound && refp < data.len() && *data.get_unchecked(refp) == *data.get_unchecked(ip) {
-                ip += 1;
-                refp += 1;
-            }
-            return ip;
+        let lhs = _mm_loadu_si128(base.add(ip) as *const __m128i);
+        let rhs = _mm_loadu_si128(base.add(refp) as *const __m128i);
+        let cmp = _mm_cmpeq_epi8(lhs, rhs);
+        let mask = _mm_movemask_epi8(cmp) as u32;
+        if mask != 0xFFFF {
+            return ip + ((!mask).trailing_zeros() as usize);
         }
         ip += 16;
         refp += 16;
     }
-    while ip < ip_bound && refp < data.len() && *data.get_unchecked(refp) == *data.get_unchecked(ip) {
+    let end = ip + (ip_bound - ip).min(data.len() - refp);
+    while ip < end && *base.add(refp) == *base.add(ip) {
         ip += 1;
         refp += 1;
     }
@@ -128,23 +134,22 @@ unsafe fn get_match_16_x86_64(data: &[u8], mut ip: usize, ip_bound: usize, mut r
 #[cfg(target_arch = "x86")]
 #[target_feature(enable = "sse2")]
 unsafe fn get_match_16_x86(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usize) -> usize {
-    use std::arch::x86::{__m128i, _mm_cmpeq_epi32, _mm_loadu_si128, _mm_movemask_epi8};
+    use std::arch::x86::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+    let base = data.as_ptr();
 
     while ip + 16 <= ip_bound && refp + 16 <= data.len() {
-        let lhs = _mm_loadu_si128(data.as_ptr().add(ip) as *const __m128i);
-        let rhs = _mm_loadu_si128(data.as_ptr().add(refp) as *const __m128i);
-        let cmp = _mm_cmpeq_epi32(lhs, rhs);
-        if _mm_movemask_epi8(cmp) != 0xFFFF {
-            while ip < ip_bound && refp < data.len() && *data.get_unchecked(refp) == *data.get_unchecked(ip) {
-                ip += 1;
-                refp += 1;
-            }
-            return ip;
+        let lhs = _mm_loadu_si128(base.add(ip) as *const __m128i);
+        let rhs = _mm_loadu_si128(base.add(refp) as *const __m128i);
+        let cmp = _mm_cmpeq_epi8(lhs, rhs);
+        let mask = _mm_movemask_epi8(cmp) as u32;
+        if mask != 0xFFFF {
+            return ip + ((!mask).trailing_zeros() as usize);
         }
         ip += 16;
         refp += 16;
     }
-    while ip < ip_bound && refp < data.len() && *data.get_unchecked(refp) == *data.get_unchecked(ip) {
+    let end = ip + (ip_bound - ip).min(data.len() - refp);
+    while ip < end && *base.add(refp) == *base.add(ip) {
         ip += 1;
         refp += 1;
     }
@@ -153,9 +158,10 @@ unsafe fn get_match_16_x86(data: &[u8], mut ip: usize, ip_bound: usize, mut refp
 
 #[inline]
 fn get_match_generic(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usize) -> usize {
+    let base = data.as_ptr();
     while ip + 8 <= ip_bound && refp + 8 <= data.len() {
-        let ip_word = readu64(data, ip);
-        let ref_word = readu64(data, refp);
+        let ip_word = unsafe { std::ptr::read_unaligned(base.add(ip).cast::<u64>()) };
+        let ref_word = unsafe { std::ptr::read_unaligned(base.add(refp).cast::<u64>()) };
         if ip_word != ref_word {
             let matched = matching_prefix_len(ip_word, ref_word);
             return (ip + matched).min(ip_bound);
@@ -163,9 +169,12 @@ fn get_match_generic(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usiz
         ip += 8;
         refp += 8;
     }
-    while ip < ip_bound && refp < data.len() && data[refp] == data[ip] {
-        ip += 1;
-        refp += 1;
+    let end = ip + (ip_bound - ip).min(data.len() - refp);
+    unsafe {
+        while ip < end && *base.add(refp) == *base.add(ip) {
+            ip += 1;
+            refp += 1;
+        }
     }
     ip
 }
@@ -374,6 +383,54 @@ unsafe fn copy_match_overlap_exact(
 }
 
 #[inline(always)]
+unsafe fn copy_match_small_overlap(
+    base: *mut u8,
+    op: usize,
+    ref_pos: usize,
+    match_len: usize,
+    use_ssse3_repeat: bool,
+) -> usize {
+    let distance = op - ref_pos;
+
+    if distance == 4 {
+        let seed = std::ptr::read_unaligned(base.add(ref_pos) as *const u32) as u64;
+        let pat = seed | (seed << 32);
+        let mut d = base.add(op);
+        let end = base.add(op + match_len);
+        while d < end {
+            std::ptr::write_unaligned(d as *mut u64, pat);
+            d = d.add(8);
+        }
+        op + match_len
+    } else if distance == 2 {
+        let seed = std::ptr::read_unaligned(base.add(ref_pos) as *const u16) as u64;
+        let pat = seed.wrapping_mul(0x0001_0001_0001_0001);
+        let mut d = base.add(op);
+        let end = base.add(op + match_len);
+        while d < end {
+            std::ptr::write_unaligned(d as *mut u64, pat);
+            d = d.add(8);
+        }
+        op + match_len
+    } else if use_ssse3_repeat && match_len >= 16 && distance <= 16 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            copy_match_repeat_16_x86_64(base, op, ref_pos, match_len)
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            copy_match_repeat_16_x86(base, op, ref_pos, match_len)
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            copy_match_overlap_exact(base, op, ref_pos, match_len)
+        }
+    } else {
+        copy_match_overlap_exact(base, op, ref_pos, match_len)
+    }
+}
+
+#[inline(always)]
 unsafe fn wild_copy_8(base: *mut u8, mut op: usize, mut ref_pos: usize, end: usize) {
     while op < end {
         let v = std::ptr::read_unaligned(base.add(ref_pos) as *const u64);
@@ -384,16 +441,23 @@ unsafe fn wild_copy_8(base: *mut u8, mut op: usize, mut ref_pos: usize, end: usi
 }
 
 #[inline(always)]
-fn get_run_or_match(data: &[u8], ip: usize, ip_bound: usize, refp: usize, run: bool) -> usize {
+fn get_run_or_match(
+    data: &[u8],
+    ip: usize,
+    ip_bound: usize,
+    refp: usize,
+    run: bool,
+    use_sse2_match: bool,
+) -> usize {
     if run {
         get_run(data, ip, ip_bound, refp)
     } else {
         #[cfg(target_arch = "x86_64")]
-        if std::arch::is_x86_feature_detected!("sse2") {
+        if use_sse2_match {
             return unsafe { get_match_16_x86_64(data, ip, ip_bound, refp) };
         }
         #[cfg(target_arch = "x86")]
-        if std::arch::is_x86_feature_detected!("sse2") {
+        if use_sse2_match {
             return unsafe { get_match_16_x86(data, ip, ip_bound, refp) };
         }
         get_match(data, ip, ip_bound, refp)
@@ -407,112 +471,170 @@ fn get_cratio_with_htab(
     maxlen: usize,
     minlen: usize,
     ipshift: usize,
-    hashlog: u8,
+    hash_shift: u32,
     htab: &mut [u32],
+    use_sse2_match: bool,
 ) -> f64 {
     htab.fill(0);
+    let data_ptr = data.as_ptr();
     let limit = maxlen.min(htab.len()).min(data.len());
     if limit < 13 {
         return 0.0;
     }
     let ip_bound = limit - 1;
     let ip_limit = limit - 12;
-    let htab_mask = htab.len() - 1;
-
     let mut oc: i64 = 0;
     let mut copy: u8 = 4;
     oc += 5;
 
     let mut ip = 0usize;
-    while ip < ip_limit {
-        let anchor = ip;
+    if hash_shift >= 32 {
+        while ip < ip_limit {
+            let anchor = ip;
 
-        let seq = readu32(data, ip);
-        let hval = hash_function(seq, hashlog) as usize & htab_mask;
-        let ref_offset = htab[hval] as usize;
+            let seq = unsafe { readu32_ptr(data_ptr, ip) };
+            let ref_offset = unsafe { htab_get(htab, 0) as usize };
 
-        let distance = anchor.saturating_sub(ref_offset);
-        htab[hval] = anchor as u32;
+            let distance = anchor - ref_offset;
+            unsafe { htab_set(htab, 0, anchor as u32) };
 
-        if distance == 0 || distance >= MAX_FARDISTANCE as usize {
-            oc += 1;
-            ip = anchor + 1;
-            copy += 1;
-            if copy == MAX_COPY as u8 {
-                copy = 0;
+            if distance == 0 || distance >= MAX_FARDISTANCE as usize {
                 oc += 1;
+                ip = anchor + 1;
+                copy += 1;
+                if copy == MAX_COPY as u8 {
+                    copy = 0;
+                    oc += 1;
+                }
+                continue;
             }
-            continue;
-        }
 
-        if ref_offset + 4 > limit {
-            oc += 1;
-            ip = anchor + 1;
-            copy += 1;
-            if copy == MAX_COPY as u8 {
-                copy = 0;
+            if unsafe { readu32_ptr(data_ptr, ref_offset) } != seq {
                 oc += 1;
+                ip = anchor + 1;
+                copy += 1;
+                if copy == MAX_COPY as u8 {
+                    copy = 0;
+                    oc += 1;
+                }
+                continue;
             }
-            continue;
-        }
 
-        if readu32(data, ref_offset) != readu32(data, ip) {
-            oc += 1;
-            ip = anchor + 1;
-            copy += 1;
-            if copy == MAX_COPY as u8 {
-                copy = 0;
-                oc += 1;
-            }
-            continue;
-        }
+            ip = anchor + 4;
+            let ref_after = ref_offset + 4;
+            let distance_dec = distance - 1;
+            ip = get_run_or_match(data, ip, ip_bound, ref_after, distance_dec == 0, use_sse2_match);
 
-        ip = anchor + 4;
-        let ref_after = ref_offset + 4;
-        let distance_dec = distance - 1;
-        ip = get_run_or_match(data, ip, ip_bound, ref_after, distance_dec == 0);
-
-        if ip > ipshift {
+            debug_assert!(ip >= ipshift);
             ip -= ipshift;
-        } else {
-            ip = anchor + 1;
-        }
-        let len = ip - anchor;
-        if len < minlen {
-            oc += 1;
-            ip = anchor + 1;
-            copy += 1;
-            if copy == MAX_COPY as u8 {
-                copy = 0;
+            let len = ip - anchor;
+            if len < minlen {
                 oc += 1;
+                ip = anchor + 1;
+                copy += 1;
+                if copy == MAX_COPY as u8 {
+                    copy = 0;
+                    oc += 1;
+                }
+                continue;
             }
-            continue;
-        }
 
-        if copy == 0 {
-            oc -= 1;
-        }
-        copy = 0;
-
-        if distance < MAX_DISTANCE as usize {
-            if len >= 7 {
-                oc += ((len - 7) / 255 + 1) as i64;
+            if copy == 0 {
+                oc -= 1;
             }
-            oc += 2;
-        } else {
-            if len >= 7 {
-                oc += ((len - 7) / 255 + 1) as i64;
-            }
-            oc += 4;
-        }
+            copy = 0;
 
-        if ip + 4 <= data.len() {
-            let seq2 = readu32(data, ip);
-            let hval2 = hash_function(seq2, hashlog) as usize & htab_mask;
-            htab[hval2] = ip as u32;
+            if distance < MAX_DISTANCE as usize {
+                if len >= 7 {
+                    oc += ((len - 7) / 255 + 1) as i64;
+                }
+                oc += 2;
+            } else {
+                if len >= 7 {
+                    oc += ((len - 7) / 255 + 1) as i64;
+                }
+                oc += 4;
+            }
+
+            unsafe { htab_set(htab, 0, ip as u32) };
+            ip += 2;
+            oc += 1;
         }
-        ip += 2;
-        oc += 1;
+    } else {
+        while ip < ip_limit {
+            let anchor = ip;
+
+            let seq = unsafe { readu32_ptr(data_ptr, ip) };
+            let hval = hash_function_shift_nonzero(seq, hash_shift) as usize;
+            let ref_offset = unsafe { htab_get(htab, hval) as usize };
+
+            let distance = anchor - ref_offset;
+            unsafe { htab_set(htab, hval, anchor as u32) };
+
+            if distance == 0 || distance >= MAX_FARDISTANCE as usize {
+                oc += 1;
+                ip = anchor + 1;
+                copy += 1;
+                if copy == MAX_COPY as u8 {
+                    copy = 0;
+                    oc += 1;
+                }
+                continue;
+            }
+
+            if unsafe { readu32_ptr(data_ptr, ref_offset) } != seq {
+                oc += 1;
+                ip = anchor + 1;
+                copy += 1;
+                if copy == MAX_COPY as u8 {
+                    copy = 0;
+                    oc += 1;
+                }
+                continue;
+            }
+
+            ip = anchor + 4;
+            let ref_after = ref_offset + 4;
+            let distance_dec = distance - 1;
+            ip = get_run_or_match(data, ip, ip_bound, ref_after, distance_dec == 0, use_sse2_match);
+
+            debug_assert!(ip >= ipshift);
+            ip -= ipshift;
+            let len = ip - anchor;
+            if len < minlen {
+                oc += 1;
+                ip = anchor + 1;
+                copy += 1;
+                if copy == MAX_COPY as u8 {
+                    copy = 0;
+                    oc += 1;
+                }
+                continue;
+            }
+
+            if copy == 0 {
+                oc -= 1;
+            }
+            copy = 0;
+
+            if distance < MAX_DISTANCE as usize {
+                if len >= 7 {
+                    oc += ((len - 7) / 255 + 1) as i64;
+                }
+                oc += 2;
+            } else {
+                if len >= 7 {
+                    oc += ((len - 7) / 255 + 1) as i64;
+                }
+                oc += 4;
+            }
+
+            let seq2 = unsafe { readu32_ptr(data_ptr, ip) };
+            let hval2 = hash_function_shift_nonzero(seq2, hash_shift) as usize;
+            unsafe { htab_set(htab, hval2, ip as u32) };
+            ip += 2;
+            oc += 1;
+        }
     }
 
     let ic = ip as f64;
@@ -560,17 +682,25 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
     }
 
     let hashlen = 1usize << hashlog;
-    let mut htab = [0u32; 1 << HASH_LOG];
+    let hash_shift = 32 - hashlog as u32;
+    let mut htab_storage = std::mem::MaybeUninit::<[u32; 1 << HASH_LOG]>::uninit();
+    // SAFETY: We only ever read entries from `htab[..hashlen]` after explicitly
+    // zeroing that prefix, and the compressor never touches the unused suffix.
+    let htab = unsafe { &mut *htab_storage.as_mut_ptr() };
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let use_sse2_match = std::arch::is_x86_feature_detected!("sse2");
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let use_sse2_match = false;
 
     let shift = length - maxlen;
-    // get_cratio_with_htab fills htab[..hashlen] with 0 at start, so no double-init
     let cratio = get_cratio_with_htab(
         &input[shift..],
         maxlen,
         minlen,
         ipshift,
-        hashlog,
+        hash_shift,
         &mut htab[..hashlen],
+        use_sse2_match,
     );
 
     let cratio_table: [f64; 10] = [0.0, 2.0, 1.5, 1.2, 1.2, 1.2, 1.2, 1.15, 1.1, 1.0];
@@ -578,7 +708,6 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
         return 0;
     }
 
-    // Only clear the portion we use (not the full 64KB array)
     htab[..hashlen].fill(0);
 
     let ip_bound = length - 1;
@@ -586,8 +715,6 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
     let mut op: usize = 0;
     let op_limit = maxout;
     let mut copy: u8 = 4;
-    let htab_mask = htab.len() - 1;
-
     if op + 5 > op_limit {
         return 0;
     }
@@ -601,13 +728,11 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
     let input_ptr = input.as_ptr();
     let output_ptr = output.as_mut_ptr();
 
-    // Unchecked writes for output[op] = v, assuming a prior explicit
-    // `op + N > op_limit` check has proven op+N <= output.len().
-    // SAFETY: `output_ptr` points into the `output` slice; the caller must
-    // have checked the window before invoking.
     macro_rules! write_u8 {
         ($v:expr) => {{
-            unsafe { *output_ptr.add(op) = $v; }
+            unsafe {
+                *output_ptr.add(op) = $v;
+            }
             op += 1;
         }};
     }
@@ -617,8 +742,6 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
             if op + 2 > op_limit {
                 return 0;
             }
-            // SAFETY: op < op_limit <= output.len() by the check above;
-            // $anchor <= ip_bound < length, so input read is in-bounds.
             unsafe {
                 *output_ptr.add(op) = *input_ptr.add($anchor);
             }
@@ -627,154 +750,363 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
             copy += 1;
             if copy == MAX_COPY as u8 {
                 copy = 0;
-                // op was just advanced, still < op_limit by the check above.
                 write_u8!(MAX_COPY as u8 - 1);
             }
         }};
     }
 
-    while ip < ip_limit {
-        let anchor = ip;
+    if hash_shift >= 32 {
+        while ip < ip_limit {
+            let anchor = ip;
 
-        let seq = readu32(input, ip);
-        let hval = hash_function(seq, hashlog) as usize & htab_mask;
-        let ref_offset = htab[hval] as usize;
-        let distance = ip - ref_offset;
+            let seq = unsafe { readu32_ptr(input_ptr, ip) };
+            let ref_offset = unsafe { htab_get(htab, 0) as usize };
+            let distance = ip - ref_offset;
 
-        htab[hval] = ip as u32;
+            unsafe { htab_set(htab, 0, ip as u32) };
 
-        if distance == 0 || distance >= MAX_FARDISTANCE as usize {
-            emit_literal!(anchor);
-            continue;
-        }
+            if distance == 0 || distance >= MAX_FARDISTANCE as usize {
+                emit_literal!(anchor);
+                continue;
+            }
 
-        if ref_offset + 4 > length || readu32(input, ref_offset) != seq {
-            emit_literal!(anchor);
-            continue;
-        }
+            if unsafe { readu32_ptr(input_ptr, ref_offset) } != seq {
+                emit_literal!(anchor);
+                continue;
+            }
 
-        ip = anchor + 4;
-        let ref_after = ref_offset + 4;
-        let distance = distance - 1;
-        ip = get_run_or_match(input, ip, ip_bound, ref_after, distance == 0);
+            ip = anchor + 4;
+            let ref_after = ref_offset + 4;
+            let distance = distance - 1;
+            ip = get_run_or_match(input, ip, ip_bound, ref_after, distance == 0, use_sse2_match);
 
-        if ip > ipshift {
+            debug_assert!(ip >= ipshift);
             ip -= ipshift;
-        } else {
-            ip = anchor + 1;
-        }
-        let len = ip - anchor;
+            let len = ip - anchor;
 
-        if len < minlen || (len <= 5 && distance >= MAX_DISTANCE as usize) {
-            emit_literal!(anchor);
-            continue;
-        }
-
-        if copy > 0 {
-            unsafe {
-                *output_ptr.add(op - copy as usize - 1) = copy - 1;
+            if len < minlen || (len <= 5 && distance >= MAX_DISTANCE as usize) {
+                emit_literal!(anchor);
+                continue;
             }
-        } else {
-            op -= 1;
-        }
-        copy = 0;
 
-        if distance < MAX_DISTANCE as usize {
-            if len < 7 {
-                if op + 2 > op_limit {
-                    return 0;
+            if copy > 0 {
+                unsafe {
+                    *output_ptr.add(op - copy as usize - 1) = copy - 1;
                 }
-                write_u8!(((len << 5) + (distance >> 8)) as u8);
-                write_u8!((distance & 255) as u8);
             } else {
-                if op + 1 > op_limit {
-                    return 0;
-                }
-                write_u8!(((7 << 5) + (distance >> 8)) as u8);
-                let mut remaining = len - 7;
-                while remaining >= 255 {
+                op -= 1;
+            }
+            copy = 0;
+
+            if distance < MAX_DISTANCE as usize {
+                if len < 7 {
+                    if op + 2 > op_limit {
+                        return 0;
+                    }
+                    write_u8!(((len << 5) + (distance >> 8)) as u8);
+                    write_u8!((distance & 255) as u8);
+                } else {
                     if op + 1 > op_limit {
                         return 0;
                     }
-                    write_u8!(255);
-                    remaining -= 255;
+                    write_u8!(((7 << 5) + (distance >> 8)) as u8);
+                    let mut remaining = len - 7;
+                    while remaining >= 255 {
+                        if op + 1 > op_limit {
+                            return 0;
+                        }
+                        write_u8!(255);
+                        remaining -= 255;
+                    }
+                    if op + 2 > op_limit {
+                        return 0;
+                    }
+                    write_u8!(remaining as u8);
+                    write_u8!((distance & 255) as u8);
                 }
-                if op + 2 > op_limit {
-                    return 0;
-                }
-                write_u8!(remaining as u8);
-                write_u8!((distance & 255) as u8);
-            }
-        } else {
-            let distance = distance - MAX_DISTANCE as usize;
-            if len < 7 {
-                if op + 4 > op_limit {
-                    return 0;
-                }
-                write_u8!(((len << 5) + 31) as u8);
-                write_u8!(255);
-                write_u8!((distance >> 8) as u8);
-                write_u8!((distance & 255) as u8);
             } else {
-                if op + 1 > op_limit {
-                    return 0;
-                }
-                write_u8!((7 << 5) + 31);
-                let mut remaining = len - 7;
-                while remaining >= 255 {
+                let distance = distance - MAX_DISTANCE as usize;
+                if len < 7 {
+                    if op + 4 > op_limit {
+                        return 0;
+                    }
+                    write_u8!(((len << 5) + 31) as u8);
+                    write_u8!(255);
+                    write_u8!((distance >> 8) as u8);
+                    write_u8!((distance & 255) as u8);
+                } else {
                     if op + 1 > op_limit {
                         return 0;
                     }
+                    write_u8!((7 << 5) + 31);
+                    let mut remaining = len - 7;
+                    while remaining >= 255 {
+                        if op + 1 > op_limit {
+                            return 0;
+                        }
+                        write_u8!(255);
+                        remaining -= 255;
+                    }
+                    if op + 4 > op_limit {
+                        return 0;
+                    }
+                    write_u8!(remaining as u8);
                     write_u8!(255);
-                    remaining -= 255;
+                    write_u8!((distance >> 8) as u8);
+                    write_u8!((distance & 255) as u8);
                 }
-                if op + 4 > op_limit {
-                    return 0;
-                }
-                write_u8!(remaining as u8);
-                write_u8!(255);
-                write_u8!((distance >> 8) as u8);
-                write_u8!((distance & 255) as u8);
             }
-        }
 
-        let cur_ip = ip;
-        if cur_ip + 4 <= length {
-            let seq2 = readu32(input, cur_ip);
-            let hval2 = hash_function(seq2, hashlog) as usize & htab_mask;
-            htab[hval2] = cur_ip as u32;
-            ip += 1;
-            if clevel == 9 && cur_ip + 4 < length {
-                let seq3 = readu32(input, ip);
-                let hval3 = hash_function(seq3, hashlog) as usize & htab_mask;
-                htab[hval3] = ip as u32;
-                ip += 1;
-            } else {
-                ip += 1;
-            }
-        } else {
+            unsafe { htab_set(htab, 0, ip as u32) };
             ip += 2;
-        }
 
-        if op + 1 > op_limit {
-            return 0;
+            if op + 1 > op_limit {
+                return 0;
+            }
+            write_u8!(MAX_COPY as u8 - 1);
         }
-        write_u8!(MAX_COPY as u8 - 1);
+    } else if clevel == 9 {
+        while ip < ip_limit {
+            let anchor = ip;
+
+            let seq = unsafe { readu32_ptr(input_ptr, ip) };
+            let hval = hash_function_shift_nonzero(seq, hash_shift) as usize;
+            let ref_offset = unsafe { htab_get(htab, hval) as usize };
+            let distance = ip - ref_offset;
+
+            unsafe { htab_set(htab, hval, ip as u32) };
+
+            if distance == 0 || distance >= MAX_FARDISTANCE as usize {
+                emit_literal!(anchor);
+                continue;
+            }
+
+            if unsafe { readu32_ptr(input_ptr, ref_offset) } != seq {
+                emit_literal!(anchor);
+                continue;
+            }
+
+            ip = anchor + 4;
+            let ref_after = ref_offset + 4;
+            let distance = distance - 1;
+            ip = get_run_or_match(input, ip, ip_bound, ref_after, distance == 0, use_sse2_match);
+
+            debug_assert!(ip >= ipshift);
+            ip -= ipshift;
+            let len = ip - anchor;
+
+            if len < minlen || (len <= 5 && distance >= MAX_DISTANCE as usize) {
+                emit_literal!(anchor);
+                continue;
+            }
+
+            if copy > 0 {
+                unsafe {
+                    *output_ptr.add(op - copy as usize - 1) = copy - 1;
+                }
+            } else {
+                op -= 1;
+            }
+            copy = 0;
+
+            if distance < MAX_DISTANCE as usize {
+                if len < 7 {
+                    if op + 2 > op_limit {
+                        return 0;
+                    }
+                    write_u8!(((len << 5) + (distance >> 8)) as u8);
+                    write_u8!((distance & 255) as u8);
+                } else {
+                    if op + 1 > op_limit {
+                        return 0;
+                    }
+                    write_u8!(((7 << 5) + (distance >> 8)) as u8);
+                    let mut remaining = len - 7;
+                    while remaining >= 255 {
+                        if op + 1 > op_limit {
+                            return 0;
+                        }
+                        write_u8!(255);
+                        remaining -= 255;
+                    }
+                    if op + 2 > op_limit {
+                        return 0;
+                    }
+                    write_u8!(remaining as u8);
+                    write_u8!((distance & 255) as u8);
+                }
+            } else {
+                let distance = distance - MAX_DISTANCE as usize;
+                if len < 7 {
+                    if op + 4 > op_limit {
+                        return 0;
+                    }
+                    write_u8!(((len << 5) + 31) as u8);
+                    write_u8!(255);
+                    write_u8!((distance >> 8) as u8);
+                    write_u8!((distance & 255) as u8);
+                } else {
+                    if op + 1 > op_limit {
+                        return 0;
+                    }
+                    write_u8!((7 << 5) + 31);
+                    let mut remaining = len - 7;
+                    while remaining >= 255 {
+                        if op + 1 > op_limit {
+                            return 0;
+                        }
+                        write_u8!(255);
+                        remaining -= 255;
+                    }
+                    if op + 4 > op_limit {
+                        return 0;
+                    }
+                    write_u8!(remaining as u8);
+                    write_u8!(255);
+                    write_u8!((distance >> 8) as u8);
+                    write_u8!((distance & 255) as u8);
+                }
+            }
+
+            let mut seq2 = unsafe { readu32_ptr(input_ptr, ip) };
+            let hval2 = hash_function_shift_nonzero(seq2, hash_shift) as usize;
+            unsafe { htab_set(htab, hval2, ip as u32) };
+            ip += 1;
+            seq2 >>= 8;
+            let hval3 = hash_function_shift_nonzero(seq2, hash_shift) as usize;
+            unsafe { htab_set(htab, hval3, ip as u32) };
+            ip += 1;
+
+            if op + 1 > op_limit {
+                return 0;
+            }
+            write_u8!(MAX_COPY as u8 - 1);
+        }
+    } else {
+        while ip < ip_limit {
+            let anchor = ip;
+
+            let seq = unsafe { readu32_ptr(input_ptr, ip) };
+            let hval = hash_function_shift_nonzero(seq, hash_shift) as usize;
+            let ref_offset = unsafe { htab_get(htab, hval) as usize };
+            let distance = ip - ref_offset;
+
+            unsafe { htab_set(htab, hval, ip as u32) };
+
+            if distance == 0 || distance >= MAX_FARDISTANCE as usize {
+                emit_literal!(anchor);
+                continue;
+            }
+
+            if unsafe { readu32_ptr(input_ptr, ref_offset) } != seq {
+                emit_literal!(anchor);
+                continue;
+            }
+
+            ip = anchor + 4;
+            let ref_after = ref_offset + 4;
+            let distance = distance - 1;
+            ip = get_run_or_match(input, ip, ip_bound, ref_after, distance == 0, use_sse2_match);
+
+            debug_assert!(ip >= ipshift);
+            ip -= ipshift;
+            let len = ip - anchor;
+
+            if len < minlen || (len <= 5 && distance >= MAX_DISTANCE as usize) {
+                emit_literal!(anchor);
+                continue;
+            }
+
+            if copy > 0 {
+                unsafe {
+                    *output_ptr.add(op - copy as usize - 1) = copy - 1;
+                }
+            } else {
+                op -= 1;
+            }
+            copy = 0;
+
+            if distance < MAX_DISTANCE as usize {
+                if len < 7 {
+                    if op + 2 > op_limit {
+                        return 0;
+                    }
+                    write_u8!(((len << 5) + (distance >> 8)) as u8);
+                    write_u8!((distance & 255) as u8);
+                } else {
+                    if op + 1 > op_limit {
+                        return 0;
+                    }
+                    write_u8!(((7 << 5) + (distance >> 8)) as u8);
+                    let mut remaining = len - 7;
+                    while remaining >= 255 {
+                        if op + 1 > op_limit {
+                            return 0;
+                        }
+                        write_u8!(255);
+                        remaining -= 255;
+                    }
+                    if op + 2 > op_limit {
+                        return 0;
+                    }
+                    write_u8!(remaining as u8);
+                    write_u8!((distance & 255) as u8);
+                }
+            } else {
+                let distance = distance - MAX_DISTANCE as usize;
+                if len < 7 {
+                    if op + 4 > op_limit {
+                        return 0;
+                    }
+                    write_u8!(((len << 5) + 31) as u8);
+                    write_u8!(255);
+                    write_u8!((distance >> 8) as u8);
+                    write_u8!((distance & 255) as u8);
+                } else {
+                    if op + 1 > op_limit {
+                        return 0;
+                    }
+                    write_u8!((7 << 5) + 31);
+                    let mut remaining = len - 7;
+                    while remaining >= 255 {
+                        if op + 1 > op_limit {
+                            return 0;
+                        }
+                        write_u8!(255);
+                        remaining -= 255;
+                    }
+                    if op + 4 > op_limit {
+                        return 0;
+                    }
+                    write_u8!(remaining as u8);
+                    write_u8!(255);
+                    write_u8!((distance >> 8) as u8);
+                    write_u8!((distance & 255) as u8);
+                }
+            }
+
+            let seq2 = unsafe { readu32_ptr(input_ptr, ip) };
+            let hval2 = hash_function_shift_nonzero(seq2, hash_shift) as usize;
+            unsafe { htab_set(htab, hval2, ip as u32) };
+            ip += 2;
+
+            if op + 1 > op_limit {
+                return 0;
+            }
+            write_u8!(MAX_COPY as u8 - 1);
+        }
     }
 
-    // Left-over as literal copy
     while ip <= ip_bound {
         emit_literal!(ip);
     }
 
-    // Adjust final copy length
     if copy > 0 {
         output[op - copy as usize - 1] = copy - 1;
     } else {
         op -= 1;
     }
 
-    // Marker for blosclz
     output[0] |= 1 << 5;
 
     op as i32
@@ -795,6 +1127,10 @@ pub fn decompress(input: &[u8], output: &mut [u8]) -> i32 {
     let mut op: usize = 0;
     let op_limit = maxout;
     let input_ptr = input.as_ptr();
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let use_ssse3_repeat = std::arch::is_x86_feature_detected!("ssse3");
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let use_ssse3_repeat = false;
 
     // SAFETY: all pointer reads below are guarded by explicit `ip + N >= ip_limit`
     // bounds checks before the reads, matching the original safe-slice indexing.
@@ -881,71 +1217,38 @@ pub fn decompress(input: &[u8], output: &mut [u8]) -> i32 {
                 // broadcast. Other distances fall back to byte-by-byte (LLVM may
                 // lower to memmove, which is still correct under LZ77 overlap).
                 let distance = op - ref_pos;
-                let has_16_slack = op + match_len + 16 <= op_limit;
                 let has_8_slack = op + match_len + 8 <= op_limit;
                 if has_8_slack && distance == 4 {
-                    // SAFETY: distance==4, seed is a u32 at ref_pos.
                     unsafe {
-                        let base = output.as_mut_ptr();
-                        let seed =
-                            std::ptr::read_unaligned(base.add(ref_pos) as *const u32) as u64;
-                        let pat = seed | (seed << 32);
-                        let mut d = base.add(op);
-                        let end = base.add(op + match_len);
-                        while d < end {
-                            std::ptr::write_unaligned(d as *mut u64, pat);
-                            d = d.add(8);
-                        }
+                        op = copy_match_small_overlap(
+                            output.as_mut_ptr(),
+                            op,
+                            ref_pos,
+                            match_len,
+                            false,
+                        );
                     }
-                    op += match_len;
                 } else if has_8_slack && distance == 2 {
-                    // SAFETY: distance==2, seed is a u16, broadcast to u64.
                     unsafe {
-                        let base = output.as_mut_ptr();
-                        let seed =
-                            std::ptr::read_unaligned(base.add(ref_pos) as *const u16) as u64;
-                        let pat = seed.wrapping_mul(0x0001_0001_0001_0001);
-                        let mut d = base.add(op);
-                        let end = base.add(op + match_len);
-                        while d < end {
-                            std::ptr::write_unaligned(d as *mut u64, pat);
-                            d = d.add(8);
-                        }
-                    }
-                    op += match_len;
-                } else if has_16_slack && match_len >= 16 && distance <= 16 {
-                    #[cfg(target_arch = "x86_64")]
-                    if std::arch::is_x86_feature_detected!("ssse3") {
-                        unsafe {
-                            op = copy_match_repeat_16_x86_64(
-                                output.as_mut_ptr(),
-                                op,
-                                ref_pos,
-                                match_len,
-                            );
-                        }
-                        continue;
-                    }
-                    #[cfg(target_arch = "x86")]
-                    if std::arch::is_x86_feature_detected!("ssse3") {
-                        unsafe {
-                            op = copy_match_repeat_16_x86(
-                                output.as_mut_ptr(),
-                                op,
-                                ref_pos,
-                                match_len,
-                            );
-                        }
-                        continue;
-                    }
-                    unsafe {
-                        op = copy_match_overlap_exact(output.as_mut_ptr(), op, ref_pos, match_len);
+                        op = copy_match_small_overlap(
+                            output.as_mut_ptr(),
+                            op,
+                            ref_pos,
+                            match_len,
+                            false,
+                        );
                     }
                 } else {
                     // General case (distance ∈ {3,5,6,7} or not enough slack).
                     // SAFETY: `ref_pos < op`, `op + match_len <= op_limit`.
                     unsafe {
-                        op = copy_match_overlap_exact(output.as_mut_ptr(), op, ref_pos, match_len);
+                        op = copy_match_small_overlap(
+                            output.as_mut_ptr(),
+                            op,
+                            ref_pos,
+                            match_len,
+                            use_ssse3_repeat && op + match_len + 16 <= op_limit,
+                        );
                     }
                 }
             }
@@ -1194,7 +1497,7 @@ mod tests {
         let copy_len = 50usize;
         data.extend_from_slice(&data.clone()[copy_start..copy_start + copy_len]);
         data.push(0xAA); // forces the match to terminate mid-word
-        // Padding so the data is large enough for blosclz to consider.
+                         // Padding so the data is large enough for blosclz to consider.
         data.extend(vec![0x77u8; 200]);
 
         let mut compressed = vec![0u8; data.len() + 256];
