@@ -419,10 +419,10 @@ mod simd {
                 *reg = arch::_mm256_permutevar8x32_epi32(*reg, mask);
             }
 
-            for j in 0..4 {
+            for (j, reg) in ymm0.iter().enumerate() {
                 arch::_mm256_storeu_si256(
                     dest_ptr.add(i + j * total_elements) as *mut arch::__m256i,
-                    ymm0[j],
+                    *reg,
                 );
             }
             i += std::mem::size_of::<arch::__m256i>();
@@ -1021,7 +1021,7 @@ fn bitunshuffle_with_scratch_and_format_version(
     }
 
     let size = blocksize / typesize;
-    if format_version == BLOSC1_VERSION_FORMAT && size % 8 != 0 {
+    if format_version == BLOSC1_VERSION_FORMAT && !size.is_multiple_of(8) {
         dest[..blocksize].copy_from_slice(src);
         return blocksize as i64;
     }

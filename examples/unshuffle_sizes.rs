@@ -3,8 +3,8 @@ use std::time::Instant;
 
 fn bench(size: usize) {
     let mut src = vec![0u8; size];
-    for i in 0..size {
-        src[i] = (i * 7) as u8;
+    for (i, byte) in src.iter_mut().enumerate() {
+        *byte = (i * 7) as u8;
     }
     let mut shuffled = vec![0u8; size];
     filters::shuffle(4, &src, &mut shuffled);

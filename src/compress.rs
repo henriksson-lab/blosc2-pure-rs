@@ -28,10 +28,12 @@ static THREAD_POOLS: OnceLock<Mutex<HashMap<i16, Arc<rayon::ThreadPool>>>> = Onc
 const MEMCPY_PARALLEL_MIN_BYTES: usize = 8 * 1024 * 1024;
 const MEMCPY_PARALLEL_MIN_BYTES_PER_THREAD: usize = 2 * 1024 * 1024;
 
+type CompressScratch = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
 thread_local! {
     static DECOMPRESS_SCRATCH: RefCell<(Vec<u8>, Vec<u8>)> =
         const { RefCell::new((Vec::new(), Vec::new())) };
-    static COMPRESS_SCRATCH: RefCell<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> =
+    static COMPRESS_SCRATCH: RefCell<CompressScratch> =
         const { RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
 }
 
@@ -1079,7 +1081,7 @@ fn apply_prefilter<'a>(
         input: block,
         output: &mut scratch[..output_size],
         output_size: output_size as i32,
-        output_typesize: output_typesize,
+        output_typesize,
         output_offset: block_start as i32,
         nchunk: -1,
         nblock: (block_start / blocksize) as i32,
@@ -1178,10 +1180,7 @@ fn compress_pre_filtered_block_with_scratch(
 
         let header_pos = result_len;
         let payload_pos = header_pos + 4;
-        result.reserve(4 + max_out);
-        unsafe {
-            result.set_len(payload_pos + max_out);
-        }
+        result.resize(payload_pos + max_out, 0);
 
         let cbytes = match dict {
             Some(dict) => codecs::compress_block_with_dict(
@@ -1568,10 +1567,7 @@ pub fn compress(src: &[u8], cparams: &CParams) -> Result<Vec<u8>, &'static str> 
 
         let total_compressed: usize = compressed_blocks.iter().map(|(b, _)| b.len()).sum();
         let total_len = header_len + bstarts_len + total_compressed;
-        output = Vec::with_capacity(total_len);
-        unsafe {
-            output.set_len(total_len);
-        }
+        output = vec![0; total_len];
         output_pos = header_len + bstarts_len;
         all_zero_runs = true;
 
@@ -3089,12 +3085,7 @@ pub fn decompress_with_dparams(chunk: &[u8], dparams: &DParams) -> Result<Vec<u8
     let header = ChunkHeader::read(chunk)?;
     validate_header(&header, chunk.len())?;
     let nbytes = header.nbytes as usize;
-    let mut output = Vec::with_capacity(nbytes);
-    // SAFETY: `decompress_into_with_header` writes every byte in `output[..nbytes]`
-    // before it is observed by the caller on all successful paths.
-    unsafe {
-        output.set_len(nbytes);
-    }
+    let mut output = vec![0; nbytes];
     let written = decompress_into_with_header(chunk, &header, &mut output, dparams)?;
     debug_assert_eq!(written, nbytes);
     Ok(output)

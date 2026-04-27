@@ -1262,17 +1262,7 @@ pub fn decompress(input: &[u8], output: &mut [u8]) -> i32 {
                 // lower to memmove, which is still correct under LZ77 overlap).
                 let distance = op - ref_pos;
                 let has_8_slack = op + match_len + 8 <= op_limit;
-                if has_8_slack && distance == 4 {
-                    unsafe {
-                        op = copy_match_small_overlap(
-                            output.as_mut_ptr(),
-                            op,
-                            ref_pos,
-                            match_len,
-                            false,
-                        );
-                    }
-                } else if has_8_slack && distance == 2 {
+                if has_8_slack && matches!(distance, 2 | 4) {
                     unsafe {
                         op = copy_match_small_overlap(
                             output.as_mut_ptr(),

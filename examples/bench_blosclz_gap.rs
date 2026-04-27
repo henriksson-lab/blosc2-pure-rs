@@ -1,12 +1,14 @@
 #[cfg(feature = "_ffi")]
-mod enabled {
-    #[path = "../tests/common/mod.rs"]
-    mod common;
+#[path = "../tests/common/mod.rs"]
+mod common;
 
+#[cfg(feature = "_ffi")]
+mod enabled {
+    use super::common;
+    use super::common::ffi;
     use blosc2_pure_rs::compress::{self, CParams};
     use blosc2_pure_rs::constants::*;
     use blosc2_pure_rs::filters;
-    use common::ffi;
     use std::time::Instant;
 
     const DATA_SIZE: usize = 10 * 1024 * 1024;
