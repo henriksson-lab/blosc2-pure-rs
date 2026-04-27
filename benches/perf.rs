@@ -3,7 +3,8 @@ use blosc2_pure_rs::compress::{self, CParams, DParams};
 use blosc2_pure_rs::constants::*;
 use blosc2_pure_rs::filters;
 use blosc2_pure_rs::schunk::Schunk;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
 use std::path::Path;
 use std::process::Command;
 
@@ -47,6 +48,7 @@ fn cparams(compcode: u8, typesize: i32, filter: u8) -> CParams {
         filters_meta: [0; BLOSC2_MAX_FILTERS],
         use_dict: false,
         nthreads: 1,
+        ..CParams::default()
     }
 }
 
@@ -218,7 +220,10 @@ fn bench_schunk_frame(c: &mut Criterion) {
     let data = signal_f32_bytes(DATA_SIZE);
     let chunks: Vec<&[u8]> = data.chunks(CHUNK_SIZE).collect();
     let params = cparams(BLOSC_BLOSCLZ, 4, BLOSC_SHUFFLE);
-    let dparams = DParams { nthreads: 1 };
+    let dparams = DParams {
+        nthreads: 1,
+        ..DParams::default()
+    };
     let mut schunk = Schunk::new(params.clone(), dparams.clone());
     for chunk in &chunks {
         schunk.append_buffer(chunk).unwrap();

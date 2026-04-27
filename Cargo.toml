@@ -50,10 +50,10 @@ clap = { version = "4", features = ["derive"], optional = true }
 rayon = "1"
 lz4-pure = { package = "lz4-pure-rs", version = "0.1.0" }
 flate2 = { version = "1", default-features = false }
-zstd = "0.13"
+zstd-pure-rs = "0.1"
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8"
 tempfile = "3"
 
 [[bench]]

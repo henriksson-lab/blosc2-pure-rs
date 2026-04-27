@@ -4,6 +4,10 @@ use crate::constants::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
+use zstd_pure_rs::common::error::{ErrorCode, ERROR};
+use zstd_pure_rs::common::xxhash::XXH64_state_t;
+use zstd_pure_rs::decompress::zstd_decompress_block::{ZSTD_DCtx, ZSTD_decoder_entropy_rep};
+use zstd_pure_rs::prelude::*;
 
 pub type CodecCompressFn = fn(clevel: u8, meta: u8, src: &[u8], dest: &mut [u8]) -> i32;
 pub type CodecDecompressFn = fn(meta: u8, src: &[u8], dest: &mut [u8]) -> i32;
@@ -17,8 +21,15 @@ struct UserCodec {
 static USER_CODECS: OnceLock<RwLock<HashMap<u8, UserCodec>>> = OnceLock::new();
 
 thread_local! {
-    static ZSTD_DECOMPRESSOR: RefCell<Option<zstd::bulk::Decompressor<'static>>> =
-        const { RefCell::new(None) };
+    static ZSTD_CCTX: RefCell<Option<Box<ZSTD_CCtx>>> = const { RefCell::new(None) };
+    static ZSTD_DICT_CCTX: RefCell<Option<Box<ZSTD_CCtx>>> = const { RefCell::new(None) };
+    static ZSTD_DICT_DCTX: RefCell<Box<ZSTD_DCtx>> = RefCell::new(ZSTD_createDCtx());
+    static ZSTD_DCTX: RefCell<(Box<ZSTD_DCtx>, ZSTD_decoder_entropy_rep, XXH64_state_t)> =
+        RefCell::new((
+            ZSTD_createDCtx(),
+            ZSTD_decoder_entropy_rep::default(),
+            XXH64_state_t::default(),
+        ));
 }
 
 fn user_codecs() -> &'static RwLock<HashMap<u8, UserCodec>> {
@@ -129,7 +140,8 @@ pub fn decompress_block_with_dict(compcode: u8, src: &[u8], dest: &mut [u8], dic
 fn lz4_compress(clevel: u8, src: &[u8], dest: &mut [u8]) -> i32 {
     use lz4_pure::block::CompressionMode;
 
-    let accel = (10 - i32::from(clevel.clamp(0, 9))).max(1);
+    let _ = clevel;
+    let accel = 1;
     match lz4_pure::block::compress_to_buffer(src, Some(CompressionMode::FAST(accel)), false, dest)
     {
         Ok(n) => n as i32,
@@ -175,7 +187,8 @@ fn lz4_compress_with_dict(clevel: u8, src: &[u8], dest: &mut [u8], dict: &[u8]) 
     let Some(dict_len) = len_as_c_int(dict.len()) else {
         return 0;
     };
-    let accel = (10 - i32::from(clevel.clamp(0, 9))).max(1);
+    let _ = clevel;
+    let accel = 1;
 
     unsafe {
         let stream = LZ4_createStream();
@@ -303,44 +316,64 @@ fn blosc_clevel_to_zstd(clevel: u8) -> i32 {
 }
 
 fn zstd_compress(src: &[u8], dest: &mut [u8], clevel: u8) -> i32 {
-    // Use compress_to_buffer to write directly into dest
-    match zstd::bulk::compress_to_buffer(src, dest, blosc_clevel_to_zstd(clevel)) {
-        Ok(n) => n as i32,
-        Err(_) => 0,
+    let n = ZSTD_CCTX.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = ZSTD_createCCtx();
+        }
+        let Some(cctx) = slot.as_deref_mut() else {
+            return ERROR(ErrorCode::MemoryAllocation);
+        };
+        ZSTD_compressCCtx(cctx, dest, src, blosc_clevel_to_zstd(clevel))
+    });
+    if ERR_isError(n) {
+        0
+    } else {
+        n as i32
     }
 }
 
 fn zstd_compress_with_dict(src: &[u8], dest: &mut [u8], clevel: u8, dict: &[u8]) -> i32 {
-    match zstd::bulk::Compressor::with_dictionary(blosc_clevel_to_zstd(clevel), dict)
-        .and_then(|mut compressor| compressor.compress_to_buffer(src, dest))
-    {
-        Ok(n) => n as i32,
-        Err(_) => 0,
+    let n = ZSTD_DICT_CCTX.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = ZSTD_createCCtx();
+        }
+        let Some(cctx) = slot.as_deref_mut() else {
+            return ERROR(ErrorCode::MemoryAllocation);
+        };
+        ZSTD_compress_usingDict(cctx, dest, src, dict, blosc_clevel_to_zstd(clevel))
+    });
+    if ERR_isError(n) {
+        0
+    } else {
+        n as i32
     }
 }
 
 fn zstd_decompress(src: &[u8], dest: &mut [u8]) -> i32 {
-    ZSTD_DECOMPRESSOR.with(|slot| {
+    let n = ZSTD_DCTX.with(|slot| {
         let mut slot = slot.borrow_mut();
-        if slot.is_none() {
-            *slot = zstd::bulk::Decompressor::new().ok();
-        }
-        match slot
-            .as_mut()
-            .and_then(|decompressor| decompressor.decompress_to_buffer(src, dest).ok())
-        {
-            Some(n) => n as i32,
-            None => -1,
-        }
-    })
+        let (dctx, entropy_rep, xxh) = &mut *slot;
+        *entropy_rep = ZSTD_decoder_entropy_rep::default();
+        ZSTD_decompressDCtx(dctx, entropy_rep, xxh, dest, src)
+    });
+    if ERR_isError(n) {
+        -1
+    } else {
+        n as i32
+    }
 }
 
 fn zstd_decompress_with_dict(src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
-    match zstd::bulk::Decompressor::with_dictionary(dict)
-        .and_then(|mut decompressor| decompressor.decompress_to_buffer(src, dest))
-    {
-        Ok(n) => n as i32,
-        Err(_) => -1,
+    let n = ZSTD_DICT_DCTX.with(|slot| {
+        let mut dctx = slot.borrow_mut();
+        ZSTD_decompress_usingDict(&mut dctx, dest, src, dict)
+    });
+    if ERR_isError(n) {
+        -1
+    } else {
+        n as i32
     }
 }
 

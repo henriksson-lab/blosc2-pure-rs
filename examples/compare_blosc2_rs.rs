@@ -130,6 +130,11 @@ mod enabled {
         )
     }
 
+    fn rust_compressed(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> Vec<u8> {
+        let cparams = rust_cparams(codec, filter, nthreads);
+        compress::compress(data, &cparams).unwrap()
+    }
+
     fn bench_rust_into(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> (usize, f64) {
         let cparams = rust_cparams(codec, filter, nthreads);
         let compressed = compress::compress(data, &cparams).unwrap();
@@ -242,6 +247,37 @@ mod enabled {
         )
     }
 
+    fn c_compressed(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> Vec<u8> {
+        blosc2::set_nthreads(nthreads);
+        blosc2::compress(
+            data,
+            Some(4),
+            Some(CLevel::Five),
+            Some(c_filter(filter)),
+            Some(c_codec(codec)),
+        )
+        .unwrap()
+    }
+
+    fn compressed_parity(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> (bool, bool) {
+        let rust = rust_compressed(data, codec, filter, nthreads);
+        let c = c_compressed(data, codec, filter, nthreads);
+        let same_compressed = rust == c;
+        if compress_only() {
+            return (same_compressed, true);
+        }
+        let rust_decoded =
+            compress::decompress_with_threads(&rust, nthreads.try_into().unwrap()).unwrap() == data;
+        let c_decoded_by_rust =
+            compress::decompress_with_threads(&c, nthreads.try_into().unwrap()).unwrap() == data;
+        let rust_decoded_by_c = blosc2::decompress::<u8>(&rust).unwrap() == data;
+        let c_decoded = blosc2::decompress::<u8>(&c).unwrap() == data;
+        (
+            same_compressed,
+            rust_decoded && c_decoded_by_rust && rust_decoded_by_c && c_decoded,
+        )
+    }
+
     fn run_case(label: &str, data: &[u8], codec: u8, filter: u8, nthreads: usize) {
         if run_rust_only() {
             let (rust_size, rust_c, rust_d) = bench_rust(data, codec, filter, nthreads);
@@ -265,7 +301,9 @@ mod enabled {
             {
                 let (_, rust_into_d) = bench_rust_into(data, codec, filter, nthreads);
                 let (_, blosc1_into_d) = bench_blosc1_into(data, codec, filter, nthreads);
-                println!("{label} @ {nthreads} thread(s): pure decompress_into MB/s={rust_into_d:.1}");
+                println!(
+                    "{label} @ {nthreads} thread(s): pure decompress_into MB/s={rust_into_d:.1}"
+                );
                 println!(
                     "{label} @ {nthreads} thread(s): pure blosc1_decompress MB/s={blosc1_into_d:.1}"
                 );
@@ -293,17 +331,18 @@ mod enabled {
 
         let (rust_size, rust_c, rust_d) = bench_rust(data, codec, filter, nthreads);
         let (c_size, c_c, c_d) = bench_c(data, codec, filter, nthreads);
+        let (same_compressed, same_decompressed) = compressed_parity(data, codec, filter, nthreads);
         if compress_only() {
             println!(
-                "{label} @ {nthreads} thread(s): csize pure={rust_size} blosc2-rs={c_size}; compress MB/s pure={rust_c:.1} blosc2-rs={c_c:.1}"
+                "{label} @ {nthreads} thread(s): csize pure={rust_size} blosc2-rs={c_size}; same compressed bytes={same_compressed}; compress MB/s pure={rust_c:.1} blosc2-rs={c_c:.1}"
             );
         } else if decompress_only() {
             println!(
-                "{label} @ {nthreads} thread(s): csize pure={rust_size} blosc2-rs={c_size}; decompress MB/s pure={rust_d:.1} blosc2-rs={c_d:.1}"
+                "{label} @ {nthreads} thread(s): csize pure={rust_size} blosc2-rs={c_size}; same compressed bytes={same_compressed}; same decompressed bytes={same_decompressed}; decompress MB/s pure={rust_d:.1} blosc2-rs={c_d:.1}"
             );
         } else {
             println!(
-                "{label} @ {nthreads} thread(s): csize pure={rust_size} blosc2-rs={c_size}; compress MB/s pure={rust_c:.1} blosc2-rs={c_c:.1}; decompress MB/s pure={rust_d:.1} blosc2-rs={c_d:.1}"
+                "{label} @ {nthreads} thread(s): csize pure={rust_size} blosc2-rs={c_size}; same compressed bytes={same_compressed}; same decompressed bytes={same_decompressed}; compress MB/s pure={rust_c:.1} blosc2-rs={c_c:.1}; decompress MB/s pure={rust_d:.1} blosc2-rs={c_d:.1}"
             );
         }
         if !compress_only()
@@ -314,7 +353,9 @@ mod enabled {
             let (_, rust_into_d) = bench_rust_into(data, codec, filter, nthreads);
             let (_, blosc1_into_d) = bench_blosc1_into(data, codec, filter, nthreads);
             println!("{label} @ {nthreads} thread(s): pure decompress_into MB/s={rust_into_d:.1}");
-            println!("{label} @ {nthreads} thread(s): pure blosc1_decompress MB/s={blosc1_into_d:.1}");
+            println!(
+                "{label} @ {nthreads} thread(s): pure blosc1_decompress MB/s={blosc1_into_d:.1}"
+            );
         }
     }
 

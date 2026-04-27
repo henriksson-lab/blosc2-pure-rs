@@ -75,7 +75,7 @@ fn get_run(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usize) -> usiz
     let x8 = u64::from_ne_bytes([x; 8]);
     let base = data.as_ptr();
 
-    while ip + 8 <= ip_bound && refp + 8 <= data.len() {
+    while ip + 8 < ip_bound && refp + 8 <= data.len() {
         let ref_word = unsafe { std::ptr::read_unaligned(base.add(refp).cast::<u64>()) };
         if ref_word != x8 {
             let matched = matching_prefix_len(ref_word, x8);
@@ -112,19 +112,22 @@ unsafe fn get_match_16_x86_64(
     use std::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
     let base = data.as_ptr();
 
-    while ip + 16 <= ip_bound && refp + 16 <= data.len() {
+    while ip + 16 < ip_bound && refp + 16 <= data.len() {
         let lhs = _mm_loadu_si128(base.add(ip) as *const __m128i);
         let rhs = _mm_loadu_si128(base.add(refp) as *const __m128i);
         let cmp = _mm_cmpeq_epi8(lhs, rhs);
         let mask = _mm_movemask_epi8(cmp) as u32;
         if mask != 0xFFFF {
-            return ip + ((!mask).trailing_zeros() as usize);
+            return ip + ((!mask).trailing_zeros() as usize) + 1;
         }
         ip += 16;
         refp += 16;
     }
     let end = ip + (ip_bound - ip).min(data.len() - refp);
-    while ip < end && *base.add(refp) == *base.add(ip) {
+    while ip < end {
+        if *base.add(refp) != *base.add(ip) {
+            return ip + 1;
+        }
         ip += 1;
         refp += 1;
     }
@@ -137,19 +140,22 @@ unsafe fn get_match_16_x86(data: &[u8], mut ip: usize, ip_bound: usize, mut refp
     use std::arch::x86::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
     let base = data.as_ptr();
 
-    while ip + 16 <= ip_bound && refp + 16 <= data.len() {
+    while ip + 16 < ip_bound && refp + 16 <= data.len() {
         let lhs = _mm_loadu_si128(base.add(ip) as *const __m128i);
         let rhs = _mm_loadu_si128(base.add(refp) as *const __m128i);
         let cmp = _mm_cmpeq_epi8(lhs, rhs);
         let mask = _mm_movemask_epi8(cmp) as u32;
         if mask != 0xFFFF {
-            return ip + ((!mask).trailing_zeros() as usize);
+            return ip + ((!mask).trailing_zeros() as usize) + 1;
         }
         ip += 16;
         refp += 16;
     }
     let end = ip + (ip_bound - ip).min(data.len() - refp);
-    while ip < end && *base.add(refp) == *base.add(ip) {
+    while ip < end {
+        if *base.add(refp) != *base.add(ip) {
+            return ip + 1;
+        }
         ip += 1;
         refp += 1;
     }
@@ -159,19 +165,22 @@ unsafe fn get_match_16_x86(data: &[u8], mut ip: usize, ip_bound: usize, mut refp
 #[inline]
 fn get_match_generic(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usize) -> usize {
     let base = data.as_ptr();
-    while ip + 8 <= ip_bound && refp + 8 <= data.len() {
+    while ip + 8 < ip_bound && refp + 8 <= data.len() {
         let ip_word = unsafe { std::ptr::read_unaligned(base.add(ip).cast::<u64>()) };
         let ref_word = unsafe { std::ptr::read_unaligned(base.add(refp).cast::<u64>()) };
         if ip_word != ref_word {
             let matched = matching_prefix_len(ip_word, ref_word);
-            return (ip + matched).min(ip_bound);
+            return (ip + matched + 1).min(ip_bound);
         }
         ip += 8;
         refp += 8;
     }
     let end = ip + (ip_bound - ip).min(data.len() - refp);
     unsafe {
-        while ip < end && *base.add(refp) == *base.add(ip) {
+        while ip < end {
+            if *base.add(refp) != *base.add(ip) {
+                return ip + 1;
+            }
             ip += 1;
             refp += 1;
         }
@@ -523,7 +532,14 @@ fn get_cratio_with_htab(
             ip = anchor + 4;
             let ref_after = ref_offset + 4;
             let distance_dec = distance - 1;
-            ip = get_run_or_match(data, ip, ip_bound, ref_after, distance_dec == 0, use_sse2_match);
+            ip = get_run_or_match(
+                data,
+                ip,
+                ip_bound,
+                ref_after,
+                distance_dec == 0,
+                use_sse2_match,
+            );
 
             debug_assert!(ip >= ipshift);
             ip -= ipshift;
@@ -596,7 +612,14 @@ fn get_cratio_with_htab(
             ip = anchor + 4;
             let ref_after = ref_offset + 4;
             let distance_dec = distance - 1;
-            ip = get_run_or_match(data, ip, ip_bound, ref_after, distance_dec == 0, use_sse2_match);
+            ip = get_run_or_match(
+                data,
+                ip,
+                ip_bound,
+                ref_after,
+                distance_dec == 0,
+                use_sse2_match,
+            );
 
             debug_assert!(ip >= ipshift);
             ip -= ipshift;
@@ -654,8 +677,8 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
         return 0;
     }
 
-    let ipshift: usize = 4;
-    let minlen: usize = 4;
+    let ipshift: usize = 3;
+    let minlen: usize = 3;
 
     let hashlog_table: [u8; 10] = [
         0,
@@ -778,7 +801,14 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
             ip = anchor + 4;
             let ref_after = ref_offset + 4;
             let distance = distance - 1;
-            ip = get_run_or_match(input, ip, ip_bound, ref_after, distance == 0, use_sse2_match);
+            ip = get_run_or_match(
+                input,
+                ip,
+                ip_bound,
+                ref_after,
+                distance == 0,
+                use_sse2_match,
+            );
 
             debug_assert!(ip >= ipshift);
             ip -= ipshift;
@@ -889,7 +919,14 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
             ip = anchor + 4;
             let ref_after = ref_offset + 4;
             let distance = distance - 1;
-            ip = get_run_or_match(input, ip, ip_bound, ref_after, distance == 0, use_sse2_match);
+            ip = get_run_or_match(
+                input,
+                ip,
+                ip_bound,
+                ref_after,
+                distance == 0,
+                use_sse2_match,
+            );
 
             debug_assert!(ip >= ipshift);
             ip -= ipshift;
@@ -1006,7 +1043,14 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
             ip = anchor + 4;
             let ref_after = ref_offset + 4;
             let distance = distance - 1;
-            ip = get_run_or_match(input, ip, ip_bound, ref_after, distance == 0, use_sse2_match);
+            ip = get_run_or_match(
+                input,
+                ip,
+                ip_bound,
+                ref_after,
+                distance == 0,
+                use_sse2_match,
+            );
 
             debug_assert!(ip >= ipshift);
             ip -= ipshift;
@@ -1404,9 +1448,7 @@ mod tests {
     // one (to eat the first differing byte too). That's the C "one past
     // mismatch" convention.
     //
-    // If Rust's `matching_prefix_len` returns the exact count, the function
-    // advances `ip` by exactly the count — one byte short. These tests pin
-    // that down so the behavior is intentional and observed.
+    // Rust must therefore return the C-compatible one-past-mismatch position.
 
     #[test]
     fn get_match_generic_stops_at_first_differing_byte_in_word() {
@@ -1430,13 +1472,10 @@ mod tests {
         // ip_bound must allow the 8-byte word read at ip_pos (ip + 8 <= ip_bound).
         let returned = get_match_generic(&data, ip_pos, ip_pos + 16, ref_pos);
 
-        // Observation: Rust stops AT the mismatch (matching_prefix_len returns
-        // 4, ip advances by 4). This is the documented baseline — any future
-        // change must update FINDINGS.md SUSPECT #10 accordingly.
         assert_eq!(
             returned - ip_pos,
-            4,
-            "Rust get_match_generic advances ip by exact matched-byte count"
+            5,
+            "Rust get_match_generic follows C's one-past-mismatch convention"
         );
     }
 
@@ -1475,16 +1514,13 @@ mod tests {
         let returned = get_match_generic(&data, 32, 48, 0);
         assert_eq!(
             returned - 32,
-            8,
-            "First word all match, second word byte 0 differs → advance 8 exactly"
+            9,
+            "First word all match, second word byte 0 differs, so advance one past the mismatch"
         );
     }
 
-    // End-to-end closure of SUSPECT #10: even though get_match_generic advances
-    // ip "one byte short" relative to C's post-increment idiom, the compressed
-    // output still decompresses correctly end-to-end. Capture that as a direct
-    // test so regressions in get_match that silently break cross-compat surface
-    // as test failures here.
+    // End-to-end closure of SUSPECT #10: get_match_generic must match C's
+    // post-increment convention while still producing round-trippable output.
     #[test]
     fn rust_blosclz_output_roundtrips_with_nontrivial_match_lengths() {
         // Build data with a known long match at a near distance so the

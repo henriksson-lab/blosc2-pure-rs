@@ -759,8 +759,41 @@ fn stored_block_len(dont_split: bool, is_leftover: bool, typesize: usize, bsize:
     bsize + nstreams * 4
 }
 
+fn compressed_block_limit(
+    chunk: &[u8],
+    header: &ChunkHeader,
+    src_pos: usize,
+    nblocks: usize,
+) -> Result<usize, &'static str> {
+    let header_len = header.header_len();
+    let chunk_limit = header.cbytes as usize;
+    let mut block_limit = chunk_limit;
+    for idx in 0..nblocks {
+        let bstart_pos = header_len + idx * 4;
+        let bstart_end = bstart_pos
+            .checked_add(4)
+            .ok_or("Invalid block table offset")?;
+        if bstart_end > chunk_limit {
+            return Err("Chunk too small for bstarts");
+        }
+        let pos_i32 = i32::from_le_bytes(chunk[bstart_pos..bstart_end].try_into().unwrap());
+        if pos_i32 < 0 {
+            continue;
+        }
+        let pos = pos_i32 as usize;
+        if pos > chunk_limit {
+            return Err("Invalid block offset");
+        }
+        if pos > src_pos && pos < block_limit {
+            block_limit = pos;
+        }
+    }
+    Ok(block_limit)
+}
+
 fn can_use_memcpy_chunk(cparams: &CParams, filters_are_noop: bool) -> bool {
-    filters_are_noop && cparams.prefilter.is_none() && !cparams.use_dict
+    let _ = (cparams, filters_are_noop);
+    false
 }
 
 fn should_emit_memcpy_chunk_early(
@@ -859,11 +892,7 @@ fn maybe_convert_to_memcpy_chunk(
 }
 
 fn udcompcode_for_header(compcode: u8) -> u8 {
-    if compcode_to_compformat(compcode) == BLOSC_UDCODEC_FORMAT {
-        compcode
-    } else {
-        0
-    }
+    compcode
 }
 
 /// Detect if all bytes in a block are the same value (run detection).
@@ -918,13 +947,9 @@ fn compress_block_with_scratch(
     prefilter_buf: &mut Vec<u8>,
 ) -> Result<(Vec<u8>, bool), &'static str> {
     let bsize = block_data.len();
-    let block_data = if let Some(filtered) = apply_prefilter(
-        cparams,
-        block_data,
-        block_start,
-        blocksize,
-        prefilter_buf,
-    )? {
+    let block_data = if let Some(filtered) =
+        apply_prefilter(cparams, block_data, block_start, blocksize, prefilter_buf)?
+    {
         filtered
     } else {
         block_data
@@ -1129,7 +1154,7 @@ fn compress_pre_filtered_block_with_scratch(
     let mut result = Vec::with_capacity(stored_block_len(dont_split, is_leftover, typesize, bsize));
     let mut result_len = 0usize;
     let mut all_zero_runs = true;
-    let max_out = neblock + (neblock / 255) + 32;
+    let max_out = neblock;
 
     for stream_idx in 0..nstreams {
         let stream_start = stream_idx * neblock;
@@ -1277,17 +1302,20 @@ fn train_zstd_dict(samples: &[Vec<u8>], nbytes: usize) -> Option<Vec<u8>> {
         return None;
     }
 
-    let mut sample_data = Vec::with_capacity(samples.iter().map(Vec::len).sum());
-    let mut sample_sizes = Vec::with_capacity(samples.len());
+    let mut dict = Vec::with_capacity(dict_maxsize);
     for sample in samples {
         if sample.is_empty() {
             return None;
         }
-        sample_sizes.push(sample.len());
-        sample_data.extend_from_slice(sample);
+        let remaining = dict_maxsize.saturating_sub(dict.len());
+        if remaining == 0 {
+            break;
+        }
+        let take = remaining.min(sample.len());
+        dict.extend_from_slice(&sample[sample.len() - take..]);
     }
 
-    zstd::dict::from_continuous(&sample_data, &sample_sizes, dict_maxsize).ok()
+    (dict.len() >= BLOSC2_MINUSEFULDICT).then_some(dict)
 }
 
 fn build_lz4_dict(samples: &[Vec<u8>], nbytes: usize) -> Option<Vec<u8>> {
@@ -1532,7 +1560,10 @@ pub fn compress(src: &[u8], cparams: &CParams) -> Result<Vec<u8>, &'static str> 
 
         let compressed_blocks: Vec<(Vec<u8>, bool)> = compressed_blocks
             .into_iter()
-            .map(|slot| slot.into_inner().expect("parallel block slot was not written"))
+            .map(|slot| {
+                slot.into_inner()
+                    .expect("parallel block slot was not written")
+            })
             .collect();
 
         let total_compressed: usize = compressed_blocks.iter().map(|(b, _)| b.len()).sum();
@@ -1655,7 +1686,7 @@ pub fn compress(src: &[u8], cparams: &CParams) -> Result<Vec<u8>, &'static str> 
 
                 block_all_zero_runs = false;
 
-                let max_out = neblock + (neblock / 255) + 32;
+                let max_out = neblock;
                 ensure_len(&mut output, output_pos + 4 + max_out);
                 if max_out > compress_buf.len() {
                     compress_buf.resize(max_out, 0);
@@ -2018,27 +2049,7 @@ fn decompress_block_data(
         }
     }
 
-    let block_limit = if block_idx + 1 < nblocks {
-        let next_bstart_pos = header_len + (block_idx + 1) * 4;
-        let next_bstart_end = next_bstart_pos
-            .checked_add(4)
-            .ok_or("Invalid block table offset")?;
-        if next_bstart_end > chunk_limit {
-            return Err("Chunk too small for bstarts");
-        }
-        let next_src_pos_i32 =
-            i32::from_le_bytes(chunk[next_bstart_pos..next_bstart_end].try_into().unwrap());
-        if next_src_pos_i32 < 0 {
-            return Err("Invalid negative block offset");
-        }
-        let next_src_pos = next_src_pos_i32 as usize;
-        if next_src_pos < src_pos || next_src_pos > chunk_limit {
-            return Err("Invalid block offset order");
-        }
-        next_src_pos
-    } else {
-        chunk_limit
-    };
+    let block_limit = compressed_block_limit(chunk, header, src_pos, nblocks)?;
 
     let nstreams = stream_count(dont_split, is_leftover, typesize, bsize);
     let neblock = bsize / nstreams;
@@ -2191,27 +2202,7 @@ fn decompress_block_into(
         }
     }
 
-    let block_limit = if block_idx + 1 < nblocks {
-        let next_bstart_pos = header_len + (block_idx + 1) * 4;
-        let next_bstart_end = next_bstart_pos
-            .checked_add(4)
-            .ok_or("Invalid block table offset")?;
-        if next_bstart_end > chunk_limit {
-            return Err("Chunk too small for bstarts");
-        }
-        let next_src_pos_i32 =
-            i32::from_le_bytes(chunk[next_bstart_pos..next_bstart_end].try_into().unwrap());
-        if next_src_pos_i32 < 0 {
-            return Err("Invalid negative block offset");
-        }
-        let next_src_pos = next_src_pos_i32 as usize;
-        if next_src_pos < src_pos || next_src_pos > chunk_limit {
-            return Err("Invalid block offset order");
-        }
-        next_src_pos
-    } else {
-        chunk_limit
-    };
+    let block_limit = compressed_block_limit(chunk, header, src_pos, nblocks)?;
 
     let nstreams = stream_count(dont_split, is_leftover, typesize, bsize);
     let neblock = bsize / nstreams;
@@ -3218,49 +3209,52 @@ fn decompress_into_with_header(
         // Delta filter requires block 0 decoded first because later blocks
         // reference it. Reuse scratch buffers while writing finished blocks
         // directly into the final output buffer.
-        with_decompress_scratch(blocksize, |scratch1, scratch2| -> Result<(), &'static str> {
-            let block0_end = blocksize.min(nbytes);
-            decompress_block_into(
-                chunk,
-                0,
-                0,
-                &mut output[..block0_end],
-                blocksize,
-                nblocks == 1 && block0_end < blocksize,
-                header,
-                None,
-                dict,
-                dparams,
-                scratch1,
-                scratch2,
-            )?;
-
-            for block_idx in 1..nblocks {
-                let block_start = block_idx * blocksize;
-                let block_end = (block_start + blocksize).min(nbytes);
-                let bsize = block_end - block_start;
-                let is_leftover = block_idx == nblocks - 1 && bsize < blocksize;
-                let (before, tail) = output.split_at_mut(block_start);
-                let dref_end = blocksize.min(before.len());
-                let dref = &before[..dref_end];
-
+        with_decompress_scratch(
+            blocksize,
+            |scratch1, scratch2| -> Result<(), &'static str> {
+                let block0_end = blocksize.min(nbytes);
                 decompress_block_into(
                     chunk,
-                    block_idx,
-                    block_start,
-                    &mut tail[..bsize],
+                    0,
+                    0,
+                    &mut output[..block0_end],
                     blocksize,
-                    is_leftover,
+                    nblocks == 1 && block0_end < blocksize,
                     header,
-                    Some(dref),
+                    None,
                     dict,
                     dparams,
                     scratch1,
                     scratch2,
                 )?;
-            }
-            Ok(())
-        })?;
+
+                for block_idx in 1..nblocks {
+                    let block_start = block_idx * blocksize;
+                    let block_end = (block_start + blocksize).min(nbytes);
+                    let bsize = block_end - block_start;
+                    let is_leftover = block_idx == nblocks - 1 && bsize < blocksize;
+                    let (before, tail) = output.split_at_mut(block_start);
+                    let dref_end = blocksize.min(before.len());
+                    let dref = &before[..dref_end];
+
+                    decompress_block_into(
+                        chunk,
+                        block_idx,
+                        block_start,
+                        &mut tail[..bsize],
+                        blocksize,
+                        is_leftover,
+                        header,
+                        Some(dref),
+                        dict,
+                        dparams,
+                        scratch1,
+                        scratch2,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
     } else if dparams.nthreads > 1 && nblocks > 1 {
         // Parallel decompression (no delta filter). Use fixed contiguous block
         // ranges per worker so each thread can reuse its scratch across
@@ -3287,8 +3281,7 @@ fn decompress_into_with_header(
                                     let block_start = block_idx * blocksize;
                                     let block_end = (block_start + blocksize).min(nbytes);
                                     let bsize = block_end - block_start;
-                                    let is_leftover =
-                                        block_idx == nblocks - 1 && bsize < blocksize;
+                                    let is_leftover = block_idx == nblocks - 1 && bsize < blocksize;
                                     let block_out = unsafe {
                                         std::slice::from_raw_parts_mut(
                                             (output_addr as *mut u8).add(block_start),
@@ -3332,30 +3325,33 @@ fn decompress_into_with_header(
     } else {
         // Sequential decompression: reuse scratch buffers and write finished
         // blocks directly into the final output buffer.
-        with_decompress_scratch(blocksize, |scratch1, scratch2| -> Result<(), &'static str> {
-            for block_idx in 0..nblocks {
-                let block_start = block_idx * blocksize;
-                let block_end = (block_start + blocksize).min(nbytes);
-                let bsize = block_end - block_start;
-                let is_leftover = block_idx == nblocks - 1 && bsize < blocksize;
+        with_decompress_scratch(
+            blocksize,
+            |scratch1, scratch2| -> Result<(), &'static str> {
+                for block_idx in 0..nblocks {
+                    let block_start = block_idx * blocksize;
+                    let block_end = (block_start + blocksize).min(nbytes);
+                    let bsize = block_end - block_start;
+                    let is_leftover = block_idx == nblocks - 1 && bsize < blocksize;
 
-                decompress_block_into(
-                    chunk,
-                    block_idx,
-                    block_start,
-                    &mut output[block_start..block_end],
-                    blocksize,
-                    is_leftover,
-                    header,
-                    None,
-                    dict,
-                    dparams,
-                    scratch1,
-                    scratch2,
-                )?;
-            }
-            Ok(())
-        })?;
+                    decompress_block_into(
+                        chunk,
+                        block_idx,
+                        block_start,
+                        &mut output[block_start..block_end],
+                        blocksize,
+                        is_leftover,
+                        header,
+                        None,
+                        dict,
+                        dparams,
+                        scratch1,
+                        scratch2,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
     }
 
     Ok(nbytes)
@@ -3840,7 +3836,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nofilter_incompressible_chunk_uses_memcpyed_fast_path() {
+    fn test_nofilter_incompressible_chunk_uses_regular_blocks_for_c_parity() {
         let mut data = Vec::with_capacity(256 * 1024);
         let mut state = 0x1234_5678_u32;
         for i in 0..((256 * 1024) / 4) {
@@ -3861,12 +3857,8 @@ mod tests {
         let compressed = compress(&data, &cparams).unwrap();
         let header = ChunkHeader::read(&compressed).unwrap();
         assert!(
-            header.memcpyed(),
-            "expected incompressible no-filter chunk to use memcpyed"
-        );
-        assert_eq!(
-            header.cbytes as usize,
-            BLOSC_EXTENDED_HEADER_LENGTH + data.len()
+            !header.memcpyed(),
+            "regular block payloads preserve C-Blosc2 byte parity"
         );
 
         let restored = decompress(&compressed).unwrap();
