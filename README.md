@@ -4,10 +4,9 @@ A pure Rust implementation of the [Blosc2](https://www.blosc.org/) high-performa
 
 Blosc2 is a block-oriented compressor optimized for binary data such as numerical arrays, tensors, and structured formats. It applies a filter pipeline (shuffle, bitshuffle, delta) before compression to exploit data patterns, then compresses with one of several codecs.
 
-The library is feature complete except for one edge case (get in touch if this is a problem). The speed is more or less comparable to the C implementation (benchmarks below). 
+The library is feature complete except for one edge case (get in touch if this is a problem). The speed is more or less comparable to the C implementation (benchmarks below).
 
-* 2026-04-27: Speed improved a further ton. now on par
-* 2026-04-24: Speed improved a ton
+* 2026-04-27: Speed is now broadly comparable to, or faster than, C-Blosc2 on the default benchmark workload.
 * 2026-04-22: Ready for testing, passing current battery of tests. But be vigilant that errors may still remain; report if possible
 
 
@@ -295,44 +294,47 @@ assert_eq!(restored, data);
 
 ## Benchmarks
 
-These are local measurements from April 24, 2026, not universal truths. They come from the
-checked-in comparison example:
+These are local measurements from April 27, 2026, not universal truths. They come from the
+checked-in comparison examples and compare against
+[`blosc2-rs`](https://crates.io/crates/blosc2-rs), which wraps the original C-Blosc2 library.
 
 ```bash
 cargo run --release --example compare_blosc2_rs --features compare-blosc2-rs
+cargo run --release --example bench_blosclz_gap --features _ffi
 ```
 
-The workload is the example's default 10 MiB `float32` signal-with-noise buffer at `clevel=5`
-and `typesize=4`. The comparison is against
-[`blosc2-rs`](https://crates.io/crates/blosc2-rs), which wraps the original C-Blosc2 library.
-The example now respects `compress` vs `decompress` mode correctly; older README numbers were
-removed because they came from an earlier harness revision.
+The workload is the examples' default 10 MiB `float32` signal-with-noise buffer at `clevel=5`
+and `typesize=4`. Ratios are pure Rust speed divided by C-Blosc2 wrapper speed.
 
-Single-thread results:
+### Full Comparison
 
-| Case | Pure size | `blosc2-rs` size | Pure compress (MB/s) | `blosc2-rs` compress (MB/s) | Compress ratio | Pure decompress (MB/s) | `blosc2-rs` decompress (MB/s) | Decompress ratio |
-|------|----------:|-----------------:|---------------------:|----------------------------:|---------------:|-----------------------:|------------------------------:|-----------------:|
-| BloscLZ, no filter | 10485792 | 10486432 | **4261.7** | 874.0 | **4.88x** | 10110.9 | **10751.9** | 0.94x |
-| BloscLZ, shuffle | 8037478 | 8033115 | **900.4** | 598.9 | **1.50x** | **5080.7** | 4746.1 | **1.07x** |
-| LZ4, shuffle | 7941596 | 7823630 | **986.7** | 461.8 | **2.14x** | **2249.9** | 1669.2 | **1.35x** |
-| Zstd, shuffle | 7259575 | 7259575 | **91.4** | 88.9 | **1.03x** | **1715.9** | 1652.8 | **1.04x** |
+| Case | Threads | Size pure/C | Compress pure/C (MB/s) | Compress ratio | Decompress pure/C (MB/s) | Decompress ratio |
+|------|--------:|------------:|-----------------------:|---------------:|-------------------------:|-----------------:|
+| BloscLZ, no filter | 1 | 10485792 / 10486432 | 4353.8 / 914.9 | **4.76x** | 10402.2 / 10879.7 | 0.96x |
+| BloscLZ, shuffle | 1 | 8033115 / 8033115 | 900.0 / 602.1 | **1.49x** | 4679.7 / 4596.5 | **1.02x** |
+| LZ4, shuffle | 1 | 7823630 / 7823630 | 651.3 / 509.8 | **1.28x** | 2537.0 / 2546.5 | 1.00x |
+| Zstd, shuffle | 1 | 7259575 / 7259575 | 80.9 / 92.2 | 0.88x | 1602.8 / 1574.3 | **1.02x** |
+| BloscLZ, no filter | 4 | 10485792 / 10486432 | 4452.3 / 2163.9 | **2.06x** | 20600.3 / 28889.3 | 0.71x |
+| BloscLZ, shuffle | 4 | 8033115 / 8033115 | 2209.0 / 2067.4 | **1.07x** | 18190.4 / 16003.2 | **1.14x** |
+| LZ4, shuffle | 4 | 7823630 / 7823630 | 1656.0 / 1550.5 | **1.07x** | 9084.4 / 4703.9 | **1.93x** |
+| Zstd, shuffle | 4 | 7259575 / 7259575 | 269.4 / 323.3 | 0.83x | 5914.2 / 6187.0 | 0.96x |
 
-Four-thread results:
+### Focused BloscLZ Comparison
 
-| Case | Pure size | `blosc2-rs` size | Pure compress (MB/s) | `blosc2-rs` compress (MB/s) | Compress ratio | Pure decompress (MB/s) | `blosc2-rs` decompress (MB/s) | Decompress ratio |
-|------|----------:|-----------------:|---------------------:|----------------------------:|---------------:|-----------------------:|------------------------------:|-----------------:|
-| BloscLZ, no filter | 10485792 | 10486432 | **4245.5** | 2278.5 | **1.86x** | **20553.5** | 16314.4 | **1.26x** |
-| BloscLZ, shuffle | 8037478 | 8033115 | **1909.5** | 1448.7 | **1.32x** | 8016.3 | **11655.3** | 0.69x |
-| LZ4, shuffle | 7941596 | 7823630 | **2233.8** | 1255.4 | **1.78x** | **8111.0** | 5381.3 | **1.51x** |
-| Zstd, shuffle | 7259575 | 7259575 | **313.1** | 311.3 | **1.01x** | 4714.5 | **6108.6** | 0.77x |
+| Case | Size pure/C | Compress pure/C (MB/s) | Compress ratio | Decompress pure/C (MB/s) | Decompress ratio |
+|------|------------:|-----------------------:|---------------:|-------------------------:|-----------------:|
+| BloscLZ, no filter | 10485792 / 10486432 | 4385.5 / 2424.2 | **1.81x** | 10371.0 / 10247.0 | **1.01x** |
+| BloscLZ, shuffle | 8033115 / 8024160 | 975.6 / 845.3 | **1.15x** | 4923.4 / 5082.2 | 0.97x |
+| Unshuffle4 dispatch/scalar | n/a | n/a | n/a | 11131.3 / 11000.6 | **1.01x** |
 
 Current reading:
 
-- `blosc2-pure-rs` is faster on all compression rows in this run, with Zstd essentially tied.
-- Single-thread decompression is competitive across the board; only BloscLZ no-filter is modestly behind in this mixed run.
-- Multithreaded decompression is mixed: pure Rust is ahead on BloscLZ no-filter and LZ4, behind on BloscLZ shuffle and Zstd in this particular run.
-- The no-filter BloscLZ rows should be read as a stored-chunk fast-path benchmark, because the pure Rust implementation chooses a chunk-level `memcpyed` representation there.
-- Some decompression rows are still measurement-sensitive; for serious tuning, rerun individual cases with `BLOSC2_COMPARE_ITERS=...`.
+- Pure Rust is faster than C-Blosc2 on most BloscLZ and LZ4 compression rows in this run.
+- Four-thread decompression is mixed: pure Rust is faster for BloscLZ shuffle and LZ4 shuffle, while C-Blosc2 is faster for no-filter BloscLZ and slightly faster for Zstd.
+- Zstd compression remains the main weakness; profiling shows most time inside `zstd-pure-rs`'s core lazy compressor rather than this crate's block orchestration.
+- The no-filter BloscLZ row uses a whole-chunk `memcpyed` fast path when sampled blocks would otherwise be stored verbatim. This improves speed and size but means the compressed bytes are not byte-identical to C-Blosc2.
+- All rows decode to identical bytes.
+- For serious tuning, rerun individual cases with `BLOSC2_COMPARE_ITERS=...`, `BLOSC2_COMPARE_CASE=...`, and `BLOSC2_COMPARE_THREADS=...`.
 
 ## Codec Comparison
 

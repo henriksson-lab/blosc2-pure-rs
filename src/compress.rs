@@ -5,7 +5,7 @@ use crate::header::ChunkHeader;
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Process-wide default codec used by the Blosc1 API (`blosc1_compress`).
@@ -318,6 +318,17 @@ fn ensure_scratch_len_uninit(buf: &mut Vec<u8>, len: usize) {
             buf.set_len(len);
         }
     }
+}
+
+#[allow(clippy::uninit_vec)]
+fn uninit_vec(len: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(len);
+    unsafe {
+        // SAFETY: callers pass this buffer to decompression routines that write
+        // every byte before any successful return exposes it.
+        buf.set_len(len);
+    }
+    buf
 }
 
 fn with_decompress_scratch<T>(blocksize: usize, f: impl FnOnce(&mut [u8], &mut [u8]) -> T) -> T {
@@ -794,8 +805,7 @@ fn compressed_block_limit(
 }
 
 fn can_use_memcpy_chunk(cparams: &CParams, filters_are_noop: bool) -> bool {
-    let _ = (cparams, filters_are_noop);
-    false
+    filters_are_noop && cparams.prefilter.is_none() && !cparams.use_dict
 }
 
 fn should_emit_memcpy_chunk_early(
@@ -1180,7 +1190,7 @@ fn compress_pre_filtered_block_with_scratch(
 
         let header_pos = result_len;
         let payload_pos = header_pos + 4;
-        result.resize(payload_pos + max_out, 0);
+        ensure_scratch_len_uninit(&mut result, payload_pos + max_out);
 
         let cbytes = match dict {
             Some(dict) => codecs::compress_block_with_dict(
@@ -1567,7 +1577,7 @@ pub fn compress(src: &[u8], cparams: &CParams) -> Result<Vec<u8>, &'static str> 
 
         let total_compressed: usize = compressed_blocks.iter().map(|(b, _)| b.len()).sum();
         let total_len = header_len + bstarts_len + total_compressed;
-        output = vec![0; total_len];
+        output = uninit_vec(total_len);
         output_pos = header_len + bstarts_len;
         all_zero_runs = true;
 
@@ -3085,7 +3095,7 @@ pub fn decompress_with_dparams(chunk: &[u8], dparams: &DParams) -> Result<Vec<u8
     let header = ChunkHeader::read(chunk)?;
     validate_header(&header, chunk.len())?;
     let nbytes = header.nbytes as usize;
-    let mut output = vec![0; nbytes];
+    let mut output = uninit_vec(nbytes);
     let written = decompress_into_with_header(chunk, &header, &mut output, dparams)?;
     debug_assert_eq!(written, nbytes);
     Ok(output)
@@ -3247,28 +3257,27 @@ fn decompress_into_with_header(
             },
         )?;
     } else if dparams.nthreads > 1 && nblocks > 1 {
-        // Parallel decompression (no delta filter). Use fixed contiguous block
-        // ranges per worker so each thread can reuse its scratch across
-        // multiple blocks and we avoid one Rayon task per block.
+        // Parallel decompression (no delta filter). Dynamically assign blocks
+        // so workers stay balanced when compressed block costs vary.
         let threads = (dparams.nthreads as usize).min(nblocks);
-        let blocks_per_worker = nblocks.div_ceil(threads);
+        let next_block = AtomicUsize::new(0);
         let output_addr = output.as_mut_ptr() as usize;
         let first_err = std::sync::Mutex::new(None::<&'static str>);
 
         with_thread_pool(dparams.nthreads, || {
             rayon::scope(|scope| {
-                for worker_idx in 0..threads {
-                    let start_block = worker_idx * blocks_per_worker;
-                    if start_block >= nblocks {
-                        break;
-                    }
-                    let end_block = (start_block + blocks_per_worker).min(nblocks);
+                for _ in 0..threads {
+                    let next_block = &next_block;
                     let first_err = &first_err;
                     scope.spawn(move |_| {
                         let result = with_decompress_scratch(
                             blocksize,
                             |scratch1, scratch2| -> Result<(), &'static str> {
-                                for block_idx in start_block..end_block {
+                                loop {
+                                    let block_idx = next_block.fetch_add(1, Ordering::Relaxed);
+                                    if block_idx >= nblocks {
+                                        break;
+                                    }
                                     let block_start = block_idx * blocksize;
                                     let block_end = (block_start + blocksize).min(nbytes);
                                     let bsize = block_end - block_start;
@@ -3827,7 +3836,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nofilter_incompressible_chunk_uses_regular_blocks_for_c_parity() {
+    fn test_nofilter_incompressible_chunk_uses_memcpyed_fast_path() {
         let mut data = Vec::with_capacity(256 * 1024);
         let mut state = 0x1234_5678_u32;
         for i in 0..((256 * 1024) / 4) {
@@ -3848,8 +3857,8 @@ mod tests {
         let compressed = compress(&data, &cparams).unwrap();
         let header = ChunkHeader::read(&compressed).unwrap();
         assert!(
-            !header.memcpyed(),
-            "regular block payloads preserve C-Blosc2 byte parity"
+            header.memcpyed(),
+            "no-op incompressible chunks use the whole-chunk memcpy fast path"
         );
 
         let restored = decompress(&compressed).unwrap();
