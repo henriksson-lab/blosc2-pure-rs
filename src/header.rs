@@ -1,35 +1,65 @@
+//! Parsing and writing of the per-chunk Blosc/Blosc2 header.
+//!
+//! Every compressed chunk starts with either a 16-byte Blosc1 header or a
+//! 32-byte extended Blosc2 header. The extended form is signalled by having
+//! both [`BLOSC_DOSHUFFLE`] and [`BLOSC_DOBITSHUFFLE`] set in the flags byte
+//! and carries the filter pipeline, user-defined codec slot, codec metadata,
+//! and the two Blosc2 flag bytes.
+
 use crate::constants::*;
 
-/// Parsed chunk header (32 bytes for extended header).
+/// Parsed chunk header.
+///
+/// Mirrors the on-disk layout: the first seven fields are the legacy 16-byte
+/// header, the remainder lives in the extended 32-byte Blosc2 header.
 #[derive(Debug, Clone, Default)]
 pub struct ChunkHeader {
+    /// Blosc chunk format version.
     pub version: u8,
+    /// Format version of the internal codec stream (normally 1).
     pub versionlz: u8,
+    /// Flags byte: filters applied, memcpy bit, split bit, and codec format code (bits 5-7).
     pub flags: u8,
+    /// Size in bytes of the atomic type.
     pub typesize: u8,
+    /// Uncompressed payload size, not including the header.
     pub nbytes: i32,
+    /// Size in bytes of the internal blocks (or block count when [`BLOSC2_VL_BLOCKS`] is set).
     pub blocksize: i32,
+    /// Total compressed chunk size including the header.
     pub cbytes: i32,
+    /// Filter pipeline (one ID per slot, applied in increasing index order).
     pub filters: [u8; BLOSC2_MAX_FILTERS],
+    /// Per-filter metadata, one byte per slot in [`filters`](Self::filters).
     pub filters_meta: [u8; BLOSC2_MAX_FILTERS],
+    /// User-defined codec ID, valid when the codec format bits equal [`BLOSC_UDCODEC_FORMAT`].
     pub udcompcode: u8,
+    /// Codec metadata byte (codec-specific).
     pub compcode_meta: u8,
+    /// Primary Blosc2 flags byte (dict use, endianness, special values, instrumentation, ...).
     pub blosc2_flags: u8,
+    /// Secondary Blosc2 flags byte (currently only the variable-length-blocks bit).
     pub blosc2_flags2: u8,
 }
 
 impl ChunkHeader {
-    /// Whether this uses the extended 32-byte header.
+    /// Returns `true` if this chunk uses the extended 32-byte Blosc2 header.
+    ///
+    /// Encoded as both the shuffle and bit-shuffle flags being set in the flags byte.
     pub fn is_extended(&self) -> bool {
         (self.flags & BLOSC_DOSHUFFLE != 0) && (self.flags & BLOSC_DOBITSHUFFLE != 0)
     }
 
-    /// Get the compression format code from the flags (bits 5-7).
+    /// Returns the 3-bit codec format code embedded in flags bits 5-7.
     pub fn compformat(&self) -> u8 {
         (self.flags >> 5) & 0x07
     }
 
-    /// Get the actual compressor code.
+    /// Returns the effective codec ID.
+    ///
+    /// For extended headers with a non-zero user-defined codec slot, the value
+    /// from [`udcompcode`](Self::udcompcode) is returned; otherwise the 3-bit
+    /// format code is mapped back to a codec ID via [`compformat_to_compcode`].
     pub fn compcode(&self) -> u8 {
         if self.is_extended() && self.udcompcode != 0 {
             self.udcompcode
@@ -38,32 +68,34 @@ impl ChunkHeader {
         }
     }
 
-    /// Whether the data was memcpyed (not compressed).
+    /// Returns `true` if the payload is a raw memcpy of the source (no compression applied).
     pub fn memcpyed(&self) -> bool {
         self.flags & BLOSC_MEMCPYED != 0
     }
 
-    /// Whether blocks should not be split into streams.
+    /// Returns `true` if blocks must not be split into per-typesize streams.
     pub fn dont_split(&self) -> bool {
         self.flags & BLOSC_DONT_SPLIT != 0
     }
 
-    /// Get the special value type (bits 4-6 of blosc2_flags).
+    /// Returns the 3-bit special-value type stored in bits 4-6 of `blosc2_flags`.
+    ///
+    /// See the `BLOSC2_SPECIAL_*` constants for the possible values.
     pub fn special_type(&self) -> u8 {
         (self.blosc2_flags >> 4) & BLOSC2_SPECIAL_MASK
     }
 
-    /// Whether dictionary compression was used.
+    /// Returns `true` if dictionary-based compression was used.
     pub fn use_dict(&self) -> bool {
         self.blosc2_flags & BLOSC2_USEDICT != 0
     }
 
-    /// Whether variable-length blocks are used.
+    /// Returns `true` if the chunk uses variable-length blocks.
     pub fn vl_blocks(&self) -> bool {
         self.blosc2_flags2 & BLOSC2_VL_BLOCKS != 0
     }
 
-    /// Header size in bytes.
+    /// Returns the actual on-disk header length in bytes (16 or 32).
     pub fn header_len(&self) -> usize {
         if self.is_extended() {
             BLOSC_EXTENDED_HEADER_LENGTH
@@ -72,7 +104,10 @@ impl ChunkHeader {
         }
     }
 
-    /// Number of blocks in this chunk.
+    /// Returns the number of blocks that make up this chunk.
+    ///
+    /// Computed as `ceil(nbytes / blocksize)`. Returns 0 for negative or zero
+    /// sizes so that malformed headers do not panic.
     pub fn nblocks(&self) -> usize {
         if self.nbytes <= 0 || self.blocksize <= 0 {
             return 0;
@@ -80,7 +115,10 @@ impl ChunkHeader {
         (self.nbytes as usize).div_ceil(self.blocksize as usize)
     }
 
-    /// Size of the last (possibly partial) block.
+    /// Returns the size of the last (possibly partial) block.
+    ///
+    /// When `nbytes` is an exact multiple of `blocksize` this returns the full
+    /// block size. Returns 0 for invalid signed sizes.
     pub fn leftover(&self) -> usize {
         if self.nbytes <= 0 || self.blocksize <= 0 {
             return 0;
@@ -93,7 +131,12 @@ impl ChunkHeader {
         }
     }
 
-    /// Parse a chunk header from raw bytes.
+    /// Parses a chunk header from raw bytes.
+    ///
+    /// Requires at least [`BLOSC_MIN_HEADER_LENGTH`] bytes. Extended-header
+    /// fields are filled in only if both flag bits are set and the buffer is
+    /// at least [`BLOSC_EXTENDED_HEADER_LENGTH`] bytes long; otherwise they
+    /// stay at their default zero values.
     pub fn read(data: &[u8]) -> Result<Self, &'static str> {
         if data.len() < BLOSC_MIN_HEADER_LENGTH {
             return Err("Buffer too small for header");
@@ -125,7 +168,9 @@ impl ChunkHeader {
         Ok(h)
     }
 
-    /// Try to write a 32-byte extended header to a buffer.
+    /// Writes a 32-byte extended header into `buf`, returning an error if it does not fit.
+    ///
+    /// All multi-byte integer fields are written in little-endian order, matching the on-disk format.
     pub fn try_write(&self, buf: &mut [u8]) -> Result<(), &'static str> {
         if buf.len() < BLOSC_EXTENDED_HEADER_LENGTH {
             return Err("Buffer too small for extended header");
@@ -149,7 +194,10 @@ impl ChunkHeader {
         Ok(())
     }
 
-    /// Write a 32-byte extended header to a buffer.
+    /// Writes a 32-byte extended header into `buf`.
+    ///
+    /// Panics if `buf` is shorter than [`BLOSC_EXTENDED_HEADER_LENGTH`]. Use
+    /// [`try_write`](Self::try_write) for a fallible variant.
     pub fn write(&self, buf: &mut [u8]) {
         self.try_write(buf)
             .expect("buffer must fit a Blosc2 extended header");

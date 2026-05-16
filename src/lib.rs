@@ -1,3 +1,14 @@
+//! High-performance compressor for binary data (numerical arrays, tensors, structured formats).
+//!
+//! A pure-Rust implementation of the Blosc2 format. Supports the BloscLZ, LZ4, LZ4HC, Zlib,
+//! and Zstd codecs, combined with shuffle, bitshuffle, delta, and truncate-precision filters
+//! for improved compression of typed data.
+//!
+//! The top-level modules expose the building blocks: chunk [`header`] parsing, [`filters`],
+//! [`codecs`], the core [`compress`] engine, [`schunk`] super-chunks, and the [`b2nd`]
+//! N-dimensional array layer. The [`Codec`] and [`Filter`] enums and [`DEFAULT_CHUNKSIZE`]
+//! constant are re-exported here for convenience.
+
 pub mod b2nd;
 pub mod codecs;
 pub mod compress;
@@ -17,6 +28,9 @@ pub enum Codec {
 }
 
 impl Codec {
+    /// Parses a codec name (case-insensitive) into a [`Codec`] variant.
+    ///
+    /// Accepts `blosclz`, `lz4`, `lz4hc`, `zlib`, or `zstd`; returns `None` otherwise.
     pub fn parse_name(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "blosclz" => Some(Codec::BloscLz),
@@ -48,6 +62,10 @@ pub enum Filter {
 }
 
 impl Filter {
+    /// Parses a filter name (case-insensitive) into a [`Filter`] variant.
+    ///
+    /// Accepts `nofilter`/`none`, `shuffle`, `bitshuffle`, `delta`, or `truncprec`/`trunc_prec`;
+    /// returns `None` otherwise.
     pub fn parse_name(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "nofilter" | "none" => Some(Filter::NoFilter),

@@ -1,28 +1,63 @@
+//! Blosc2 N-dimensional array (b2nd) layer.
+//!
+//! A [`B2ndArray`] is a multidimensional array of fixed-size items backed by a
+//! super-chunk ([`Schunk`]). It is described by three shapes:
+//!
+//! * `shape` — the logical extent of the array in items per dimension.
+//! * `chunkshape` — the per-dimension extent of one compressed chunk. The
+//!   array is tiled by chunks; each chunk maps to a [`Schunk`] entry.
+//! * `blockshape` — the per-dimension extent of one block inside a chunk,
+//!   which is also Blosc's compression unit.
+//!
+//! The shape/chunkshape/blockshape triple, the dtype string and the dtype
+//! format are serialized into the `b2nd` fixed-size metalayer of the
+//! super-chunk so that an array can be reconstructed from a frame on disk.
+
 use crate::compress::{CParams, DParams};
 use crate::schunk::Schunk;
 use std::path::Path;
 
+/// Name of the fixed-size metalayer that carries the b2nd shape descriptor.
 pub const B2ND_METALAYER_NAME: &str = "b2nd";
+/// Version of the b2nd metalayer format; must not exceed 127.
 pub const B2ND_METALAYER_VERSION: u8 = 0;
+/// Maximum number of dimensions supported by a b2nd array.
 pub const B2ND_MAX_DIM: usize = 16;
+/// `dtype_format` value indicating that the dtype string follows the
+/// NumPy dtype convention.
 pub const DTYPE_NUMPY_FORMAT: i8 = 0;
 
+/// Shape descriptor for a b2nd array.
+///
+/// Holds the logical shape, the chunkshape, the blockshape and the dtype
+/// string. This is exactly the information serialized into the `b2nd`
+/// metalayer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct B2ndMeta {
+    /// Shape of the original data in items per dimension.
     pub shape: Vec<i64>,
+    /// Shape of each chunk in items per dimension.
     pub chunkshape: Vec<i32>,
+    /// Shape of each block in items per dimension.
     pub blockshape: Vec<i32>,
+    /// Data type as a string (NumPy dtype string when `dtype_format = 0`).
     pub dtype: String,
+    /// Format of the data type string. `0` means NumPy.
     pub dtype_format: i8,
 }
 
+/// A multidimensional array of fixed-size items backed by a super-chunk.
 #[derive(Clone)]
 pub struct B2ndArray {
+    /// Shape descriptor stored as the b2nd metalayer.
     pub meta: B2ndMeta,
+    /// Underlying super-chunk holding the compressed chunks.
     pub schunk: Schunk,
 }
 
 impl B2ndMeta {
+    /// Build a validated [`B2ndMeta`] from the array shape, chunkshape,
+    /// blockshape and dtype string.
     pub fn new(
         shape: Vec<i64>,
         chunkshape: Vec<i32>,
@@ -41,18 +76,22 @@ impl B2ndMeta {
         Ok(meta)
     }
 
+    /// Number of dimensions of the array.
     pub fn ndim(&self) -> usize {
         self.shape.len()
     }
 
+    /// Total number of items in the original (un-padded) array.
     pub fn nitems(&self) -> Result<usize, &'static str> {
         product_i64(&self.shape)
     }
 
+    /// Number of items in a single chunk.
     pub fn chunk_nitems(&self) -> Result<usize, &'static str> {
         product_i32(&self.chunkshape)
     }
 
+    /// Check that ranks, sizes and dtype satisfy all b2nd invariants.
     pub fn validate(&self) -> Result<(), &'static str> {
         let ndim = self.shape.len();
         if ndim == 0 || ndim > B2ND_MAX_DIM {
@@ -86,6 +125,7 @@ impl B2ndMeta {
         Ok(())
     }
 
+    /// Encode the metadata as a msgpack buffer suitable for the b2nd metalayer.
     pub fn serialize(&self) -> Result<Vec<u8>, &'static str> {
         self.validate()?;
         let ndim = self.ndim();
@@ -124,6 +164,8 @@ impl B2ndMeta {
         Ok(out)
     }
 
+    /// Decode the msgpack buffer stored in the b2nd metalayer back into a
+    /// validated [`B2ndMeta`].
     pub fn deserialize(data: &[u8]) -> Result<Self, &'static str> {
         let mut pos = 0usize;
         expect_byte(data, &mut pos, 0x90 + 7)?;
@@ -179,6 +221,12 @@ impl B2ndMeta {
 }
 
 impl B2ndArray {
+    /// Build a b2nd array from a dense row-major C buffer.
+    ///
+    /// The buffer must contain `meta.nitems() * cparams.typesize` bytes laid out
+    /// in C order. Data is split into chunks and blocks, compressed with
+    /// `cparams`, and written to a new super-chunk that carries `meta` as the
+    /// `b2nd` metalayer.
     pub fn from_cbuffer(
         meta: B2ndMeta,
         data: &[u8],
@@ -225,6 +273,8 @@ impl B2ndArray {
         Ok(Self { meta, schunk })
     }
 
+    /// Reinterpret a super-chunk as a b2nd array by reading its `b2nd`
+    /// metalayer. The chunk count must match the grid implied by the shape.
     pub fn from_schunk(schunk: Schunk) -> Result<Self, &'static str> {
         let content = schunk
             .metalayer(B2ND_METALAYER_NAME)
@@ -237,23 +287,30 @@ impl B2ndArray {
         Ok(Self { meta, schunk })
     }
 
+    /// Build a b2nd array from a serialized contiguous frame.
     pub fn from_frame(frame: &[u8]) -> Result<Self, String> {
         Self::from_schunk(Schunk::from_frame(frame)?).map_err(str::to_string)
     }
 
+    /// Open a b2nd array from a contiguous frame file or sparse frame
+    /// directory on disk.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
         Self::from_schunk(Schunk::open(path.as_ref().to_str().ok_or("Invalid path")?)?)
             .map_err(str::to_string)
     }
 
+    /// Serialize the array as a contiguous in-memory frame.
     pub fn to_frame(&self) -> Vec<u8> {
         self.schunk.to_frame()
     }
 
+    /// Write the array as a contiguous frame at `path`.
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         std::fs::write(path, self.to_frame())
     }
 
+    /// Decompress every chunk and assemble a dense row-major C buffer covering
+    /// the full array shape.
     pub fn to_cbuffer(&self) -> Result<Vec<u8>, &'static str> {
         let typesize = self.schunk.cparams.typesize as usize;
         let out_len = self
@@ -283,14 +340,17 @@ impl B2ndArray {
         Ok(out)
     }
 
+    /// Shape of the original data in items per dimension.
     pub fn shape(&self) -> &[i64] {
         &self.meta.shape
     }
 
+    /// Shape of each chunk in items per dimension.
     pub fn chunkshape(&self) -> &[i32] {
         &self.meta.chunkshape
     }
 
+    /// Shape of each block in items per dimension.
     pub fn blockshape(&self) -> &[i32] {
         &self.meta.blockshape
     }
@@ -396,6 +456,8 @@ impl B2ndArray {
         self.rebuild_from_dense(new_meta, &new_dense)
     }
 
+    /// Replace `self` with a freshly built array carrying the given metadata
+    /// and dense buffer, reusing the current compression parameters.
     fn rebuild_from_dense(&mut self, meta: B2ndMeta, data: &[u8]) -> Result<(), &'static str> {
         let rebuilt = Self::from_cbuffer(
             meta,
@@ -408,12 +470,15 @@ impl B2ndArray {
     }
 }
 
+/// Validated `start..stop` slice expressed in three forms used by callers.
 struct B2ndSlice {
     starts: Vec<usize>,
     extents: Vec<usize>,
     extents_as_i64: Vec<i64>,
 }
 
+/// Validate that `start..stop` is a non-empty in-bounds slice and return it
+/// in the convenience forms used by the dense copy helpers.
 fn validate_slice_bounds(
     meta: &B2ndMeta,
     start: &[i64],
@@ -446,6 +511,7 @@ fn validate_slice_bounds(
     })
 }
 
+/// Consume one byte from `data` at `pos` and check it matches `expected`.
 fn expect_byte(data: &[u8], pos: &mut usize, expected: u8) -> Result<(), &'static str> {
     if data.get(*pos).copied() != Some(expected) {
         return Err("Invalid B2ND metadata");
@@ -454,6 +520,7 @@ fn expect_byte(data: &[u8], pos: &mut usize, expected: u8) -> Result<(), &'stati
     Ok(())
 }
 
+/// Read a msgpack positive fixint (0x00-0x7f).
 fn read_fixint(data: &[u8], pos: &mut usize) -> Result<u8, &'static str> {
     let byte = *data.get(*pos).ok_or("Truncated B2ND metadata")?;
     if byte > 0x7f {
@@ -463,6 +530,7 @@ fn read_fixint(data: &[u8], pos: &mut usize) -> Result<u8, &'static str> {
     Ok(byte)
 }
 
+/// Read a big-endian `i64` and advance `pos` past it.
 fn read_i64(data: &[u8], pos: &mut usize) -> Result<i64, &'static str> {
     let end = pos.checked_add(8).ok_or("Invalid B2ND metadata")?;
     let bytes = data.get(*pos..end).ok_or("Truncated B2ND metadata")?;
@@ -470,6 +538,7 @@ fn read_i64(data: &[u8], pos: &mut usize) -> Result<i64, &'static str> {
     Ok(i64::from_be_bytes(bytes.try_into().unwrap()))
 }
 
+/// Read a big-endian `i32` and advance `pos` past it.
 fn read_i32(data: &[u8], pos: &mut usize) -> Result<i32, &'static str> {
     let end = pos.checked_add(4).ok_or("Invalid B2ND metadata")?;
     let bytes = data.get(*pos..end).ok_or("Truncated B2ND metadata")?;
@@ -477,6 +546,8 @@ fn read_i32(data: &[u8], pos: &mut usize) -> Result<i32, &'static str> {
     Ok(i32::from_be_bytes(bytes.try_into().unwrap()))
 }
 
+/// Product of strictly positive `i64` values, or an error on overflow or
+/// non-positive entries.
 fn product_i64(values: &[i64]) -> Result<usize, &'static str> {
     values.iter().try_fold(1usize, |acc, &value| {
         if value <= 0 {
@@ -487,6 +558,8 @@ fn product_i64(values: &[i64]) -> Result<usize, &'static str> {
     })
 }
 
+/// Product of strictly positive `i32` values, or an error on overflow or
+/// non-positive entries.
 fn product_i32(values: &[i32]) -> Result<usize, &'static str> {
     values.iter().try_fold(1usize, |acc, &value| {
         if value <= 0 {
@@ -497,12 +570,15 @@ fn product_i32(values: &[i32]) -> Result<usize, &'static str> {
     })
 }
 
+/// Product of `usize` values guarded against overflow.
 fn product_usize(values: &[usize]) -> Result<usize, &'static str> {
     values.iter().try_fold(1usize, |acc, &value| {
         acc.checked_mul(value).ok_or("B2ND shape too large")
     })
 }
 
+/// Number of chunks needed to tile the shape along each dimension
+/// (`ceil(shape[d] / chunkshape[d])`).
 fn chunk_grid(meta: &B2ndMeta) -> Result<Vec<usize>, &'static str> {
     meta.shape
         .iter()
@@ -516,6 +592,8 @@ fn chunk_grid(meta: &B2ndMeta) -> Result<Vec<usize>, &'static str> {
         .collect()
 }
 
+/// Padded chunk shape: each chunk dimension rounded up to a multiple of the
+/// matching block dimension so that a chunk holds a whole number of blocks.
 fn extchunkshape(meta: &B2ndMeta) -> Result<Vec<i32>, &'static str> {
     meta.chunkshape
         .iter()
@@ -533,10 +611,12 @@ fn extchunkshape(meta: &B2ndMeta) -> Result<Vec<i32>, &'static str> {
         .collect()
 }
 
+/// Number of items in a padded chunk.
 fn extchunk_nitems(meta: &B2ndMeta) -> Result<usize, &'static str> {
     product_i32(&extchunkshape(meta)?)
 }
 
+/// Number of blocks per dimension inside one padded chunk.
 fn blocks_in_chunk(extchunkshape: &[i32], blockshape: &[i32]) -> Result<Vec<usize>, &'static str> {
     extchunkshape
         .iter()
@@ -550,6 +630,7 @@ fn blocks_in_chunk(extchunkshape: &[i32], blockshape: &[i32]) -> Result<Vec<usiz
         .collect()
 }
 
+/// Row-major byte strides for the given shape and item size.
 fn byte_strides_i64(shape: &[i64], typesize: usize) -> Result<Vec<usize>, &'static str> {
     let mut strides = vec![0; shape.len()];
     let mut stride = typesize;
@@ -562,6 +643,8 @@ fn byte_strides_i64(shape: &[i64], typesize: usize) -> Result<Vec<usize>, &'stat
     Ok(strides)
 }
 
+/// Byte offset of an item at multi-index `starts + idx` in a row-major buffer
+/// with the given byte strides.
 fn dense_offset(starts: &[usize], idx: &[usize], strides: &[usize]) -> Result<usize, &'static str> {
     starts
         .iter()
@@ -576,11 +659,14 @@ fn dense_offset(starts: &[usize], idx: &[usize], strides: &[usize]) -> Result<us
         })
 }
 
+/// Description of a rectangular region inside a dense row-major buffer.
 struct DenseRegion<'a> {
     shape: &'a [i64],
     start: &'a [usize],
 }
 
+/// Copy an `extents`-shaped block of items from one dense row-major buffer
+/// into another, given the source and destination regions.
 fn copy_dense_region(
     src: &[u8],
     src_region: DenseRegion<'_>,
@@ -613,6 +699,8 @@ fn copy_dense_region(
     )
 }
 
+/// Precomputed strides and block geometry shared by the chunk/dense copy
+/// helpers.
 struct B2ndLayout {
     data_strides: Vec<usize>,
     extchunkshape: Vec<i32>,
@@ -622,6 +710,7 @@ struct B2ndLayout {
 }
 
 impl B2ndLayout {
+    /// Build the layout cache for a given metadata and typesize.
     fn new(meta: &B2ndMeta, typesize: usize) -> Result<Self, &'static str> {
         let extchunkshape = extchunkshape(meta)?;
         let blocks_in_chunk = blocks_in_chunk(&extchunkshape, &meta.blockshape)?;
@@ -635,6 +724,7 @@ impl B2ndLayout {
     }
 }
 
+/// Convert a linear C-order index into a multi-dimensional index.
 fn unravel_index(mut index: usize, shape: &[usize]) -> Vec<usize> {
     let mut out = vec![0; shape.len()];
     for dim in (0..shape.len()).rev() {
@@ -644,6 +734,8 @@ fn unravel_index(mut index: usize, shape: &[usize]) -> Vec<usize> {
     out
 }
 
+/// Copy the items belonging to chunk `chunk_index` out of a dense row-major
+/// source buffer into the chunk's block-interleaved layout.
 fn copy_dense_to_chunk(
     meta: &B2ndMeta,
     data: &[u8],
@@ -685,6 +777,8 @@ fn copy_dense_to_chunk(
     )
 }
 
+/// Copy items from a single block-interleaved chunk back into the
+/// corresponding region of a dense row-major destination buffer.
 fn copy_chunk_to_dense(
     meta: &B2ndMeta,
     chunk: &[u8],
@@ -726,6 +820,8 @@ fn copy_chunk_to_dense(
     )
 }
 
+/// Byte offset of item `idx` inside a padded chunk laid out as a grid of
+/// row-major blocks (the C-Blosc2 b2nd in-chunk layout).
 fn b2nd_chunk_offset(
     idx: &[usize],
     extchunkshape: &[i32],
@@ -759,6 +855,9 @@ fn b2nd_chunk_offset(
         .ok_or("B2ND chunk offset overflow")
 }
 
+/// Iterate over every multi-index in an `extents`-shaped region and copy one
+/// item per index from `src` to `dst`, using `offsets` to map the index to the
+/// source and destination byte positions.
 fn copy_region(
     dim: usize,
     extents: &[usize],
@@ -771,6 +870,7 @@ fn copy_region(
     copy_region_inner(dim, extents, &mut idx, &mut offsets, src, dst, typesize)
 }
 
+/// Recursive worker for [`copy_region`].
 fn copy_region_inner(
     dim: usize,
     extents: &[usize],

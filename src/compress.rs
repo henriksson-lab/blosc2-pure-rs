@@ -1,3 +1,18 @@
+//! Core compression and decompression engine for Blosc2 chunks.
+//!
+//! This module implements the chunk-level compress/decompress pipeline:
+//! block splitting and sizing, the filter pipeline (shuffle, bitshuffle,
+//! delta, trunc_prec), codec dispatch (BloscLZ, LZ4, LZ4HC, Zlib, Zstd),
+//! special-value chunks, dictionary training, variable-length blocks and
+//! the Blosc1 compatibility wrappers.
+//!
+//! The public API exposes the high-level [`compress`]/[`decompress`] pair
+//! together with their `*_with_dparams` / `*_with_threads` variants,
+//! [`CParams`]/[`DParams`] parameter structs, and the Blosc1-style helpers
+//! [`blosc1_compress`]/[`blosc1_decompress`]. Process-wide settings used by
+//! the Blosc1 API are exposed via the `blosc1_set_*` / `blosc2_set_*`
+//! family of functions.
+
 use crate::codecs;
 use crate::constants::*;
 use crate::filters;
@@ -37,10 +52,12 @@ thread_local! {
         const { RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
 }
 
+/// Access the lazily-initialized map of cached rayon thread pools keyed by thread count.
 fn thread_pools() -> &'static Mutex<HashMap<i16, Arc<rayon::ThreadPool>>> {
     THREAD_POOLS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Return a cached rayon thread pool sized for `nthreads`, or `None` when serial execution suffices.
 fn thread_pool_for(nthreads: i16) -> Option<Arc<rayon::ThreadPool>> {
     if nthreads <= 1 {
         return None;
@@ -68,6 +85,7 @@ fn thread_pool_for(nthreads: i16) -> Option<Arc<rayon::ThreadPool>> {
     Some(Arc::clone(entry))
 }
 
+/// Heuristic: whether copying a memcpyed chunk of `nbytes` is worth parallelizing across `nthreads`.
 fn should_parallelize_memcpyed(nbytes: usize, nthreads: i16) -> bool {
     if nthreads <= 1 || nbytes < MEMCPY_PARALLEL_MIN_BYTES {
         return false;
@@ -75,6 +93,7 @@ fn should_parallelize_memcpyed(nbytes: usize, nthreads: i16) -> bool {
     nbytes.div_ceil(nthreads as usize) >= MEMCPY_PARALLEL_MIN_BYTES_PER_THREAD
 }
 
+/// Map a codec numeric code to its canonical lowercase name.
 fn compressor_code_to_name(code: u8) -> Option<&'static str> {
     match code {
         BLOSC_BLOSCLZ => Some("blosclz"),
@@ -245,6 +264,8 @@ fn apply_blosc_env_overrides(
     let _ = std::env::var("BLOSC_NOLOCK");
 }
 
+/// Apply the `BLOSC_*` environment-variable overrides honored by `blosc1_decompress`.
+/// Returns the resulting thread count (defaults to the process-wide value).
 fn apply_blosc_decompress_env_overrides() -> Result<i16, &'static str> {
     if let Ok(v) = std::env::var("BLOSC_NTHREADS") {
         let parsed = v
@@ -263,36 +284,67 @@ fn apply_blosc_decompress_env_overrides() -> Result<i16, &'static str> {
     Ok(blosc2_get_nthreads())
 }
 
+/// Parameters passed to a user-supplied prefilter callback.
+///
+/// A prefilter runs once per block, ahead of the standard filter pipeline,
+/// and writes its transformed output into `output`. Returning a non-zero
+/// status aborts compression unless `output_is_disposable` is set.
 #[derive(Debug)]
 pub struct PrefilterParams<'a> {
+    /// Opaque user-supplied data passed back into the callback.
     pub user_data: usize,
+    /// Input block bytes.
     pub input: &'a [u8],
+    /// Destination buffer for the transformed block.
     pub output: &'a mut [u8],
+    /// Size in bytes of `output`.
     pub output_size: i32,
+    /// Typesize the prefilter reports for the produced data.
     pub output_typesize: i32,
+    /// Byte offset of the current block within the uncompressed chunk.
     pub output_offset: i32,
+    /// Chunk index when invoked from a super-chunk, or `-1` for stand-alone chunks.
     pub nchunk: i64,
+    /// Index of the current block within the chunk.
     pub nblock: i32,
+    /// Worker thread id, or `0` in serial execution.
     pub tid: i32,
+    /// When true, the engine may discard `output` if the callback fails.
     pub output_is_disposable: bool,
 }
 
+/// Parameters passed to a user-supplied postfilter callback.
+///
+/// A postfilter runs once per block after the backward filter pipeline,
+/// before the data is delivered to the caller.
 #[derive(Debug)]
 pub struct PostfilterParams<'a> {
+    /// Opaque user-supplied data passed back into the callback.
     pub user_data: usize,
+    /// Input bytes produced by the filter pipeline.
     pub input: &'a [u8],
+    /// Destination buffer for the postfilter output.
     pub output: &'a mut [u8],
+    /// Size in bytes of `input`/`output`.
     pub size: i32,
+    /// Logical typesize of the data.
     pub typesize: i32,
+    /// Byte offset of the current block within the uncompressed chunk.
     pub offset: i32,
+    /// Chunk index when invoked from a super-chunk, or `-1` for stand-alone chunks.
     pub nchunk: i64,
+    /// Index of the current block within the chunk.
     pub nblock: i32,
+    /// Worker thread id, or `0` in serial execution.
     pub tid: i32,
 }
 
+/// Function pointer type for a prefilter callback. A return of `0` indicates success.
 pub type PrefilterFn = for<'a> fn(&mut PrefilterParams<'a>) -> i32;
+/// Function pointer type for a postfilter callback. A return of `0` indicates success.
 pub type PostfilterFn = for<'a> fn(&mut PostfilterParams<'a>) -> i32;
 
+/// Run `op` on the cached rayon thread pool for `nthreads`; falls back to serial execution when `nthreads <= 1`.
 pub(crate) fn with_thread_pool<T: Send>(nthreads: i16, op: impl FnOnce() -> T + Send) -> T {
     if nthreads <= 1 {
         return op();
@@ -303,11 +355,13 @@ pub(crate) fn with_thread_pool<T: Send>(nthreads: i16, op: impl FnOnce() -> T + 
     }
 }
 
+/// Grow `buf` to exactly `len`, zero-filling any new bytes.
 #[inline]
 fn ensure_scratch_len(buf: &mut Vec<u8>, len: usize) {
     buf.resize(len, 0);
 }
 
+/// Grow `buf` to at least `len` without initializing the new bytes; callers must overwrite before reading.
 #[inline]
 fn ensure_scratch_len_uninit(buf: &mut Vec<u8>, len: usize) {
     if len > buf.len() {
@@ -320,6 +374,7 @@ fn ensure_scratch_len_uninit(buf: &mut Vec<u8>, len: usize) {
     }
 }
 
+/// Allocate a `Vec<u8>` of length `len` with uninitialized contents.
 #[allow(clippy::uninit_vec)]
 fn uninit_vec(len: usize) -> Vec<u8> {
     let mut buf = Vec::with_capacity(len);
@@ -331,6 +386,7 @@ fn uninit_vec(len: usize) -> Vec<u8> {
     buf
 }
 
+/// Borrow two thread-local scratch buffers of `blocksize` bytes for the duration of `f`.
 fn with_decompress_scratch<T>(blocksize: usize, f: impl FnOnce(&mut [u8], &mut [u8]) -> T) -> T {
     DECOMPRESS_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
@@ -341,6 +397,7 @@ fn with_decompress_scratch<T>(blocksize: usize, f: impl FnOnce(&mut [u8], &mut [
     })
 }
 
+/// Borrow four thread-local scratch buffers (sized for `blocksize`) for the duration of `f`.
 fn with_compress_scratch<T>(
     blocksize: usize,
     f: impl FnOnce(&mut Vec<u8>, &mut Vec<u8>, &mut Vec<u8>, &mut Vec<u8>) -> T,
@@ -564,6 +621,7 @@ fn compute_filter_flags(filters: &[u8; BLOSC2_MAX_FILTERS]) -> u8 {
     flags
 }
 
+/// Validate caller-supplied compression parameters against the chunk size and codec/filter registry.
 fn validate_cparams(cparams: &CParams, nbytes: usize) -> Result<(), &'static str> {
     if nbytes > BLOSC2_MAX_BUFFERSIZE as usize {
         return Err("Input too large");
@@ -609,6 +667,7 @@ fn validate_cparams(cparams: &CParams, nbytes: usize) -> Result<(), &'static str
     Ok(())
 }
 
+/// Validate that a chunk header is self-consistent and that the encoded sizes fit `chunk_len`.
 fn validate_header(header: &ChunkHeader, chunk_len: usize) -> Result<(), &'static str> {
     let header_len = header.header_len();
     if chunk_len < header_len {
@@ -748,6 +807,7 @@ fn validate_header(header: &ChunkHeader, chunk_len: usize) -> Result<(), &'stati
     Ok(())
 }
 
+/// Number of independent sub-streams a block is split into for compression (`typesize` when splitting, otherwise `1`).
 fn stream_count(dont_split: bool, is_leftover: bool, typesize: usize, bsize: usize) -> usize {
     if !dont_split
         && !is_leftover
@@ -761,17 +821,21 @@ fn stream_count(dont_split: bool, is_leftover: bool, typesize: usize, bsize: usi
     }
 }
 
+/// Grow `buf` to at least `len` bytes, zero-filling new positions.
 fn ensure_len(buf: &mut Vec<u8>, len: usize) {
     if len > buf.len() {
         buf.resize(len, 0);
     }
 }
 
+/// Size in bytes of a fully memcpy-fallback-stored block: the block payload plus a per-stream 4-byte length prefix.
 fn stored_block_len(dont_split: bool, is_leftover: bool, typesize: usize, bsize: usize) -> usize {
     let nstreams = stream_count(dont_split, is_leftover, typesize, bsize);
     bsize + nstreams * 4
 }
 
+/// Compute the upper byte bound for the compressed-block payload starting at `src_pos`
+/// by finding the next non-overlapping block start in the block-offset table.
 fn compressed_block_limit(
     chunk: &[u8],
     header: &ChunkHeader,
@@ -804,10 +868,12 @@ fn compressed_block_limit(
     Ok(block_limit)
 }
 
+/// Whether the parameters permit emitting an uncompressed (memcpy) chunk — no filters, prefilter, or dictionary.
 fn can_use_memcpy_chunk(cparams: &CParams, filters_are_noop: bool) -> bool {
     filters_are_noop && cparams.prefilter.is_none() && !cparams.use_dict
 }
 
+/// Probe a few leading blocks to decide if the chunk is incompressible and should be emitted as a memcpy chunk.
 fn should_emit_memcpy_chunk_early(
     src: &[u8],
     cparams: &CParams,
@@ -862,6 +928,7 @@ fn should_emit_memcpy_chunk_early(
     true
 }
 
+/// Emit a memcpy chunk (header + raw payload) when the parameters allow and the budget is sufficient.
 fn maybe_convert_to_memcpy_chunk(
     src: &[u8],
     cparams: &CParams,
@@ -903,6 +970,7 @@ fn maybe_convert_to_memcpy_chunk(
     Some(memcpyed)
 }
 
+/// Codec code as stored in the extended header's `udcompcode` field.
 fn udcompcode_for_header(compcode: u8) -> u8 {
     compcode
 }
@@ -943,6 +1011,8 @@ fn get_run(data: &[u8]) -> Option<u8> {
     Some(val)
 }
 
+/// Apply the forward filter pipeline (with optional prefilter) and codec to a single block,
+/// returning the encoded block bytes plus a flag indicating whether every produced stream is an all-zero run.
 #[allow(clippy::too_many_arguments)]
 fn compress_block_with_scratch(
     src: &[u8],
@@ -1035,6 +1105,8 @@ fn compress_block_with_scratch(
     ))
 }
 
+/// If the filter pipeline reduces to a single shuffle filter, return its typesize;
+/// otherwise return `None`. Enables the fast shuffle-only fast path.
 fn single_shuffle_filter(
     filters: &[u8; BLOSC2_MAX_FILTERS],
     filters_meta: &[u8; BLOSC2_MAX_FILTERS],
@@ -1061,6 +1133,8 @@ fn single_shuffle_filter(
     shuffle_typesize
 }
 
+/// Invoke the optional prefilter for one block.
+/// Returns `Ok(Some(transformed))` when a prefilter ran, or `Ok(None)` when no prefilter is configured.
 fn apply_prefilter<'a>(
     cparams: &CParams,
     block: &'a [u8],
@@ -1105,6 +1179,8 @@ fn apply_prefilter<'a>(
     Ok(Some(&scratch[..output_size]))
 }
 
+/// Invoke the optional postfilter for one block.
+/// When no postfilter is configured, copies `input` to `output` (or is a no-op if they alias).
 fn apply_postfilter(
     dparams: &DParams,
     input: &[u8],
@@ -1139,6 +1215,12 @@ fn apply_postfilter(
     Ok(())
 }
 
+/// Encode an already-filtered block, splitting into per-typesize streams when requested.
+///
+/// Per-stream runs of constant bytes are emitted as the special `cbytes == 0` or negative
+/// run-of-`val` form; otherwise the codec output (or a literal-stored stream when it does
+/// not shrink) is written. Returns the encoded bytes plus whether every stream was an
+/// all-zero run.
 fn compress_pre_filtered_block_with_scratch(
     filtered: &[u8],
     cparams: &CParams,
@@ -1243,6 +1325,8 @@ fn compress_pre_filtered_block_with_scratch(
     (result, all_zero_runs)
 }
 
+/// Run the forward filter pipeline over every block of `src`, returning the filtered
+/// payloads. Used to gather training samples for dictionary construction.
 fn filtered_blocks_for_dict(
     src: &[u8],
     cparams: &CParams,
@@ -1305,6 +1389,8 @@ fn filtered_blocks_for_dict(
     Ok(out)
 }
 
+/// Build a Zstd-style dictionary from the trailing portions of the filtered samples,
+/// returning `None` if there is not enough material to be useful.
 fn train_zstd_dict(samples: &[Vec<u8>], nbytes: usize) -> Option<Vec<u8>> {
     let dict_maxsize = BLOSC2_MAXDICTSIZE.min(nbytes / 20);
     if dict_maxsize < BLOSC2_MINUSEFULDICT || samples.is_empty() {
@@ -1327,6 +1413,7 @@ fn train_zstd_dict(samples: &[Vec<u8>], nbytes: usize) -> Option<Vec<u8>> {
     (dict.len() >= BLOSC2_MINUSEFULDICT).then_some(dict)
 }
 
+/// Build an LZ4-style dictionary from the leading portions of the filtered samples.
 fn build_lz4_dict(samples: &[Vec<u8>], nbytes: usize) -> Option<Vec<u8>> {
     let dict_maxsize = BLOSC2_MAXDICTSIZE.min(nbytes / 20);
     if dict_maxsize < BLOSC2_MINUSEFULDICT || samples.is_empty() {
@@ -1353,6 +1440,7 @@ fn build_lz4_dict(samples: &[Vec<u8>], nbytes: usize) -> Option<Vec<u8>> {
     }
 }
 
+/// Dispatch to the dictionary builder appropriate for `compcode`. Returns `None` for codecs without dictionary support.
 fn build_codec_dictionary(samples: &[Vec<u8>], nbytes: usize, compcode: u8) -> Option<Vec<u8>> {
     match compcode {
         BLOSC_LZ4 | BLOSC_LZ4HC => build_lz4_dict(samples, nbytes),
@@ -1361,9 +1449,12 @@ fn build_codec_dictionary(samples: &[Vec<u8>], nbytes: usize, compcode: u8) -> O
     }
 }
 
-/// Compress data into a Blosc2 chunk.
+/// Compress `src` into a Blosc2 chunk using the supplied compression parameters.
 ///
-/// Returns the compressed chunk as a `Vec<u8>`, or an error message.
+/// Splits `src` into blocks, applies the filter pipeline (optionally preceded
+/// by a prefilter), feeds each block through the configured codec and writes
+/// the extended chunk header. When the data is incompressible, an inline
+/// memcpy chunk is produced. Returns the compressed chunk on success.
 pub fn compress(src: &[u8], cparams: &CParams) -> Result<Vec<u8>, &'static str> {
     validate_cparams(cparams, src.len())?;
     let nbytes = src.len() as i32;
@@ -1766,6 +1857,9 @@ pub fn compress(src: &[u8], cparams: &CParams) -> Result<Vec<u8>, &'static str> 
     Ok(output)
 }
 
+/// Compress a slice of input buffers in parallel when `cparams.nthreads > 1`,
+/// returning one Blosc2 chunk per input. Each call shares the supplied parameters
+/// but compresses each chunk single-threaded.
 pub fn compress_many(buffers: &[&[u8]], cparams: &CParams) -> Result<Vec<Vec<u8>>, &'static str> {
     if buffers.len() > 1 && cparams.nthreads > 1 {
         let per_chunk_params = CParams {
@@ -1786,6 +1880,7 @@ pub fn compress_many(buffers: &[&[u8]], cparams: &CParams) -> Result<Vec<Vec<u8>
     }
 }
 
+/// Validate variable-length-block compression inputs and return the total payload size in bytes.
 fn validate_vl_inputs(blocks: &[&[u8]], cparams: &CParams) -> Result<usize, &'static str> {
     if blocks.is_empty() {
         return Err("VL-block input cannot be empty");
@@ -1818,6 +1913,7 @@ fn validate_vl_inputs(blocks: &[&[u8]], cparams: &CParams) -> Result<usize, &'st
     Ok(total)
 }
 
+/// Apply the prefilter and forward filter pipeline to each variable-length block independently.
 fn filtered_vl_blocks(blocks: &[&[u8]], cparams: &CParams) -> Result<Vec<Vec<u8>>, &'static str> {
     let typesize = cparams.typesize as usize;
     let filters_are_noop = cparams
@@ -1873,6 +1969,7 @@ fn filtered_vl_blocks(blocks: &[&[u8]], cparams: &CParams) -> Result<Vec<Vec<u8>
     Ok(out)
 }
 
+/// Codec-encode a single filtered VL block (with optional shared dictionary), prefixed by its uncompressed size.
 fn compress_filtered_vl_block(filtered: &[u8], cparams: &CParams, dict: Option<&[u8]>) -> Vec<u8> {
     let max_out = filtered.len() + (filtered.len() / 255) + 32;
     let mut compressed = vec![0u8; max_out];
@@ -1903,6 +2000,7 @@ fn compress_filtered_vl_block(filtered: &[u8], cparams: &CParams, dict: Option<&
     out
 }
 
+/// Filter and codec-encode a single VL block end-to-end (no dictionary path).
 fn compress_vl_block(block: &[u8], cparams: &CParams) -> Vec<u8> {
     let filtered = filtered_vl_blocks(&[block], cparams).expect("VL prefilter failed");
     compress_filtered_vl_block(&filtered[0], cparams, None)
@@ -2151,6 +2249,10 @@ fn decompress_block_data(
     Ok(out)
 }
 
+/// Decompress a single block directly into `dest`, reusing caller-provided scratch buffers.
+///
+/// Applies the backward filter pipeline and optional postfilter. `dref` carries the
+/// decoded contents of block 0 when delta filtering is active.
 #[allow(clippy::too_many_arguments)]
 fn decompress_block_into(
     chunk: &[u8],
@@ -2326,6 +2428,7 @@ fn decompress_block_into(
     Ok(())
 }
 
+/// Extract the embedded codec dictionary slice, or `Ok(None)` if the chunk does not carry one.
 fn embedded_dictionary<'a>(
     chunk: &'a [u8],
     header: &ChunkHeader,
@@ -2364,15 +2467,20 @@ fn embedded_dictionary<'a>(
     Ok(Some(&chunk[dict_size_end..dict_end]))
 }
 
-/// Decompress a Blosc2 chunk.
+/// Decompress a Blosc2 chunk into a freshly allocated buffer.
 ///
-/// Returns the decompressed data as a `Vec<u8>`.
+/// Reads the extended header, decodes every block, and applies the backward
+/// filter pipeline. Returns the reconstructed bytes whose length equals the
+/// `nbytes` recorded in the header. Single-threaded; for parallel decoding
+/// use [`decompress_with_threads`] or [`decompress_with_dparams`].
 pub fn decompress(chunk: &[u8]) -> Result<Vec<u8>, &'static str> {
     decompress_with_threads(chunk, 1)
 }
 
-/// Decompress a Blosc2 chunk into a caller-provided destination buffer.
-/// Returns the number of bytes written.
+/// Decompress a Blosc2 chunk into a caller-supplied destination buffer.
+///
+/// `dest` must be at least as large as the chunk's `nbytes`. Returns the
+/// number of bytes written, which equals `nbytes`.
 pub fn decompress_into(chunk: &[u8], dest: &mut [u8]) -> Result<usize, &'static str> {
     decompress_into_with_threads(chunk, dest, 1)
 }
@@ -2405,6 +2513,7 @@ pub fn cbuffer_validate(chunk: &[u8]) -> Result<(), &'static str> {
     validate_header(&header, chunk.len())
 }
 
+/// Locate the byte span (length-prefix + payload) of VL-block index `nblock` within a VL-block chunk.
 fn vl_block_span<'a>(
     chunk: &'a [u8],
     header: &ChunkHeader,
@@ -2490,6 +2599,7 @@ pub fn vldecompress_block(chunk: &[u8], nblock: usize) -> Result<Vec<u8>, &'stat
     vldecompress_block_with_params(chunk, nblock, &DParams::default())
 }
 
+/// Decompress a single VL block using the supplied decompression parameters.
 fn vldecompress_block_with_params(
     chunk: &[u8],
     nblock: usize,
@@ -2562,6 +2672,7 @@ pub fn vldecompress(chunk: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
     vldecompress_with_params(chunk, &DParams::default())
 }
 
+/// Decompress every VL block in `chunk` using the supplied decompression parameters.
 fn vldecompress_with_params(chunk: &[u8], dparams: &DParams) -> Result<Vec<Vec<u8>>, &'static str> {
     let nblocks = vlchunk_get_nblocks(chunk)?;
     (0..nblocks)
@@ -2684,6 +2795,7 @@ pub fn getitem(chunk: &[u8], start: usize, nitems: usize) -> Result<Vec<u8>, &'s
     Ok(out)
 }
 
+/// Implementation of `getitem` for VL-block chunks: walks blocks until the requested byte range is covered.
 fn getitem_vlblocks(
     chunk: &[u8],
     header: &ChunkHeader,
@@ -2731,6 +2843,10 @@ fn getitem_vlblocks(
     Ok(out)
 }
 
+/// Read every block's compressed payload byte range from the block-offset table.
+///
+/// `min_payload_start` is the smallest legal payload offset (header end plus block
+/// table and any embedded dictionary). Used by [`replace_aligned_blocks`].
 fn read_block_payload_spans(
     chunk: &[u8],
     header: &ChunkHeader,
@@ -3117,6 +3233,10 @@ pub fn decompress_into_with_dparams(
     decompress_into_with_header(chunk, &header, dest, dparams)
 }
 
+/// Decompress a chunk given its already-parsed header, writing the output into `dest`.
+///
+/// Selects the appropriate fast path (special chunks, memcpyed payload, VL blocks,
+/// delta-sequential, or block-parallel decoding) based on the header.
 fn decompress_into_with_header(
     chunk: &[u8],
     header: &ChunkHeader,

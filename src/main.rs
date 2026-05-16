@@ -1,3 +1,9 @@
+//! Command-line interface for the Blosc2 compressor.
+//!
+//! Provides `compress` and `decompress` subcommands that read and write Blosc2 frame files
+//! (`.b2frame`). Compression parameters (codec, level, type size, block size, split mode,
+//! filter, thread count) are exposed as flags; decompression only needs a thread count.
+
 use blosc2_pure_rs::compress::{CParams, DParams};
 use blosc2_pure_rs::constants::*;
 use blosc2_pure_rs::schunk::Schunk;
@@ -63,6 +69,7 @@ enum Commands {
     },
 }
 
+/// Collected compression parameters passed to [`compress_file`].
 struct CompressOptions {
     codec: Codec,
     clevel: u8,
@@ -75,6 +82,11 @@ struct CompressOptions {
     filter_meta: u8,
 }
 
+/// Compresses `input` into a Blosc2 frame written to `output`.
+///
+/// Reads the input file in `chunksize` segments, appends each as a chunk to a [`Schunk`]
+/// configured with `options`, serializes the super-chunk to disk, and prints ratio and
+/// throughput statistics. Any existing file at `output` is removed before writing.
 fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::Result<()> {
     if options.chunksize == 0 {
         return Err(io::Error::new(
@@ -147,6 +159,11 @@ fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::R
     Ok(())
 }
 
+/// Decompresses a Blosc2 frame at `input` into the raw file at `output`.
+///
+/// Opens the frame as a [`Schunk`], iterates over its chunks decoding each in turn, and writes
+/// the concatenated result via a buffered writer. Empty frames produce an empty output file.
+/// Prints ratio and throughput statistics on completion.
 fn decompress_file(input: &Path, output: &Path, nthreads: i16) -> io::Result<()> {
     let input_str = input
         .to_str()
@@ -194,6 +211,7 @@ fn decompress_file(input: &Path, output: &Path, nthreads: i16) -> io::Result<()>
     Ok(())
 }
 
+/// Returns `numerator / denominator` as `f64`, or `0.0` when `denominator` is not positive.
 fn ratio(numerator: i64, denominator: i64) -> f64 {
     if denominator > 0 {
         numerator as f64 / denominator as f64
@@ -202,6 +220,9 @@ fn ratio(numerator: i64, denominator: i64) -> f64 {
     }
 }
 
+/// Computes throughput in MiB/s given a byte count and an elapsed time in seconds.
+///
+/// Returns `0.0` for non-positive elapsed times to avoid division by zero.
 fn throughput_mib(nbytes: i64, elapsed_secs: f64) -> f64 {
     if elapsed_secs > 0.0 {
         nbytes as f64 / (elapsed_secs * 1024.0 * 1024.0)
@@ -210,6 +231,10 @@ fn throughput_mib(nbytes: i64, elapsed_secs: f64) -> f64 {
     }
 }
 
+/// Parses a split-mode name (case-insensitive) into its Blosc2 constant.
+///
+/// Recognizes `always`, `never`, `auto`, and `forward` (with optional `_split` suffix); returns
+/// `None` for unknown values.
 fn parse_splitmode(s: &str) -> Option<i32> {
     match s.to_lowercase().as_str() {
         "always" | "always_split" => Some(BLOSC_ALWAYS_SPLIT),
@@ -220,6 +245,8 @@ fn parse_splitmode(s: &str) -> Option<i32> {
     }
 }
 
+/// CLI entry point: parses arguments, configures the rayon thread pool, and dispatches to the
+/// `compress` or `decompress` handler. Exits with status 1 on error.
 fn main() {
     let cli = Cli::parse();
 

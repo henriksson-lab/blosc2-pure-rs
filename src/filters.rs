@@ -1,9 +1,33 @@
+//! Filters that pre-process a block of data before it is fed to the codec.
+//!
+//! Filters do not compress data on their own; they rearrange or transform it so
+//! that the downstream codec can compress it more efficiently. Each filter has a
+//! forward variant (applied at compression time) and a backward variant
+//! (applied at decompression time). The pipeline supports up to
+//! [`BLOSC2_MAX_FILTERS`] filters and is applied left-to-right when encoding,
+//! right-to-left when decoding.
+//!
+//! Built-in filters:
+//! - **shuffle**: byte-wise transpose within each element, grouping bytes of
+//!   equal positional significance together.
+//! - **bitshuffle**: bit-wise transpose within elements (after a byte
+//!   transpose), grouping bits of equal positional significance.
+//! - **delta**: XOR each element against a reference, exposing redundancy
+//!   across consecutive blocks or elements.
+//! - **trunc_prec**: zero out least-significant mantissa bits of IEEE-754
+//!   floats, trading precision for compressibility.
+//!
+//! Users can register custom filters via [`register_filter`]; their IDs must be
+//! at or above [`BLOSC2_USER_DEFINED_FILTERS_START`].
+
 use crate::constants::*;
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
+/// Forward (encoding-side) callback signature for a user-defined filter.
 pub type FilterForwardFn =
     fn(meta: u8, typesize: usize, block_offset: usize, src: &[u8], dest: &mut [u8]);
+/// Backward (decoding-side) callback signature for a user-defined filter.
 pub type FilterBackwardFn =
     fn(meta: u8, typesize: usize, block_offset: usize, src: &[u8], dest: &mut [u8]);
 
@@ -19,6 +43,11 @@ fn user_filters() -> &'static RwLock<HashMap<u8, UserFilter>> {
     USER_FILTERS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// Register a user-defined filter under `filter_id`.
+///
+/// `filter_id` must be at least [`BLOSC2_USER_DEFINED_FILTERS_START`]; lower IDs
+/// are reserved for built-in filters. Re-registering an existing ID overwrites
+/// the previous callbacks.
 pub fn register_filter(
     filter_id: u8,
     forward: FilterForwardFn,
@@ -34,12 +63,14 @@ pub fn register_filter(
     Ok(())
 }
 
+/// Return `true` if a user-defined filter has been registered under `filter_id`.
 pub fn is_registered_filter(filter_id: u8) -> bool {
     user_filters()
         .read()
         .is_ok_and(|filters| filters.contains_key(&filter_id))
 }
 
+/// Look up a previously [`register_filter`]-ed callback pair by ID.
 fn registered_filter(filter_id: u8) -> Option<UserFilter> {
     user_filters()
         .read()
@@ -47,10 +78,15 @@ fn registered_filter(filter_id: u8) -> Option<UserFilter> {
         .and_then(|filters| filters.get(&filter_id).copied())
 }
 
-/// Apply byte-wise shuffle (transpose bytes within elements).
+/// Apply byte-wise shuffle: transpose bytes within elements of size `typesize`.
 ///
-/// For each byte position j within a type of size `typesize`,
-/// gather all j-th bytes of each element contiguously.
+/// For each byte position `j` in `0..typesize`, all `j`-th bytes of the
+/// elements are written contiguously into `dest`. This groups bytes of equal
+/// positional significance, which typically improves the compressibility of
+/// numerical data. Trailing bytes that do not form a complete element are
+/// copied through unchanged.
+///
+/// Dispatches to SIMD or fixed-width implementations when available.
 pub fn shuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
     let blocksize = src.len();
     if dest.len() < blocksize {
@@ -83,7 +119,11 @@ pub fn shuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
     }
 }
 
-/// Reverse byte-wise shuffle (untranspose bytes within elements).
+/// Reverse byte-wise shuffle: untranspose bytes back into element-order.
+///
+/// Inverse of [`shuffle`]. `typesize` must match the value used at encode
+/// time. Trailing bytes that do not form a complete element are copied
+/// through unchanged.
 pub fn unshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
     let blocksize = src.len();
     if dest.len() < blocksize {
@@ -119,6 +159,8 @@ pub fn unshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
     }
 }
 
+/// Fast path for the common element sizes 2, 4, and 8. Returns `false`
+/// otherwise so the caller falls back to the generic implementation.
 fn shuffle_common_width(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
     match typesize {
         2 => {
@@ -137,6 +179,7 @@ fn shuffle_common_width(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
     }
 }
 
+/// Fast path for the common element sizes 2, 4, and 8 on the decode side.
 fn unshuffle_common_width(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
     match typesize {
         2 => {
@@ -155,6 +198,7 @@ fn unshuffle_common_width(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool 
     }
 }
 
+/// Scalar shuffle specialized for 2-byte elements.
 fn shuffle2(src: &[u8], dest: &mut [u8]) {
     let nelements = src.len() / 2;
     let main_len = nelements * 2;
@@ -166,6 +210,7 @@ fn shuffle2(src: &[u8], dest: &mut [u8]) {
     dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
 }
 
+/// Scalar unshuffle specialized for 2-byte elements.
 fn unshuffle2(src: &[u8], dest: &mut [u8]) {
     let nelements = src.len() / 2;
     let main_len = nelements * 2;
@@ -182,6 +227,7 @@ fn unshuffle2(src: &[u8], dest: &mut [u8]) {
     dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
 }
 
+/// Scalar shuffle specialized for 4-byte elements.
 fn shuffle4(src: &[u8], dest: &mut [u8]) {
     let nelements = src.len() / 4;
     let main_len = nelements * 4;
@@ -197,6 +243,7 @@ fn shuffle4(src: &[u8], dest: &mut [u8]) {
     dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
 }
 
+/// Scalar unshuffle specialized for 4-byte elements.
 fn unshuffle4(src: &[u8], dest: &mut [u8]) {
     let nelements = src.len() / 4;
     let main_len = nelements * 4;
@@ -215,6 +262,7 @@ fn unshuffle4(src: &[u8], dest: &mut [u8]) {
     dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
 }
 
+/// Scalar shuffle specialized for 8-byte elements.
 fn shuffle8(src: &[u8], dest: &mut [u8]) {
     let nelements = src.len() / 8;
     let main_len = nelements * 8;
@@ -238,6 +286,7 @@ fn shuffle8(src: &[u8], dest: &mut [u8]) {
     dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
 }
 
+/// Scalar unshuffle specialized for 8-byte elements.
 fn unshuffle8(src: &[u8], dest: &mut [u8]) {
     let nelements = src.len() / 8;
     let main_len = nelements * 8;
@@ -261,6 +310,11 @@ fn unshuffle8(src: &[u8], dest: &mut [u8]) {
     dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
 }
 
+/// x86/x86_64 SIMD accelerations for byte-wise shuffle/unshuffle.
+///
+/// Each `try_*` entry point checks the runtime feature flags and falls back to
+/// `false` if it cannot handle the given typesize/block-size, in which case
+/// the scalar implementations take over.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod simd {
     #[cfg(target_arch = "x86")]
@@ -268,6 +322,7 @@ mod simd {
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64 as arch;
 
+    /// Try to run a SIMD shuffle. Returns `true` if `dest` was written.
     pub fn try_shuffle(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
         if try_shuffle_avx2(typesize, src, dest) {
             return true;
@@ -287,6 +342,7 @@ mod simd {
         true
     }
 
+    /// AVX2 shuffle entry point (typesize=4, blocks of at least 128 bytes).
     fn try_shuffle_avx2(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
         if dest.len() < src.len() || typesize != 4 || src.len() < 128 {
             return false;
@@ -301,6 +357,7 @@ mod simd {
         true
     }
 
+    /// Try to run a SIMD unshuffle. Returns `true` if `dest` was written.
     pub fn try_unshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
         if typesize == 4 && try_unshuffle_avx2(typesize, src, dest) {
             return true;
@@ -320,6 +377,7 @@ mod simd {
         true
     }
 
+    /// AVX2 unshuffle entry point (typesize=4, blocks of at least 128 bytes).
     fn try_unshuffle_avx2(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
         if src.len() < 128 || dest.len() < src.len() || !src.len().is_multiple_of(typesize) {
             return false;
@@ -339,6 +397,8 @@ mod simd {
         true
     }
 
+    /// AVX2 byte-unshuffle dispatcher: uses the optimized `unshuffle4_avx2`
+    /// kernel for typesize=4 and falls back to a scalar transpose otherwise.
     #[target_feature(enable = "avx2")]
     unsafe fn unshuffle_avx2(typesize: usize, src: &[u8], dest: &mut [u8]) {
         if typesize == 4 {
@@ -356,9 +416,8 @@ mod simd {
         }
     }
 
-    /// AVX2 unshuffle for typesize=4, following c-blosc2's unshuffle-avx2.c
-    /// reference: unpack-interleave bytes from 4 planes using unpack_epi8/16
-    /// and permute2x128 to restore lane order.
+    /// AVX2 byte-shuffle dispatcher: uses the optimized `shuffle4_avx2`
+    /// kernel for typesize=4, with a scalar transpose fallback for other widths.
     #[target_feature(enable = "avx2")]
     unsafe fn shuffle_avx2(typesize: usize, src: &[u8], dest: &mut [u8]) {
         if typesize == 4 {
@@ -376,7 +435,11 @@ mod simd {
         }
     }
 
-    /// AVX2 shuffle for typesize=4, following c-blosc2's `shuffle4_avx2`.
+    /// AVX2 shuffle kernel for 4-byte elements.
+    ///
+    /// Loads four 256-bit vectors at a time, interleaves with `shuffle_epi32`
+    /// and `unpack` instructions to assemble four byte planes, and uses
+    /// `permutevar8x32_epi32` to restore sequential lane order.
     #[target_feature(enable = "avx2")]
     unsafe fn shuffle4_avx2(src: &[u8], dest: &mut [u8]) {
         const BYTESOFTYPE: usize = 4;
@@ -441,6 +504,11 @@ mod simd {
         }
     }
 
+    /// AVX2 unshuffle kernel for 4-byte elements.
+    ///
+    /// Loads 32 bytes from each of the four byte planes, interleaves them with
+    /// `unpacklo/unpackhi_epi8` and `_epi16`, then permutes 128-bit lanes to
+    /// produce 128 bytes of element-ordered output per iteration.
     #[target_feature(enable = "avx2")]
     unsafe fn unshuffle4_avx2(src: &[u8], dest: &mut [u8]) {
         const BYTESOFTYPE: usize = 4;
@@ -538,6 +606,8 @@ mod simd {
         }
     }
 
+    /// SSE2 shuffle kernel for 4-byte elements, processing 16 input bytes
+    /// (4 elements) per iteration and scattering them across 4 byte planes.
     #[target_feature(enable = "sse2")]
     unsafe fn shuffle4_sse2(src: &[u8], dest: &mut [u8]) {
         let blocksize = src.len();
@@ -576,6 +646,9 @@ mod simd {
         }
     }
 
+    /// SSE2 unshuffle kernel for 4-byte elements, gathering one byte from
+    /// each of the 4 planes into 16-byte vectors and storing them back as
+    /// element-ordered output.
     #[target_feature(enable = "sse2")]
     unsafe fn unshuffle4_sse2(src: &[u8], dest: &mut [u8]) {
         let blocksize = src.len();
@@ -615,6 +688,8 @@ mod simd {
     }
 }
 
+/// SIMD shim used on non-x86 targets: all entry points decline so the scalar
+/// implementations run.
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 mod simd {
     pub fn try_shuffle(_typesize: usize, _src: &[u8], _dest: &mut [u8]) -> bool {
@@ -626,6 +701,8 @@ mod simd {
     }
 }
 
+/// Pure-scalar bitshuffle used as a reference implementation in tests so that
+/// SIMD output can be cross-checked against it.
 #[cfg(test)]
 fn bitshuffle_scalar_with_scratch(
     typesize: usize,
@@ -666,6 +743,7 @@ fn bitshuffle_scalar_with_scratch(
     blocksize as i64
 }
 
+/// Pure-scalar bitunshuffle used as a reference implementation in tests.
 #[cfg(test)]
 fn bitunshuffle_scalar_with_scratch(
     typesize: usize,
@@ -769,15 +847,24 @@ fn trans_bitrow_eight(src: &[u8], dest: &mut [u8], size: usize, elem_size: usize
     }
 }
 
-/// Apply bit-wise shuffle (bitshuffle). Returns number of bytes processed.
+/// Apply bit-wise shuffle to a block of `typesize`-sized elements.
 ///
-/// Transposes bits within elements for better compression of typed data.
-/// `scratch` is an optional pre-allocated temporary buffer (avoids per-call allocation).
+/// Bits of equal positional significance across all elements are grouped
+/// together, which typically improves compression for typed binary data.
+/// Operates in three steps internally: byte-transpose within elements, then
+/// transpose bits within each byte, then transpose bit-rows within groups of
+/// eight elements. Trailing elements that do not form a complete group of 8
+/// are copied through unchanged.
+///
+/// Returns the number of bytes processed.
 pub fn bitshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) -> i64 {
     bitshuffle_with_scratch(typesize, src, dest, None)
 }
 
-/// Bitshuffle with optional scratch buffer to avoid allocation.
+/// Like [`bitshuffle`], but accepts a caller-provided scratch buffer to avoid
+/// per-call allocation. The scratch slice must be at least as large as the
+/// number of bytes that form complete 8-element groups (`(src.len() /
+/// typesize / 8) * 8 * typesize`).
 pub fn bitshuffle_with_scratch(
     typesize: usize,
     src: &[u8],
@@ -853,6 +940,9 @@ fn shuffle_bit_eightelem(src: &[u8], dest: &mut [u8], size: usize, elem_size: us
     }
 }
 
+/// x86/x86_64 SSE2 accelerations for the bit-level transpose steps of
+/// bitshuffle. The entry points decline when their preconditions are not met
+/// so callers fall back to the scalar path.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod bitshuffle_simd {
     use super::{trans_bit_8x8, trans_bitrow_eight, trans_byte_bitrow, trans_byte_elem};
@@ -862,6 +952,7 @@ mod bitshuffle_simd {
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64 as arch;
 
+    /// Try a SIMD-accelerated bitshuffle. Returns `true` if successful.
     pub fn try_bitshuffle(
         typesize: usize,
         src: &[u8],
@@ -887,6 +978,7 @@ mod bitshuffle_simd {
         true
     }
 
+    /// Try a SIMD-accelerated bitunshuffle. Returns `true` if successful.
     pub fn try_bitunshuffle(
         typesize: usize,
         src: &[u8],
@@ -911,6 +1003,8 @@ mod bitshuffle_simd {
         true
     }
 
+    /// SSE2-accelerated equivalent of `trans_bit_byte`: transpose bits within
+    /// each byte using 64-bit loads and the `trans_bit_8x8` matrix kernel.
     #[target_feature(enable = "sse2")]
     unsafe fn trans_bit_byte_sse2(src: &[u8], dest: &mut [u8], nbyte: usize) {
         let nbyte_bitrow = nbyte / 8;
@@ -924,6 +1018,8 @@ mod bitshuffle_simd {
         }
     }
 
+    /// SSE2-accelerated equivalent of `shuffle_bit_eightelem`: undo the bit
+    /// transpose within each eight-element group using 64-bit loads.
     #[target_feature(enable = "sse2")]
     unsafe fn shuffle_bit_eightelem_sse2(
         src: &[u8],
@@ -955,6 +1051,8 @@ mod bitshuffle_simd {
     }
 }
 
+/// Bitshuffle SIMD shim used on non-x86 targets: every entry point declines so
+/// the scalar transpose runs.
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 mod bitshuffle_simd {
     pub fn try_bitshuffle(
@@ -978,12 +1076,16 @@ mod bitshuffle_simd {
     }
 }
 
-/// Reverse bit-wise shuffle (bitunshuffle). Returns number of bytes processed.
+/// Reverse bit-wise shuffle.
+///
+/// Inverse of [`bitshuffle`]; `typesize` must match the value used to encode.
+/// Returns the number of bytes processed.
 pub fn bitunshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) -> i64 {
     bitunshuffle_with_format_version(typesize, src, dest, BLOSC2_VERSION_FORMAT)
 }
 
-/// Bitunshuffle with optional scratch buffer to avoid allocation.
+/// Like [`bitunshuffle`], but accepts a caller-provided scratch buffer to
+/// avoid per-call allocation.
 pub fn bitunshuffle_with_scratch(
     typesize: usize,
     src: &[u8],
@@ -999,6 +1101,9 @@ pub fn bitunshuffle_with_scratch(
     )
 }
 
+/// Bitunshuffle that honors the legacy Blosc 1 format quirk: for
+/// `format_version == BLOSC1_VERSION_FORMAT`, blocks whose element count is
+/// not a multiple of 8 are passed through unshuffled.
 pub fn bitunshuffle_with_format_version(
     typesize: usize,
     src: &[u8],
@@ -1008,6 +1113,9 @@ pub fn bitunshuffle_with_format_version(
     bitunshuffle_with_scratch_and_format_version(typesize, src, dest, None, format_version)
 }
 
+/// Common implementation backing [`bitunshuffle`] and its variants: optional
+/// scratch buffer plus format-version-aware handling of partial trailing
+/// groups.
 fn bitunshuffle_with_scratch_and_format_version(
     typesize: usize,
     src: &[u8],
@@ -1053,10 +1161,17 @@ fn bitunshuffle_with_scratch_and_format_version(
     blocksize as i64
 }
 
-/// Apply delta encoding.
+/// Apply the delta filter to a block.
 ///
-/// If `offset == 0` (reference block), XOR each element with the previous element
-/// in the reference. Otherwise, XOR with the corresponding element in the reference.
+/// Replaces each element with the XOR of itself and a reference element,
+/// exposing redundancy across nearby blocks or elements. When
+/// `offset == 0` the block is treated as the reference block and is encoded
+/// against its own preceding element; for later blocks the reference is the
+/// corresponding element in `dref`. This filter can never fail.
+///
+/// Only element widths 1, 2, 4, and 8 are encoded element-wise; other widths
+/// fall back to 8-byte (if a multiple of 8) or single-byte XORs, mirroring
+/// the original C encoder so that output stays interoperable.
 pub fn delta_encode(
     dref: &[u8],
     offset: usize,
@@ -1097,9 +1212,11 @@ pub fn delta_encode(
     }
 }
 
-/// Reverse delta encoding (in-place).
-/// For offset=0 (reference block), decode is self-referential: `dest[i] ^= dest[i-typesize]`.
-/// For offset>0, decode uses dref: `dest[i] ^= dref[i]`.
+/// Reverse the delta filter in place over `dest`.
+///
+/// For `offset == 0` (the reference block), decoding is self-referential:
+/// each element XORs against the previous element in `dest`. For later
+/// blocks, each element XORs against the corresponding entry in `dref`.
 pub fn delta_decode(
     dref: Option<&[u8]>,
     offset: usize,
@@ -1131,10 +1248,19 @@ pub fn delta_decode(
     }
 }
 
-/// Apply the forward filter pipeline to a block.
+/// Apply the configured filter pipeline to one block in encode order.
 ///
-/// Returns the filtered data (may swap between `buf1` and `buf2`).
-/// The caller provides two working buffers; `src` is the input.
+/// The caller provides two working buffers `buf1` and `buf2`; filters are
+/// applied left-to-right and ping-pong between them so no extra allocation is
+/// needed. `src` is read directly by the first active filter to avoid a copy.
+///
+/// `filters` is the array of filter IDs (e.g. `BLOSC_SHUFFLE`,
+/// `BLOSC_BITSHUFFLE`, `BLOSC_DELTA`, `BLOSC_TRUNC_PREC`, or a user-defined
+/// ID) and `filters_meta` carries the per-filter metadata byte. `dref` is the
+/// reference block used by the delta filter (defaulting to `src`).
+///
+/// Returns the index (1 or 2) of the buffer holding the final output, or 1
+/// after a no-op copy when no filters are active.
 #[allow(clippy::too_many_arguments)]
 pub fn pipeline_forward(
     src: &[u8],
@@ -1217,9 +1343,15 @@ pub fn pipeline_forward(
     current as usize
 }
 
-/// Apply the backward filter pipeline to a block (in-place friendly).
+/// Apply the configured filter pipeline in decode order.
 ///
-/// Returns which buffer holds the result (1 or 2).
+/// Filters are applied in reverse, ping-ponging between `buf1` and `buf2`.
+/// `current_buf` (1 or 2) specifies which buffer initially holds the filtered
+/// data. `format_version` is forwarded to the bitunshuffle to preserve
+/// Blosc 1 compatibility, and `dref` provides the reference block for the
+/// delta filter.
+///
+/// Returns the index (1 or 2) of the buffer holding the decoded output.
 #[allow(clippy::too_many_arguments)]
 pub fn pipeline_backward(
     buf1: &mut [u8],
@@ -1290,13 +1422,21 @@ pub fn pipeline_backward(
     current as usize
 }
 
-/// Truncate precision: zero out least-significant bits of floating-point values.
-// See c-blosc2/blosc/trunc-prec.c. The filter zeros *mantissa* bits of IEEE-754
-// floats — sign and exponent are preserved. Only typesize 4 (f32) and 8 (f64)
-// are supported by the C library. The `prec_bits` value is signed:
-//   > 0 → absolute mantissa bits to keep (python-index-from-start semantics)
-//   < 0 → mantissa bits to drop (python-negative-index semantics)
-//   = 0 → the C library treats this as "keep 0 bits" (i.e. drop all mantissa).
+/// Truncate precision: zero out least-significant bits of IEEE-754 floats.
+///
+/// Sign and exponent are preserved; only mantissa bits are cleared, so NaN
+/// and infinity stay representable. Only typesizes 4 (f32) and 8 (f64) are
+/// processed; other widths pass through unchanged so output stays
+/// interoperable with the C library.
+///
+/// `prec_bits` is signed and follows Python-slice semantics:
+/// - `> 0`: absolute number of mantissa bits to keep
+/// - `< 0`: number of mantissa bits to drop
+/// - `= 0`: keep zero bits (drop the entire mantissa)
+///
+/// If `|prec_bits|` exceeds the mantissa width, or would clear the whole
+/// mantissa, the block is passed through unchanged (matching the C error
+/// path which returns -1).
 const BITS_MANTISSA_F32: i32 = 23;
 const BITS_MANTISSA_F64: i32 = 52;
 

@@ -1,16 +1,40 @@
-//! BloscLZ compression codec.
+//! BloscLZ — a fast LZ-family codec tuned for binary and numerical data.
 //!
-//! Based on FastLZ, a lightning-fast lossless compression library.
-//! Ported from c-blosc2/blosc/blosclz.c.
+//! BloscLZ is derived from FastLZ and is Blosc's default in-house codec.
+//! It targets very high (de)compression bandwidth on the small block sizes
+//! that Blosc uses, accepting a modest compression ratio in exchange.
+//!
+//! The wire format encodes a stream of *literal runs* and *back-references*
+//! (LZ77-style copies). A 5-bit control byte selects between the two: low
+//! 5 bits are a literal run length (0–31), the high 3 bits are a match
+//! length (3–9) or an escape into the long-distance / long-length encoding
+//! (16-bit distance, length encoded as a chain of 255-extension bytes).
+//!
+//! The encoder uses a small (≤ 16 KiB) hash table to find matches, performs
+//! a quick *entropy probe* (see [`get_cratio_with_htab`]) to bail out on
+//! incompressible input, and uses SIMD-accelerated match scanners and
+//! match-copy routines on x86 when available.
 
+/// Maximum number of bytes that can be emitted as a single literal run
+/// before the encoder must restart a new run (control byte rolls over).
 const MAX_COPY: u32 = 32;
+/// Maximum back-reference distance encodable in the short (2-byte) match
+/// form. Distances up to `MAX_FARDISTANCE` are encoded via the long form.
 const MAX_DISTANCE: u32 = 8191;
+/// Maximum back-reference distance encodable at all (long form).
 const MAX_FARDISTANCE: u32 = 65535 + MAX_DISTANCE - 1;
+/// log2 of the hash table size used for match search at the maximum level.
 const HASH_LOG: u8 = 14;
 
+/// Per-offset shift amount used by the SSSE3 16-byte repeating-pattern
+/// copy: after one 16-byte block is written, the source pointer advances
+/// by this many bytes so that the next block continues the repeat.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const COPY_MATCH_16_SHIFTS: [u8; 17] = [0, 1, 2, 1, 4, 1, 4, 2, 8, 7, 6, 5, 4, 3, 2, 1, 16];
 
+/// Build the lookup table of `pshufb` shuffle masks for repeating a short
+/// pattern (offset 1..=16) across a 16-byte SSSE3 register. Index 0 is
+/// unused; index 16 is the identity mask.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const fn copy_match_16_masks() -> [[u8; 16]; 17] {
     let mut masks = [[0u8; 16]; 17];
@@ -33,29 +57,36 @@ const fn copy_match_16_masks() -> [[u8; 16]; 17] {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const COPY_MATCH_16_MASKS: [[u8; 16]; 17] = copy_match_16_masks();
 
+/// LZ4-style Fibonacci hash: multiply by the golden-ratio constant and
+/// keep the top `32 - hash_shift` bits.
 #[inline(always)]
 fn hash_function_shift_nonzero(seq: u32, hash_shift: u32) -> u32 {
     debug_assert!(hash_shift < 32);
     seq.wrapping_mul(2654435761) >> hash_shift
 }
 
+/// Unaligned little-endian load of a 32-bit word from `base + pos`.
 #[inline(always)]
 unsafe fn readu32_ptr(base: *const u8, pos: usize) -> u32 {
     std::ptr::read_unaligned(base.add(pos).cast::<u32>())
 }
 
+/// Read `htab[idx]` without bounds checking.
 #[inline(always)]
 unsafe fn htab_get(htab: &[u32], idx: usize) -> u32 {
     debug_assert!(idx < htab.len());
     *htab.get_unchecked(idx)
 }
 
+/// Write `htab[idx] = value` without bounds checking.
 #[inline(always)]
 unsafe fn htab_set(htab: &mut [u32], idx: usize, value: u32) {
     debug_assert!(idx < htab.len());
     *htab.get_unchecked_mut(idx) = value;
 }
 
+/// Return the number of equal leading bytes shared by two non-equal
+/// machine words, taking endianness into account.
 #[inline(always)]
 fn matching_prefix_len(a: u64, b: u64) -> usize {
     let diff = a ^ b;
@@ -67,7 +98,9 @@ fn matching_prefix_len(a: u64, b: u64) -> usize {
     }
 }
 
-/// Find a run of identical bytes starting from `ip`, comparing against `refp`.
+/// Extend a "run" — a sequence of bytes equal to `data[ip - 1]` — starting
+/// at `ip`, by reading the source via `refp` and stopping at `ip_bound`.
+/// Returns the position of the first byte that breaks the run.
 #[inline]
 fn get_run(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usize) -> usize {
     debug_assert!(ip > 0 && ip <= data.len());
@@ -95,12 +128,16 @@ fn get_run(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usize) -> usiz
     ip
 }
 
-/// Find the length of a match between `ip` and `refp`.
+/// Extend a match starting at `(ip, refp)` and return the first `ip`
+/// position whose byte differs from the corresponding reference byte
+/// (one past the mismatch, matching the upstream C convention).
 #[inline(always)]
 fn get_match(data: &[u8], ip: usize, ip_bound: usize, refp: usize) -> usize {
     get_match_generic(data, ip, ip_bound, refp)
 }
 
+/// SSE2-accelerated match scanner that compares 16 bytes at a time
+/// (x86_64 variant).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 unsafe fn get_match_16_x86_64(
@@ -134,6 +171,8 @@ unsafe fn get_match_16_x86_64(
     ip
 }
 
+/// SSE2-accelerated match scanner that compares 16 bytes at a time
+/// (32-bit x86 variant).
 #[cfg(target_arch = "x86")]
 #[target_feature(enable = "sse2")]
 unsafe fn get_match_16_x86(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usize) -> usize {
@@ -162,6 +201,9 @@ unsafe fn get_match_16_x86(data: &[u8], mut ip: usize, ip_bound: usize, mut refp
     ip
 }
 
+/// Portable match scanner: compare 8 bytes at a time using unaligned
+/// 64-bit loads, then a byte-by-byte tail. Returns one past the first
+/// differing byte.
 #[inline]
 fn get_match_generic(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usize) -> usize {
     let base = data.as_ptr();
@@ -188,6 +230,9 @@ fn get_match_generic(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usiz
     ip
 }
 
+/// SSSE3 fast-path for short overlapping copies (distance ∈ [1, 16]).
+/// Uses `pshufb` with a precomputed mask to replicate the pattern across
+/// 16-byte writes (x86_64 variant).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
 unsafe fn copy_match_repeat_16_x86_64(
@@ -220,6 +265,7 @@ unsafe fn copy_match_repeat_16_x86_64(
     op + len
 }
 
+/// SSSE3 fast-path for short overlapping copies (32-bit x86 variant).
 #[cfg(target_arch = "x86")]
 #[target_feature(enable = "ssse3")]
 unsafe fn copy_match_repeat_16_x86(
@@ -252,6 +298,9 @@ unsafe fn copy_match_repeat_16_x86(
     op + len
 }
 
+/// Overlapping match copy specialised by distance, using the largest
+/// power-of-two-ish word writes that fit within one period. Falls back
+/// to a byte loop for the tail.
 #[inline(always)]
 unsafe fn copy_match_overlap_exact(
     base: *mut u8,
@@ -261,6 +310,7 @@ unsafe fn copy_match_overlap_exact(
 ) -> usize {
     let distance = op - ref_pos;
 
+    /// Copy 2 bytes from `from` to `op`.
     #[inline(always)]
     unsafe fn copy2(base: *mut u8, op: usize, from: usize) -> usize {
         let v = std::ptr::read_unaligned(base.add(from) as *const u16);
@@ -268,6 +318,7 @@ unsafe fn copy_match_overlap_exact(
         op + 2
     }
 
+    /// Copy 4 bytes from `from` to `op`.
     #[inline(always)]
     unsafe fn copy4(base: *mut u8, op: usize, from: usize) -> usize {
         let v = std::ptr::read_unaligned(base.add(from) as *const u32);
@@ -275,6 +326,7 @@ unsafe fn copy_match_overlap_exact(
         op + 4
     }
 
+    /// Copy 8 bytes from `from` to `op`.
     #[inline(always)]
     unsafe fn copy8(base: *mut u8, op: usize, from: usize) -> usize {
         let v = std::ptr::read_unaligned(base.add(from) as *const u64);
@@ -282,6 +334,7 @@ unsafe fn copy_match_overlap_exact(
         op + 8
     }
 
+    /// Copy 16 bytes from `from` to `op`.
     #[inline(always)]
     unsafe fn copy16(base: *mut u8, op: usize, from: usize) -> usize {
         let v = std::ptr::read_unaligned(base.add(from) as *const u128);
@@ -391,6 +444,11 @@ unsafe fn copy_match_overlap_exact(
     op + len
 }
 
+/// Dispatch for overlapping match copies with small distances.
+///
+/// Picks an optimised path for the common shuffle-friendly distances of 2
+/// and 4, an SSSE3 `pshufb`-based path for other short distances when
+/// available, and otherwise falls back to [`copy_match_overlap_exact`].
 #[inline(always)]
 unsafe fn copy_match_small_overlap(
     base: *mut u8,
@@ -439,6 +497,9 @@ unsafe fn copy_match_small_overlap(
     }
 }
 
+/// LZ4-style 8-byte "wild copy": stream 8 bytes at a time from `ref_pos`
+/// to `op` until `op` reaches `end`. The caller must ensure `end` leaves
+/// enough trailing slack for the final overrun.
 #[inline(always)]
 unsafe fn wild_copy_8(base: *mut u8, mut op: usize, mut ref_pos: usize, end: usize) {
     while op < end {
@@ -449,6 +510,10 @@ unsafe fn wild_copy_8(base: *mut u8, mut op: usize, mut ref_pos: usize, end: usi
     }
 }
 
+/// Choose between a run extender and a match extender based on `run`,
+/// and select the best available implementation. A zero biased distance
+/// (`run == true`) means the match overlaps with a single byte and is
+/// most efficiently handled as a run.
 #[inline(always)]
 fn get_run_or_match(
     data: &[u8],
@@ -473,8 +538,12 @@ fn get_run_or_match(
     }
 }
 
-/// Estimate compression ratio for entropy probing.
-/// `data` is a slice starting from the probe offset (like C's `ibase + shift`).
+/// Estimate the compression ratio of `data` cheaply, used for entropy
+/// probing before launching a full encode. Mirrors a streamlined version
+/// of [`compress`]: it walks the hash table and accumulates the number of
+/// output bytes that the real encoder would emit (`oc`), then returns
+/// `bytes_read / bytes_written`. Low ratios cause the caller to bail out
+/// and store the block uncompressed.
 fn get_cratio_with_htab(
     data: &[u8],
     maxlen: usize,
@@ -667,8 +736,15 @@ fn get_cratio_with_htab(
     ic / oc as f64
 }
 
-/// Compress data using BloscLZ.
-/// Returns the number of compressed bytes, or 0 if compression fails/is not beneficial.
+/// Compress `input` into `output` using the BloscLZ codec.
+///
+/// `clevel` is the Blosc compression level in `0..=9`; higher values
+/// enlarge the search-hash table and disable the entropy-probe early-exit
+/// more aggressively. The input must be at least 16 bytes and the output
+/// buffer at least 66 bytes; the buffers must not overlap.
+///
+/// Returns the number of bytes written to `output`, or `0` if the input
+/// is incompressible or the output buffer is too small.
 pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
     let length = input.len();
     let maxout = output.len();
@@ -1156,8 +1232,14 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
     op as i32
 }
 
-/// Decompress BloscLZ data.
-/// Returns the number of decompressed bytes, or 0 on error.
+/// Decompress a BloscLZ-encoded block.
+///
+/// Reads tokens from `input` and writes plain bytes into `output`. The
+/// decoder is bounds-safe: it never writes past `output.len()` and bails
+/// out on truncated or malformed input. The buffers must not overlap.
+///
+/// Returns the number of bytes written to `output`, or `0` if the input
+/// is corrupted or the output buffer is too small.
 pub fn decompress(input: &[u8], output: &mut [u8]) -> i32 {
     let length = input.len();
     let maxout = output.len();

@@ -1,3 +1,28 @@
+//! Super-chunks and the Blosc2 frame container format.
+//!
+//! A super-chunk ([`Schunk`]) is an ordered collection of independently
+//! compressed chunks that share a single set of compression and
+//! decompression parameters. It is the unit of data that Blosc2 reads from
+//! and writes to a frame on disk:
+//!
+//! * Append, insert, update or delete chunks one at a time (or in bulk).
+//! * Decompress an individual chunk, a contiguous byte range, or the whole
+//!   super-chunk.
+//! * Attach named fixed-size [`Metalayer`]s in the frame header and
+//!   variable-length metalayers in the trailer.
+//!
+//! Serialization lives in the [`frame`] submodule. Two on-disk forms are
+//! supported, both byte-compatible with C-Blosc2:
+//!
+//! * **Contiguous frame** — header, chunks, offsets index and trailer in
+//!   one file or buffer ([`Schunk::to_frame`], [`Schunk::from_frame`]).
+//! * **Sparse frame directory** — the header/offsets index in
+//!   `chunks.b2frame` with one file per compressed chunk
+//!   ([`Schunk::to_sframe_dir`], [`Schunk::open_sframe`]).
+//!
+//! [`LazySchunk`] gives random read access to a frame on disk without
+//! decompressing or even loading every chunk up front.
+
 use crate::codecs;
 use crate::compress::{self, CParams, DParams};
 use crate::constants::*;
@@ -716,6 +741,8 @@ impl Schunk {
         Ok(first.unwrap_or(self.chunks.len())..last.unwrap_or(self.chunks.len()))
     }
 
+    /// Recompute `nbytes`, `cbytes` and `chunksize` after the chunk list has
+    /// been mutated.
     fn recompute_metadata(&mut self) -> Result<(), &'static str> {
         let mut nbytes = 0i64;
         let mut cbytes = 0i64;
@@ -741,6 +768,8 @@ impl Schunk {
         Ok(())
     }
 
+    /// Refresh `chunksize`, `variable_chunks` and `vlblocks` to reflect the
+    /// current chunk list.
     fn refresh_chunk_shape(&mut self) -> Result<(), &'static str> {
         let Some((first, rest)) = self.chunks.split_first() else {
             self.chunksize = 0;
@@ -822,10 +851,12 @@ impl Schunk {
     }
 }
 
+/// Path of one chunk file inside a sparse frame directory.
 fn sframe_chunk_path(dir: &Path, chunk_id: u64) -> PathBuf {
     dir.join(format!("{chunk_id:08X}.chunk"))
 }
 
+/// Check that a metalayer name is non-empty and fits in the on-disk format.
 fn validate_metalayer_name(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("Metalayer name cannot be empty");
@@ -836,6 +867,7 @@ fn validate_metalayer_name(name: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Check that a VL-metalayer name is non-empty and fits in the on-disk format.
 fn validate_vlmetalayer_name(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("VL-metalayer name cannot be empty");
@@ -846,6 +878,8 @@ fn validate_vlmetalayer_name(name: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Reject VL-metalayer sets whose msgpack-encoded trailer would overflow the
+/// signed 32-bit size fields used by the frame format.
 fn validate_vlmetalayers_encoded_size<'a>(
     layers: impl Iterator<Item = (&'a str, &'a [u8])>,
 ) -> Result<(), &'static str> {
@@ -880,6 +914,7 @@ fn validate_vlmetalayers_encoded_size<'a>(
     Ok(())
 }
 
+/// Encoded length in bytes of a msgpack string carrying the given name.
 fn encoded_str_len(name: &str) -> usize {
     if name.len() <= 31 {
         1 + name.len()
@@ -890,6 +925,8 @@ fn encoded_str_len(name: &str) -> usize {
     }
 }
 
+/// Reject metalayer sets whose msgpack-encoded header would overflow the
+/// signed 32-bit size fields used by the frame format.
 fn validate_metalayers_encoded_size<'a>(
     layers: impl Iterator<Item = (&'a str, &'a [u8])>,
 ) -> Result<(), &'static str> {
@@ -924,6 +961,8 @@ fn validate_metalayers_encoded_size<'a>(
     Ok(())
 }
 
+/// Compute `start + len` and verify the resulting byte range fits inside the
+/// uncompressed super-chunk.
 fn checked_slice_end(start: usize, len: usize, nbytes: i64) -> Result<usize, &'static str> {
     if nbytes < 0 {
         return Err("Invalid schunk nbytes");
@@ -1084,8 +1123,9 @@ pub mod frame {
         std::fs::write(path.join("chunks.b2frame"), index)
     }
 
-    /// Build the offsets array: uint64 offsets for each chunk relative to data section start.
-    /// This matches the C convention where offset 0 = first chunk (at header_size position).
+    /// Build the contiguous-frame offsets array: little-endian `u64` offsets
+    /// for each chunk relative to the start of the data section (offset 0
+    /// being the first chunk just after the header).
     fn build_offsets(schunk: &Schunk, _header_size: usize) -> Vec<u8> {
         let nchunks = schunk.chunks.len();
         if nchunks == 0 {
@@ -1103,6 +1143,9 @@ pub mod frame {
         offsets
     }
 
+    /// Build the sparse-frame offsets array: little-endian `u64` chunk file
+    /// identifiers used to locate each chunk file inside the sparse frame
+    /// directory.
     fn build_sframe_offsets(nchunks: usize) -> Vec<u8> {
         let mut offsets = Vec::with_capacity(nchunks * 8);
         for chunk_id in 0..nchunks {
@@ -1111,6 +1154,9 @@ pub mod frame {
         offsets
     }
 
+    /// Determine the `chunksize` value to record in the frame header.
+    /// Returns the common uncompressed chunk size, or `0` when chunks are
+    /// variable-sized or carry VL-blocks.
     fn derive_frame_chunksize(schunk: &Schunk) -> usize {
         if schunk.vlblocks {
             return 0;
@@ -1136,8 +1182,9 @@ pub mod frame {
         first_nbytes
     }
 
-    /// Build a simple memcpy Blosc2 chunk for the offsets (matching C behavior).
-    /// Small data like offsets is stored as-is with the MEMCPYED flag.
+    /// Wrap the offsets payload in a Blosc2 chunk using the MEMCPYED flag so
+    /// the data is stored as-is. Small data like the offsets index is kept
+    /// uncompressed.
     fn build_offsets_chunk(data: &[u8]) -> Vec<u8> {
         let nbytes = data.len() as i32;
         let typesize: u8 = 8;
@@ -1173,7 +1220,9 @@ pub mod frame {
     const FRAME_CODEC_META: usize = 78;
     const FRAME_OTHER_FLAGS2: usize = 85;
 
-    /// Build frame header in msgpack format — exactly matching C's new_header_frame().
+    /// Build the msgpack frame header. Layout matches the C reference
+    /// implementation byte for byte: 14-entry fixarray of `b2frame\0` magic,
+    /// sizes, codec flags, filter pipeline, and any metalayers.
     fn build_header(schunk: &Schunk, nbytes: i64, cbytes: i64, chunksize: usize) -> Vec<u8> {
         // Start with 87-byte minimum header (zeroed)
         let mut h = vec![0u8; FRAME_HEADER_MIN_LEN];
@@ -1323,6 +1372,8 @@ pub mod frame {
         h
     }
 
+    /// Encode the metalayers section of the frame header: an index of
+    /// `(name, offset)` pairs followed by an array of msgpack `bin32` payloads.
     fn encode_metalayers(metalayers: &[Metalayer]) -> Vec<u8> {
         let mut section = vec![0x93, MSGPACK_UINT16, 0, 0, MSGPACK_MAP16];
         section.extend_from_slice(&(metalayers.len() as u16).to_be_bytes());
@@ -1353,6 +1404,7 @@ pub mod frame {
         section
     }
 
+    /// Append a msgpack string (`fixstr`, `str8` or `str16`) to `out`.
     fn encode_msgpack_str(out: &mut Vec<u8>, value: &str) {
         let bytes = value.as_bytes();
         if bytes.len() <= 31 {
@@ -1367,7 +1419,8 @@ pub mod frame {
         out.extend_from_slice(bytes);
     }
 
-    /// Build trailer matching C's frame_update_trailer() format.
+    /// Build the frame trailer: the VL-metalayers index and payloads followed
+    /// by the trailer length and 16-byte fingerprint placeholder.
     fn build_trailer(schunk: &Schunk) -> Vec<u8> {
         let compressed_vlmetalayers: Vec<_> = schunk
             .vlmetalayers
@@ -1425,6 +1478,8 @@ pub mod frame {
         t
     }
 
+    /// Append a VL-metalayer name as a msgpack `fixstr` (names are limited to
+    /// 31 bytes).
     fn encode_vlmeta_name(out: &mut Vec<u8>, name: &str) {
         let bytes = name.as_bytes();
         debug_assert!(bytes.len() <= 31);
@@ -1432,6 +1487,8 @@ pub mod frame {
         out.extend_from_slice(bytes);
     }
 
+    /// Cached frame-level parameters that every embedded chunk header must
+    /// agree with during frame validation.
     struct FrameChunkSpec<'a> {
         compcode: u8,
         compcode_meta: u8,
@@ -1442,6 +1499,8 @@ pub mod frame {
         vlblocks: bool,
     }
 
+    /// Check that an embedded chunk header is well-formed and matches the
+    /// codec, typesize and filter pipeline advertised by the frame header.
     fn validate_embedded_chunk_header(
         ch: &ChunkHeader,
         spec: &FrameChunkSpec<'_>,
@@ -1514,6 +1573,8 @@ pub mod frame {
         Ok(())
     }
 
+    /// Decode the metalayers section that may follow the 87-byte minimum
+    /// frame header.
     fn parse_metalayers(header: &[u8]) -> Result<Vec<Metalayer>, String> {
         if header.len() == FRAME_HEADER_MIN_LEN {
             return Ok(Vec::new());
@@ -1615,6 +1676,7 @@ pub mod frame {
         Ok(metalayers)
     }
 
+    /// Decode a msgpack `fixstr`/`str8`/`str16` string and advance `pos`.
     fn decode_msgpack_str(data: &[u8], pos: &mut usize, limit: usize) -> Result<String, String> {
         let marker = *data
             .get(*pos)
@@ -1657,6 +1719,7 @@ pub mod frame {
         Ok(name)
     }
 
+    /// Decode a msgpack `bin8`/`bin16`/`bin32` payload and advance `pos`.
     fn decode_msgpack_bin(data: &[u8], pos: &mut usize, limit: usize) -> Result<Vec<u8>, String> {
         let marker = *data
             .get(*pos)
@@ -1701,6 +1764,8 @@ pub mod frame {
         Ok(content)
     }
 
+    /// Total in-frame size of the offsets chunk that starts at `pos`, or `0`
+    /// if no offsets chunk is present.
     fn offsets_chunk_len(data: &[u8], pos: usize, frame_size: usize) -> Result<usize, String> {
         if pos >= frame_size {
             return Ok(0);
@@ -1723,6 +1788,8 @@ pub mod frame {
         Ok(cbytes)
     }
 
+    /// Decode the VL-metalayers stored in the frame trailer, decompressing
+    /// each payload to recover the original metalayer bytes.
     fn parse_vlmetalayers(
         trailer: &[u8],
         has_vlmetalayers: bool,
@@ -1820,6 +1887,8 @@ pub mod frame {
         Ok(metalayers)
     }
 
+    /// Seek to `offset` and fill `buf` from the file. `context` is used as a
+    /// prefix in error messages.
     fn read_exact_at(
         file: &mut std::fs::File,
         offset: u64,
@@ -1834,6 +1903,9 @@ pub mod frame {
             .map_err(|e| format!("{context}: read failed: {e}"))
     }
 
+    /// Read either a 16-byte or 32-byte chunk header from a frame file
+    /// starting at `pos`, depending on whether the chunk uses the extended
+    /// header format.
     fn read_chunk_header_at(
         file: &mut std::fs::File,
         pos: u64,
@@ -1871,6 +1943,8 @@ pub mod frame {
             .map_err(|_| "Invalid frame: invalid chunk header".to_string())
     }
 
+    /// File-backed counterpart of [`offsets_chunk_len`] used by the lazy
+    /// frame reader.
     fn offsets_chunk_len_from_file(
         file: &mut std::fs::File,
         pos: usize,
@@ -1893,6 +1967,9 @@ pub mod frame {
         Ok(cbytes)
     }
 
+    /// Load the `chunks.b2frame` index of a sparse frame directory and
+    /// return its raw bytes, header size, decoded chunk-file IDs, and the
+    /// byte position where the offsets chunk ends.
     fn read_sframe_index(path: &Path) -> Result<(Vec<u8>, usize, Vec<u64>, usize), String> {
         let index_path = path.join("chunks.b2frame");
         let index =
@@ -1977,6 +2054,9 @@ pub mod frame {
         ))
     }
 
+    /// Assemble a contiguous frame in memory from the sparse-frame index and
+    /// the per-chunk files in `path` so the regular contiguous-frame reader
+    /// can be reused.
     fn contiguous_frame_from_sframe_index(
         index: &[u8],
         header_size: usize,
