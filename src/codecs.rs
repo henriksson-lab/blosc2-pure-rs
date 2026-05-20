@@ -2,7 +2,7 @@
 //!
 //! Provides a uniform interface over the bundled codecs — BloscLZ, LZ4,
 //! LZ4HC, Zlib and Zstd — together with optional zstd/LZ4 dictionary
-//! variants and a registry for user-defined codecs (IDs ≥ 32).
+//! variants and a registry for plugin/user-defined codecs (IDs ≥ 32).
 //!
 //! The actual BloscLZ implementation lives in the [`blosclz`] sub-module;
 //! the other codecs are delegated to their respective Rust crates.
@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 use zstd_pure_rs::common::error::{ErrorCode, ERROR};
 use zstd_pure_rs::common::xxhash::XXH64_state_t;
+use zstd_pure_rs::decompress::zstd_ddict::{ZSTD_DDict_dictContent, ZSTD_createDDict};
 use zstd_pure_rs::decompress::zstd_decompress_block::{ZSTD_DCtx, ZSTD_decoder_entropy_rep};
 use zstd_pure_rs::prelude::*;
 
@@ -50,18 +51,18 @@ fn user_codecs() -> &'static RwLock<HashMap<u8, UserCodec>> {
     USER_CODECS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Register a user-defined codec under `compcode`.
+/// Register a plugin or user-defined codec under `compcode`.
 ///
-/// The codec ID must be ≥ [`BLOSC2_USER_DEFINED_CODECS_START`] (32);
-/// lower IDs are reserved for the built-in codecs. Subsequent calls
-/// with the same ID overwrite the existing entry.
+/// C-Blosc2 reserves IDs 32..=159 for global plugin codecs and 160..=255 for
+/// user-defined codecs. Lower IDs are reserved for built-in codecs. Subsequent
+/// calls with the same ID overwrite the existing entry.
 pub fn register_codec(
     compcode: u8,
     compress: CodecCompressFn,
     decompress: CodecDecompressFn,
 ) -> Result<(), &'static str> {
-    if compcode < BLOSC2_USER_DEFINED_CODECS_START {
-        return Err("User-defined codec IDs must be >= 32");
+    if compcode < 32 {
+        return Err("Registered codec IDs must be >= 32");
     }
     user_codecs()
         .write()
@@ -396,7 +397,7 @@ fn zstd_compress(src: &[u8], dest: &mut [u8], clevel: u8) -> i32 {
 }
 
 /// Zstd compression of a single block, seeded with a preset dictionary.
-fn zstd_compress_with_dict(src: &[u8], dest: &mut [u8], clevel: u8, dict: &[u8]) -> i32 {
+fn zstd_compress_with_dict(src: &[u8], dest: &mut [u8], _clevel: u8, dict: &[u8]) -> i32 {
     let n = ZSTD_DICT_CCTX.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
@@ -405,7 +406,7 @@ fn zstd_compress_with_dict(src: &[u8], dest: &mut [u8], clevel: u8, dict: &[u8])
         let Some(cctx) = slot.as_deref_mut() else {
             return ERROR(ErrorCode::MemoryAllocation);
         };
-        ZSTD_compress_usingDict(cctx, dest, src, dict, blosc_clevel_to_zstd(clevel))
+        ZSTD_compress_usingDict(cctx, dest, src, dict, 1)
     });
     if ERR_isError(n) {
         0
@@ -433,7 +434,16 @@ fn zstd_decompress(src: &[u8], dest: &mut [u8]) -> i32 {
 fn zstd_decompress_with_dict(src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
     let n = ZSTD_DICT_DCTX.with(|slot| {
         let mut dctx = slot.borrow_mut();
-        ZSTD_decompress_usingDict(&mut dctx, dest, src, dict)
+        let Some(ddict) = ZSTD_createDDict(dict) else {
+            return ERROR(ErrorCode::DictionaryCorrupted);
+        };
+        let n = ZSTD_decompress_usingDDict(&mut dctx, dest, src, &ddict);
+        if ERR_isError(n) {
+            let content = ZSTD_DDict_dictContent(&ddict);
+            ZSTD_decompress_usingDict(&mut dctx, dest, src, content)
+        } else {
+            n
+        }
     });
     if ERR_isError(n) {
         -1

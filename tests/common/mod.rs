@@ -8,7 +8,7 @@ pub mod ffi {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
-#[link(name = "blosc2", kind = "static")]
+#[link(name = "blosc2", kind = "dylib")]
 extern "C" {}
 
 /// RAII guard that initializes C-Blosc2 for FFI comparison tests.

@@ -43,6 +43,42 @@ pub struct ChunkHeader {
 }
 
 impl ChunkHeader {
+    fn read_legacy_fields(data: &[u8]) -> Result<Self, &'static str> {
+        if data.len() < BLOSC_MIN_HEADER_LENGTH {
+            return Err("Buffer too small for header");
+        }
+
+        let mut h = ChunkHeader {
+            version: data[BLOSC2_CHUNK_VERSION],
+            versionlz: data[BLOSC2_CHUNK_VERSIONLZ],
+            flags: data[BLOSC2_CHUNK_FLAGS],
+            typesize: data[BLOSC2_CHUNK_TYPESIZE],
+            nbytes: i32::from_le_bytes(data[4..8].try_into().unwrap()),
+            blocksize: i32::from_le_bytes(data[8..12].try_into().unwrap()),
+            cbytes: i32::from_le_bytes(data[12..16].try_into().unwrap()),
+            ..Default::default()
+        };
+
+        if h.flags & BLOSC_DOBITSHUFFLE != 0 {
+            h.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_BITSHUFFLE;
+        } else if h.flags & BLOSC_DOSHUFFLE != 0 {
+            h.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_SHUFFLE;
+        }
+        if h.flags & BLOSC_DODELTA != 0 {
+            h.filters[BLOSC2_MAX_FILTERS - 2] = BLOSC_DELTA;
+        }
+
+        Ok(h)
+    }
+
+    /// Parses only the 16-byte legacy prefix of a chunk header.
+    ///
+    /// This mirrors C-Blosc metadata queries, which can inspect size and basic
+    /// filter information without requiring the full compressed payload.
+    pub fn read_minimal(data: &[u8]) -> Result<Self, &'static str> {
+        Self::read_legacy_fields(data)
+    }
+
     /// Returns `true` if this chunk uses the extended 32-byte Blosc2 header.
     ///
     /// Encoded as both the shuffle and bit-shuffle flags being set in the flags byte.
@@ -57,11 +93,11 @@ impl ChunkHeader {
 
     /// Returns the effective codec ID.
     ///
-    /// For extended headers with a non-zero user-defined codec slot, the value
-    /// from [`udcompcode`](Self::udcompcode) is returned; otherwise the 3-bit
-    /// format code is mapped back to a codec ID via [`compformat_to_compcode`].
+    /// For user-defined codec format headers, the value from
+    /// [`udcompcode`](Self::udcompcode) is returned; otherwise the 3-bit format
+    /// code is mapped back to a codec ID via [`compformat_to_compcode`].
     pub fn compcode(&self) -> u8 {
-        if self.is_extended() && self.udcompcode != 0 {
+        if self.is_extended() && self.compformat() == BLOSC_UDCODEC_FORMAT {
             self.udcompcode
         } else {
             compformat_to_compcode(self.compformat())
@@ -134,27 +170,15 @@ impl ChunkHeader {
     /// Parses a chunk header from raw bytes.
     ///
     /// Requires at least [`BLOSC_MIN_HEADER_LENGTH`] bytes. Extended-header
-    /// fields are filled in only if both flag bits are set and the buffer is
-    /// at least [`BLOSC_EXTENDED_HEADER_LENGTH`] bytes long; otherwise they
-    /// stay at their default zero values.
+    /// fields are required when both extended-header flag bits are set.
     pub fn read(data: &[u8]) -> Result<Self, &'static str> {
-        if data.len() < BLOSC_MIN_HEADER_LENGTH {
-            return Err("Buffer too small for header");
-        }
-
-        let mut h = ChunkHeader {
-            version: data[BLOSC2_CHUNK_VERSION],
-            versionlz: data[BLOSC2_CHUNK_VERSIONLZ],
-            flags: data[BLOSC2_CHUNK_FLAGS],
-            typesize: data[BLOSC2_CHUNK_TYPESIZE],
-            nbytes: i32::from_le_bytes(data[4..8].try_into().unwrap()),
-            blocksize: i32::from_le_bytes(data[8..12].try_into().unwrap()),
-            cbytes: i32::from_le_bytes(data[12..16].try_into().unwrap()),
-            ..Default::default()
-        };
+        let mut h = Self::read_legacy_fields(data)?;
 
         // Extended header (32 bytes)
-        if h.is_extended() && data.len() >= BLOSC_EXTENDED_HEADER_LENGTH {
+        if h.is_extended() {
+            if data.len() < BLOSC_EXTENDED_HEADER_LENGTH {
+                return Err("Buffer too small for extended header");
+            }
             h.filters
                 .copy_from_slice(&data[BLOSC2_CHUNK_FILTER_CODES..BLOSC2_CHUNK_FILTER_CODES + 6]);
             h.udcompcode = data[BLOSC2_CHUNK_UDCOMPCODE];
@@ -163,6 +187,10 @@ impl ChunkHeader {
                 .copy_from_slice(&data[BLOSC2_CHUNK_FILTER_META..BLOSC2_CHUNK_FILTER_META + 6]);
             h.blosc2_flags2 = data[BLOSC2_CHUNK_BLOSC2_FLAGS2];
             h.blosc2_flags = data[BLOSC2_CHUNK_BLOSC2_FLAGS];
+            if h.version == BLOSC2_VERSION_FORMAT_ALPHA {
+                h.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_NOFILTER;
+                h.filters_meta[BLOSC2_MAX_FILTERS - 1] = 0;
+            }
         }
 
         Ok(h)
@@ -190,7 +218,10 @@ impl ChunkHeader {
         buf[BLOSC2_CHUNK_FILTER_META..BLOSC2_CHUNK_FILTER_META + 6]
             .copy_from_slice(&self.filters_meta);
         buf[BLOSC2_CHUNK_BLOSC2_FLAGS2] = self.blosc2_flags2;
-        buf[BLOSC2_CHUNK_BLOSC2_FLAGS] = self.blosc2_flags;
+        let blosc2_flags = self.blosc2_flags;
+        #[cfg(target_endian = "big")]
+        let blosc2_flags = blosc2_flags | BLOSC2_BIGENDIAN;
+        buf[BLOSC2_CHUNK_BLOSC2_FLAGS] = blosc2_flags;
         Ok(())
     }
 

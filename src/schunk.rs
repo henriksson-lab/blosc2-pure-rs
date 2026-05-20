@@ -88,6 +88,7 @@ pub struct LazyChunkRef {
     pub cbytes: usize,
     /// Uncompressed chunk size in bytes.
     pub nbytes: usize,
+    special: Option<u8>,
 }
 
 /// A file-backed super-chunk that loads compressed chunks on demand.
@@ -126,7 +127,9 @@ impl LazySchunk {
     /// Decompress a chunk by index, reading only that compressed chunk from the frame file.
     pub fn decompress_chunk(&self, nchunk: i64) -> Result<Vec<u8>, String> {
         let chunk = self.read_chunk_bytes(nchunk)?;
-        compress::decompress_with_dparams(&chunk, &self.dparams).map_err(str::to_string)
+        let mut dparams = self.dparams.clone();
+        dparams.nchunk = nchunk;
+        compress::decompress_with_dparams(&chunk, &dparams).map_err(str::to_string)
     }
 
     /// Return decompressed bytes spanning the whole super-chunk.
@@ -218,9 +221,14 @@ impl LazySchunk {
             .chunks
             .get(nchunk as usize)
             .ok_or_else(|| "Chunk index out of range".to_string())?;
+        if let Some(special) = chunk_ref.special {
+            return synthetic_special_chunk_for_params(special, chunk_ref.nbytes, &self.cparams);
+        }
         if self.sframe {
-            return std::fs::read(sframe_chunk_path(&self.path, chunk_ref.offset))
-                .map_err(|e| format!("Failed to read sparse frame chunk: {e}"));
+            let chunk = std::fs::read(sframe_chunk_path(&self.path, chunk_ref.offset))
+                .map_err(|e| format!("Failed to read sparse frame chunk: {e}"))?;
+            compress::cbuffer_validate(&chunk).map_err(|err| format!("Invalid frame: {err}"))?;
+            return Ok(chunk);
         }
         let mut file = std::fs::File::open(&self.path)
             .map_err(|e| format!("Failed to open frame file: {e}"))?;
@@ -230,8 +238,42 @@ impl LazySchunk {
         let mut chunk = vec![0u8; chunk_ref.cbytes];
         file.read_exact(&mut chunk)
             .map_err(|e| format!("Failed to read chunk: {e}"))?;
+        compress::cbuffer_validate(&chunk).map_err(|err| format!("Invalid frame: {err}"))?;
         Ok(chunk)
     }
+}
+
+fn synthetic_special_chunk_for_params(
+    special_type: u8,
+    nbytes: usize,
+    cparams: &CParams,
+) -> Result<Vec<u8>, String> {
+    if nbytes > i32::MAX as usize {
+        return Err("Invalid frame: special chunk is too large".to_string());
+    }
+    compress::validate_cparams(cparams, nbytes).map_err(|err| format!("Invalid frame: {err}"))?;
+    let normalized_cparams = compress::normalized_cparams(cparams);
+    let typesize = normalized_cparams.typesize as usize;
+    if nbytes != 0 && !nbytes.is_multiple_of(typesize) {
+        return Err("Invalid frame: special chunk size is not a multiple of typesize".to_string());
+    }
+    let blocksize = compress::compute_blocksize(&normalized_cparams, nbytes as i32);
+    let mut chunk = vec![0u8; BLOSC_EXTENDED_HEADER_LENGTH];
+    let header = ChunkHeader {
+        version: BLOSC2_VERSION_FORMAT_STABLE,
+        versionlz: BLOSC_BLOSCLZ_VERSION_FORMAT,
+        flags: BLOSC_DOSHUFFLE | BLOSC_DOBITSHUFFLE,
+        typesize: chunk_header_typesize(normalized_cparams.typesize),
+        nbytes: nbytes as i32,
+        blocksize,
+        cbytes: BLOSC_EXTENDED_HEADER_LENGTH as i32,
+        blosc2_flags: special_type << 4,
+        ..Default::default()
+    };
+    header
+        .try_write(&mut chunk)
+        .map_err(|_| "Invalid frame: cannot build special chunk".to_string())?;
+    Ok(chunk)
 }
 
 impl Schunk {
@@ -257,12 +299,14 @@ impl Schunk {
     }
 
     /// Compress and append a data buffer as a new chunk.
-    /// Returns the chunk index on success.
+    /// Returns the resulting number of chunks, matching the C API.
     pub fn append_buffer(&mut self, data: &[u8]) -> Result<i64, &'static str> {
         if self.vlblocks {
             return Err("Cannot mix regular and VL-block chunks");
         }
-        let chunk = compress::compress(data, &self.cparams)?;
+        let mut cparams = self.cparams.clone();
+        cparams.nchunk = self.chunks.len() as i64;
+        let chunk = compress::compress(data, &cparams)?;
 
         let new_chunksize = if self.chunks.is_empty() {
             data.len()
@@ -283,7 +327,7 @@ impl Schunk {
         self.chunks.push(chunk);
         self.refresh_chunk_shape()?;
 
-        Ok(self.chunks.len() as i64 - 1)
+        Ok(self.chunks.len() as i64)
     }
 
     /// Compress and append multiple regular chunks, preserving input order.
@@ -299,7 +343,17 @@ impl Schunk {
             return Ok(idx..idx);
         }
 
-        let chunks = compress::compress_many(buffers, &self.cparams)?;
+        let start = self.chunks.len() as i64;
+        let chunks: Result<Vec<_>, _> = buffers
+            .iter()
+            .enumerate()
+            .map(|(idx, buffer)| {
+                let mut cparams = self.cparams.clone();
+                cparams.nchunk = start + idx as i64;
+                compress::compress(buffer, &cparams)
+            })
+            .collect();
+        let chunks = chunks?;
         let add_nbytes = buffers.iter().try_fold(0i64, |acc, buffer| {
             acc.checked_add(buffer.len() as i64)
                 .ok_or("Schunk nbytes overflow")
@@ -308,7 +362,6 @@ impl Schunk {
             acc.checked_add(chunk.len() as i64)
                 .ok_or("Schunk cbytes overflow")
         })?;
-        let start = self.chunks.len() as i64;
         self.nbytes = self
             .nbytes
             .checked_add(add_nbytes)
@@ -326,11 +379,14 @@ impl Schunk {
     }
 
     /// Compress and append independent variable-length blocks as one VL-block chunk.
+    /// Returns the resulting number of chunks, matching the C API.
     pub fn append_vlblocks(&mut self, blocks: &[&[u8]]) -> Result<i64, &'static str> {
         if !self.chunks.is_empty() && !self.vlblocks {
             return Err("Cannot mix regular and VL-block chunks");
         }
-        let chunk = compress::vlcompress(blocks, &self.cparams)?;
+        let mut cparams = self.cparams.clone();
+        cparams.nchunk = self.chunks.len() as i64;
+        let chunk = compress::vlcompress(blocks, &cparams)?;
         let (chunk_nbytes, chunk_cbytes, _) = compress::cbuffer_sizes(&chunk)?;
         let new_nbytes = self
             .nbytes
@@ -346,7 +402,7 @@ impl Schunk {
         self.variable_chunks = true;
         self.vlblocks = true;
         self.chunks.push(chunk);
-        Ok(self.chunks.len() as i64 - 1)
+        Ok(self.chunks.len() as i64)
     }
 
     /// Decompress a chunk by index.
@@ -359,7 +415,9 @@ impl Schunk {
         if idx >= self.chunks.len() {
             return Err("Chunk index out of range");
         }
-        compress::decompress_with_dparams(&self.chunks[idx], &self.dparams)
+        let mut dparams = self.dparams.clone();
+        dparams.nchunk = nchunk;
+        compress::decompress_with_dparams(&self.chunks[idx], &dparams)
     }
 
     /// Borrow the raw compressed bytes for a chunk by index.
@@ -398,11 +456,13 @@ impl Schunk {
         if idx >= self.chunks.len() {
             return Err("Chunk index out of range");
         }
-        compress::decompress_into_with_dparams(&self.chunks[idx], dest, &self.dparams)
+        let mut dparams = self.dparams.clone();
+        dparams.nchunk = nchunk;
+        compress::decompress_into_with_dparams(&self.chunks[idx], dest, &dparams)
     }
 
     /// Compress and insert a data buffer before `nchunk`.
-    /// Returns the inserted chunk index on success.
+    /// Returns the resulting number of chunks, matching the C API.
     pub fn insert_buffer(&mut self, nchunk: i64, data: &[u8]) -> Result<i64, &'static str> {
         if self.vlblocks {
             return Err("Cannot mix regular and VL-block chunks");
@@ -411,7 +471,9 @@ impl Schunk {
             return Err("Chunk index out of range");
         }
 
-        let chunk = compress::compress(data, &self.cparams)?;
+        let mut cparams = self.cparams.clone();
+        cparams.nchunk = nchunk;
+        let chunk = compress::compress(data, &cparams)?;
         let new_nbytes = self
             .nbytes
             .checked_add(data.len() as i64)
@@ -432,25 +494,50 @@ impl Schunk {
         self.cbytes = new_cbytes;
         self.refresh_chunk_shape()?;
 
-        Ok(nchunk)
+        Ok(self.chunks.len() as i64)
     }
 
-    /// Delete a chunk and return its decompressed data.
-    pub fn delete_chunk(&mut self, nchunk: i64) -> Result<Vec<u8>, &'static str> {
+    pub(crate) fn insert_special_zero_chunk(
+        &mut self,
+        nchunk: i64,
+        nbytes: usize,
+    ) -> Result<i64, &'static str> {
+        if self.vlblocks {
+            return Err("Cannot mix regular and VL-block chunks");
+        }
+        if nchunk < 0 || nchunk as usize > self.chunks.len() {
+            return Err("Chunk index out of range");
+        }
+
+        let chunk = synthetic_special_chunk_for_params(BLOSC2_SPECIAL_ZERO, nbytes, &self.cparams)
+            .map_err(|_| "Invalid special zero chunk")?;
+        self.chunks.insert(nchunk as usize, chunk);
+        self.recompute_metadata()?;
+        Ok(self.chunks.len() as i64)
+    }
+
+    /// Delete a chunk and return the resulting number of chunks, matching the C API.
+    pub fn delete_chunk(&mut self, nchunk: i64) -> Result<i64, &'static str> {
         if nchunk < 0 || nchunk as usize >= self.chunks.len() {
             return Err("Chunk index out of range");
         }
         let idx = nchunk as usize;
-        let data = self.decompress_chunk(nchunk)?;
 
         self.chunks.remove(idx);
         self.recompute_metadata()?;
 
+        Ok(self.chunks.len() as i64)
+    }
+
+    /// Delete a chunk and return its decompressed data.
+    pub fn delete_chunk_data(&mut self, nchunk: i64) -> Result<Vec<u8>, &'static str> {
+        let data = self.decompress_chunk(nchunk)?;
+        self.delete_chunk(nchunk)?;
         Ok(data)
     }
 
     /// Replace a chunk with newly compressed data.
-    pub fn update_chunk(&mut self, nchunk: i64, data: &[u8]) -> Result<(), &'static str> {
+    pub fn update_chunk(&mut self, nchunk: i64, data: &[u8]) -> Result<i64, &'static str> {
         if self.vlblocks {
             return Err("Cannot update a VL-block schunk with regular chunks");
         }
@@ -459,9 +546,12 @@ impl Schunk {
         }
 
         let idx = nchunk as usize;
-        let chunk = compress::compress(data, &self.cparams)?;
+        let mut cparams = self.cparams.clone();
+        cparams.nchunk = nchunk;
+        let chunk = compress::compress(data, &cparams)?;
         self.chunks[idx] = chunk;
-        self.recompute_metadata()
+        self.recompute_metadata()?;
+        Ok(self.chunks.len() as i64)
     }
 
     /// Deep-copy the super-chunk.
@@ -469,26 +559,45 @@ impl Schunk {
         self.clone()
     }
 
-    /// Add or replace a named fixed-size metalayer.
+    /// Add a named fixed-size metalayer.
     pub fn add_metalayer(&mut self, name: &str, content: &[u8]) -> Result<(), &'static str> {
         validate_metalayer_name(name)?;
+        if self.metalayers.iter().any(|layer| layer.name == name) {
+            return Err("Metalayer already exists");
+        }
         validate_metalayers_encoded_size(
             self.metalayers
                 .iter()
-                .filter(|layer| layer.name != name)
                 .map(|layer| (layer.name.as_str(), layer.content.as_slice()))
                 .chain(std::iter::once((name, content))),
         )?;
 
-        if let Some(layer) = self.metalayers.iter_mut().find(|layer| layer.name == name) {
-            layer.content.clear();
-            layer.content.extend_from_slice(content);
-        } else {
-            self.metalayers.push(Metalayer {
-                name: name.to_string(),
-                content: content.to_vec(),
-            });
-        }
+        self.metalayers.push(Metalayer {
+            name: name.to_string(),
+            content: content.to_vec(),
+        });
+        Ok(())
+    }
+
+    /// Replace an existing fixed-size metalayer payload.
+    pub fn update_metalayer(&mut self, name: &str, content: &[u8]) -> Result<(), &'static str> {
+        validate_metalayer_name(name)?;
+        let pos = self
+            .metalayers
+            .iter()
+            .position(|layer| layer.name == name)
+            .ok_or("Metalayer does not exist")?;
+        validate_metalayers_encoded_size(self.metalayers.iter().enumerate().map(
+            |(idx, layer)| {
+                if idx == pos {
+                    (name, content)
+                } else {
+                    (layer.name.as_str(), layer.content.as_slice())
+                }
+            },
+        ))?;
+        self.metalayers[pos].content.clear();
+        self.metalayers[pos].content.extend_from_slice(content);
         Ok(())
     }
 
@@ -509,12 +618,15 @@ impl Schunk {
         Some(self.metalayers.remove(pos).content)
     }
 
-    /// Add or replace a named variable-length metalayer.
+    /// Add a named variable-length metalayer.
     pub fn add_vlmetalayer(&mut self, name: &str, content: &[u8]) -> Result<(), &'static str> {
         validate_vlmetalayer_name(name)?;
+        if self.vlmetalayers.iter().any(|layer| layer.name == name) {
+            return Err("VL-metalayer already exists");
+        }
         let compressed = compress::compress(content, &CParams::default())?;
         let mut compressed_layers = Vec::with_capacity(self.vlmetalayers.len() + 1);
-        for layer in self.vlmetalayers.iter().filter(|layer| layer.name != name) {
+        for layer in &self.vlmetalayers {
             compressed_layers.push((
                 layer.name.as_str(),
                 compress::compress(&layer.content, &CParams::default())?,
@@ -527,19 +639,40 @@ impl Schunk {
                 .map(|(layer_name, compressed)| (*layer_name, compressed.as_slice())),
         )?;
 
-        if let Some(layer) = self
+        self.vlmetalayers.push(Metalayer {
+            name: name.to_string(),
+            content: content.to_vec(),
+        });
+        Ok(())
+    }
+
+    /// Replace an existing variable-length metalayer payload.
+    pub fn update_vlmetalayer(&mut self, name: &str, content: &[u8]) -> Result<(), &'static str> {
+        validate_vlmetalayer_name(name)?;
+        let pos = self
             .vlmetalayers
-            .iter_mut()
-            .find(|layer| layer.name == name)
-        {
-            layer.content.clear();
-            layer.content.extend_from_slice(content);
-        } else {
-            self.vlmetalayers.push(Metalayer {
-                name: name.to_string(),
-                content: content.to_vec(),
-            });
+            .iter()
+            .position(|layer| layer.name == name)
+            .ok_or("VL-metalayer does not exist")?;
+        let compressed = compress::compress(content, &CParams::default())?;
+        let mut compressed_layers = Vec::with_capacity(self.vlmetalayers.len());
+        for (idx, layer) in self.vlmetalayers.iter().enumerate() {
+            if idx == pos {
+                compressed_layers.push((name, compressed.clone()));
+            } else {
+                compressed_layers.push((
+                    layer.name.as_str(),
+                    compress::compress(&layer.content, &CParams::default())?,
+                ));
+            }
         }
+        validate_vlmetalayers_encoded_size(
+            compressed_layers
+                .iter()
+                .map(|(layer_name, compressed)| (*layer_name, compressed.as_slice())),
+        )?;
+        self.vlmetalayers[pos].content.clear();
+        self.vlmetalayers[pos].content.extend_from_slice(content);
         Ok(())
     }
 
@@ -564,10 +697,12 @@ impl Schunk {
     pub fn decompress_all(&self) -> Result<Vec<u8>, &'static str> {
         let capacity = usize::try_from(self.nbytes).map_err(|_| "Invalid schunk nbytes")?;
         if self.dparams.nthreads > 1 && self.chunks.len() > 1 {
+            let mut dparams = self.dparams.clone();
+            dparams.nthreads = 1;
             let chunks: Vec<Vec<u8>> = compress::with_thread_pool(self.dparams.nthreads, || {
                 self.chunks
                     .par_iter()
-                    .map(|chunk| compress::decompress_with_dparams(chunk, &DParams::default()))
+                    .map(|chunk| compress::decompress_with_dparams(chunk, &dparams))
                     .collect::<Result<Vec<_>, _>>()
             })?;
             let mut out = Vec::with_capacity(capacity);
@@ -693,10 +828,20 @@ impl Schunk {
     /// Return compressed chunk offsets relative to the frame data section.
     pub fn chunk_offsets(&self) -> Vec<u64> {
         let mut offsets = Vec::with_capacity(self.chunks.len());
+        let encode_special_offsets = false;
         let mut offset = 0u64;
         for chunk in &self.chunks {
+            if encode_special_offsets {
+                if let Some(special) = frame::special_offset_for_chunk(chunk) {
+                    offsets.push(special);
+                    continue;
+                }
+            }
             offsets.push(offset);
-            offset = offset.saturating_add(chunk.len() as u64);
+            offset =
+                offset.saturating_add(
+                    frame::stored_frame_chunk_len(chunk, encode_special_offsets) as u64
+                );
         }
         offsets
     }
@@ -771,20 +916,11 @@ impl Schunk {
     /// Refresh `chunksize`, `variable_chunks` and `vlblocks` to reflect the
     /// current chunk list.
     fn refresh_chunk_shape(&mut self) -> Result<(), &'static str> {
-        let Some((first, rest)) = self.chunks.split_first() else {
+        if self.chunks.is_empty() {
             self.chunksize = 0;
             self.variable_chunks = false;
             self.vlblocks = false;
             return Ok(());
-        };
-        let (first_nbytes, _, _) = compress::cbuffer_sizes(first)?;
-        let mut variable = false;
-        for chunk in rest {
-            let (chunk_nbytes, _, _) = compress::cbuffer_sizes(chunk)?;
-            if chunk_nbytes != first_nbytes {
-                variable = true;
-                break;
-            }
         }
         self.vlblocks = self
             .chunks
@@ -794,8 +930,9 @@ impl Schunk {
             self.variable_chunks = true;
             self.chunksize = 0;
         } else {
-            self.variable_chunks = variable;
-            self.chunksize = if variable { 0 } else { first_nbytes };
+            let chunksize = fixed_tail_chunksize(&self.chunks)?;
+            self.variable_chunks = chunksize == 0 && !self.chunks.is_empty();
+            self.chunksize = chunksize;
         }
         Ok(())
     }
@@ -829,7 +966,8 @@ impl Schunk {
             return frame::read_sframe_dir(Path::new(path));
         }
         let data = std::fs::read(path).map_err(|e| format!("Failed to read file: {e}"))?;
-        Self::from_frame(&data)
+        let frame_len = frame::declared_frame_size(&data).unwrap_or(data.len());
+        Self::from_frame(&data[..frame_len])
     }
 
     /// Open a sparse frame directory.
@@ -848,6 +986,14 @@ impl Schunk {
     /// Open a sparse frame directory lazily.
     pub fn open_lazy_sframe(path: impl AsRef<Path>) -> Result<LazySchunk, String> {
         frame::read_lazy_sframe_dir(path.as_ref())
+    }
+}
+
+fn chunk_header_typesize(typesize: i32) -> u8 {
+    if typesize > BLOSC_MAX_TYPESIZE as i32 {
+        1
+    } else {
+        typesize as u8
     }
 }
 
@@ -889,7 +1035,7 @@ fn validate_vlmetalayers_encoded_size<'a>(
     for (name, compressed_content) in layers {
         validate_vlmetalayer_name(name)?;
         count += 1;
-        if count > i16::MAX as usize {
+        if count > BLOSC2_MAX_METALAYERS {
             return Err("Too many VL-metalayers");
         }
         index_len = index_len
@@ -936,7 +1082,7 @@ fn validate_metalayers_encoded_size<'a>(
     for (name, content) in layers {
         validate_metalayer_name(name)?;
         count += 1;
-        if count > u16::MAX as usize {
+        if count > BLOSC2_MAX_METALAYERS {
             return Err("Too many metalayers");
         }
         index_len = index_len
@@ -974,6 +1120,25 @@ fn checked_slice_end(start: usize, len: usize, nbytes: i64) -> Result<usize, &'s
     Ok(end)
 }
 
+fn fixed_tail_chunksize(chunks: &[Vec<u8>]) -> Result<usize, &'static str> {
+    let Some((first, rest)) = chunks.split_first() else {
+        return Ok(0);
+    };
+    let (first_nbytes, _, _) = compress::cbuffer_sizes(first)?;
+    for (idx, chunk) in rest.iter().enumerate() {
+        let (chunk_nbytes, _, _) = compress::cbuffer_sizes(chunk)?;
+        let is_last = idx + 1 == rest.len();
+        if is_last {
+            if chunk_nbytes > first_nbytes {
+                return Ok(0);
+            }
+        } else if chunk_nbytes != first_nbytes {
+            return Ok(0);
+        }
+    }
+    Ok(first_nbytes)
+}
+
 /// Frame format implementation.
 ///
 /// The frame format uses msgpack encoding for the header and stores
@@ -990,8 +1155,6 @@ pub mod frame {
     const MSGPACK_INT16: u8 = 0xD1;
     const MSGPACK_STR4: u8 = 0xA4; // fixstr of 4 bytes
     const MSGPACK_STR16: u8 = 0xDA;
-    const MSGPACK_BIN8: u8 = 0xC4;
-    const MSGPACK_BIN16: u8 = 0xC5;
     const MSGPACK_BIN32: u8 = 0xC6;
     const MSGPACK_UINT16: u8 = 0xCD;
     const MSGPACK_UINT32: u8 = 0xCE;
@@ -1004,6 +1167,19 @@ pub mod frame {
     const FRAME_MAGIC: &[u8] = b"b2frame\0";
     pub(super) const FRAME_HEADER_MIN_LEN: usize = 87;
 
+    pub(super) fn declared_frame_size(data: &[u8]) -> Option<usize> {
+        if data.len() < 24
+            || data[0] != MSGPACK_FIXARRAY_14
+            || data[1] != MSGPACK_STR8
+            || &data[2..10] != FRAME_MAGIC
+            || data[15] != MSGPACK_UINT64
+        {
+            return None;
+        }
+        let frame_size = u64::from_be_bytes(data[16..24].try_into().ok()?) as usize;
+        (frame_size <= data.len()).then_some(frame_size)
+    }
+
     /// Write a frame from a schunk.
     pub fn write_frame(schunk: &Schunk) -> Vec<u8> {
         let nbytes: i64 = schunk
@@ -1012,15 +1188,20 @@ pub mod frame {
             .filter_map(|chunk| ChunkHeader::read(chunk).ok())
             .map(|header| i64::from(header.nbytes))
             .sum();
-        let cbytes: i64 = schunk.chunks.iter().map(|chunk| chunk.len() as i64).sum();
         let chunksize = derive_frame_chunksize(schunk);
+        let encode_special_offsets = false;
+        let cbytes: i64 = schunk
+            .chunks
+            .iter()
+            .map(|chunk| stored_frame_chunk_len(chunk, encode_special_offsets) as i64)
+            .sum();
 
         // Build header first to know its size
         let header = build_header(schunk, nbytes, cbytes, chunksize);
         let header_size = header.len();
 
         // Build the offset index as a Blosc2 chunk with int64 offsets
-        let offsets_data = build_offsets(schunk, header_size);
+        let offsets_data = build_offsets(schunk, header_size, encode_special_offsets);
         let offsets_chunk = if !offsets_data.is_empty() {
             build_offsets_chunk(&offsets_data)
         } else {
@@ -1037,7 +1218,9 @@ pub mod frame {
 
         // Data chunks
         for chunk in &schunk.chunks {
-            frame.extend_from_slice(chunk);
+            if stored_frame_chunk_len(chunk, encode_special_offsets) != 0 {
+                frame.extend_from_slice(chunk);
+            }
         }
 
         // Offset index
@@ -1061,11 +1244,16 @@ pub mod frame {
             .filter_map(|chunk| ChunkHeader::read(chunk).ok())
             .map(|header| i64::from(header.nbytes))
             .sum();
-        let cbytes: i64 = schunk.chunks.iter().map(|chunk| chunk.len() as i64).sum();
         let chunksize = derive_frame_chunksize(schunk);
+        let encode_special_offsets = false;
+        let cbytes: i64 = schunk
+            .chunks
+            .iter()
+            .map(|chunk| stored_frame_chunk_len(chunk, encode_special_offsets) as i64)
+            .sum();
 
         let mut header = build_header(schunk, nbytes, cbytes, chunksize);
-        let offsets_data = build_offsets(schunk, header.len());
+        let offsets_data = build_offsets(schunk, header.len(), encode_special_offsets);
         let offsets_chunk = if offsets_data.is_empty() {
             Vec::new()
         } else {
@@ -1078,7 +1266,9 @@ pub mod frame {
 
         writer.write_all(&header)?;
         for chunk in &schunk.chunks {
-            writer.write_all(chunk)?;
+            if stored_frame_chunk_len(chunk, encode_special_offsets) != 0 {
+                writer.write_all(chunk)?;
+            }
         }
         writer.write_all(&offsets_chunk)?;
         writer.write_all(&trailer)?;
@@ -1095,13 +1285,24 @@ pub mod frame {
             .filter_map(|chunk| ChunkHeader::read(chunk).ok())
             .map(|header| i64::from(header.nbytes))
             .sum();
-        let cbytes: i64 = schunk.chunks.iter().map(|chunk| chunk.len() as i64).sum();
         let chunksize = derive_frame_chunksize(schunk);
+        let encode_special_offsets = chunksize > 0;
+        let cbytes: i64 = schunk
+            .chunks
+            .iter()
+            .map(|chunk| stored_frame_chunk_len(chunk, encode_special_offsets) as i64)
+            .sum();
 
         let mut header = build_header(schunk, nbytes, cbytes, chunksize);
         header[26] = 1;
 
-        let offsets_data = build_sframe_offsets(schunk.chunks.len());
+        if schunk.chunks.len() > u32::MAX as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "too many sparse frame chunks",
+            ));
+        }
+        let offsets_data = build_sframe_offsets(schunk, encode_special_offsets);
         let offsets_chunk = if offsets_data.is_empty() {
             Vec::new()
         } else {
@@ -1112,8 +1313,12 @@ pub mod frame {
         let frame_size = header.len() + offsets_chunk.len() + trailer.len();
         header[16..24].copy_from_slice(&(frame_size as u64).to_be_bytes());
 
-        for (chunk_id, chunk) in schunk.chunks.iter().enumerate() {
-            std::fs::write(sframe_chunk_path(path, chunk_id as u64), chunk)?;
+        let mut next_chunk_id = 0u64;
+        for chunk in &schunk.chunks {
+            if !encode_special_offsets || special_offset_for_chunk(chunk).is_none() {
+                std::fs::write(sframe_chunk_path(path, next_chunk_id), chunk)?;
+                next_chunk_id += 1;
+            }
         }
 
         let mut index = Vec::with_capacity(frame_size);
@@ -1126,7 +1331,11 @@ pub mod frame {
     /// Build the contiguous-frame offsets array: little-endian `u64` offsets
     /// for each chunk relative to the start of the data section (offset 0
     /// being the first chunk just after the header).
-    fn build_offsets(schunk: &Schunk, _header_size: usize) -> Vec<u8> {
+    fn build_offsets(
+        schunk: &Schunk,
+        _header_size: usize,
+        encode_special_offsets: bool,
+    ) -> Vec<u8> {
         let nchunks = schunk.chunks.len();
         if nchunks == 0 {
             return Vec::new();
@@ -1136,8 +1345,16 @@ pub mod frame {
         let mut coffset: u64 = 0;
 
         for chunk in &schunk.chunks {
-            offsets.extend_from_slice(&coffset.to_le_bytes());
-            coffset += chunk.len() as u64;
+            if encode_special_offsets {
+                if let Some(special) = special_offset_for_chunk(chunk) {
+                    offsets.extend_from_slice(&special.to_le_bytes());
+                    continue;
+                }
+            }
+            {
+                offsets.extend_from_slice(&coffset.to_le_bytes());
+                coffset += chunk.len() as u64;
+            }
         }
 
         offsets
@@ -1146,73 +1363,209 @@ pub mod frame {
     /// Build the sparse-frame offsets array: little-endian `u64` chunk file
     /// identifiers used to locate each chunk file inside the sparse frame
     /// directory.
-    fn build_sframe_offsets(nchunks: usize) -> Vec<u8> {
+    fn build_sframe_offsets(schunk: &Schunk, encode_special_offsets: bool) -> Vec<u8> {
+        let nchunks = schunk.chunks.len();
         let mut offsets = Vec::with_capacity(nchunks * 8);
-        for chunk_id in 0..nchunks {
-            offsets.extend_from_slice(&(chunk_id as u64).to_le_bytes());
+        let mut next_chunk_id = 0u64;
+        for chunk in &schunk.chunks {
+            let offset = if encode_special_offsets {
+                if let Some(special) = special_offset_for_chunk(chunk) {
+                    special
+                } else {
+                    let chunk_id = next_chunk_id;
+                    next_chunk_id += 1;
+                    chunk_id
+                }
+            } else {
+                let chunk_id = next_chunk_id;
+                next_chunk_id += 1;
+                chunk_id
+            };
+            offsets.extend_from_slice(&offset.to_le_bytes());
         }
         offsets
     }
 
-    /// Determine the `chunksize` value to record in the frame header.
-    /// Returns the common uncompressed chunk size, or `0` when chunks are
-    /// variable-sized or carry VL-blocks.
-    fn derive_frame_chunksize(schunk: &Schunk) -> usize {
-        if schunk.vlblocks {
-            return 0;
+    pub(super) fn stored_frame_chunk_len(chunk: &[u8], encode_special_offsets: bool) -> usize {
+        if encode_special_offsets && special_offset_for_chunk(chunk).is_some() {
+            0
+        } else {
+            chunk.len()
         }
-        let Some((first, rest)) = schunk.chunks.split_first() else {
-            return 0;
-        };
-        let Ok(first_header) = ChunkHeader::read(first) else {
-            return 0;
-        };
-        if first_header.nbytes < 0 {
-            return 0;
-        }
-        let first_nbytes = first_header.nbytes as usize;
-        for chunk in rest {
-            let Ok(header) = ChunkHeader::read(chunk) else {
-                return 0;
-            };
-            if header.nbytes < 0 || header.nbytes as usize != first_nbytes {
-                return 0;
-            }
-        }
-        first_nbytes
     }
 
-    /// Wrap the offsets payload in a Blosc2 chunk using the MEMCPYED flag so
-    /// the data is stored as-is. Small data like the offsets index is kept
-    /// uncompressed.
-    fn build_offsets_chunk(data: &[u8]) -> Vec<u8> {
-        let nbytes = data.len() as i32;
-        let typesize: u8 = 8;
-        let cbytes = BLOSC_EXTENDED_HEADER_LENGTH as i32 + nbytes;
+    pub(super) fn special_offset_for_chunk(chunk: &[u8]) -> Option<u64> {
+        let header = ChunkHeader::read(chunk).ok()?;
+        match header.special_type() {
+            BLOSC2_SPECIAL_ZERO | BLOSC2_SPECIAL_NAN | BLOSC2_SPECIAL_UNINIT => {
+                Some(encoded_special_offset(header.special_type()))
+            }
+            _ => None,
+        }
+    }
 
-        let mut chunk = vec![0u8; cbytes as usize];
+    pub(super) fn encoded_special_offset(special: u8) -> u64 {
+        (1u64 << 63) | ((special as u64) << 56)
+    }
 
-        // Write extended header (32 bytes)
+    pub(super) fn special_type_from_offset(offset: u64) -> Option<u8> {
+        if offset & (1u64 << 63) == 0 {
+            return None;
+        }
+        let special = ((offset >> 56) as u8) & BLOSC2_SPECIAL_MASK;
+        if matches!(
+            special,
+            BLOSC2_SPECIAL_ZERO | BLOSC2_SPECIAL_NAN | BLOSC2_SPECIAL_UNINIT
+        ) {
+            Some(special)
+        } else {
+            None
+        }
+    }
+
+    fn special_chunk_from_offset(
+        offset: u64,
+        logical_idx: usize,
+        nchunks: usize,
+        nbytes: i64,
+        chunksize: usize,
+        blocksize: i32,
+        spec: &FrameChunkSpec<'_>,
+    ) -> Result<Vec<u8>, String> {
+        let special_type = special_type_from_offset(offset)
+            .ok_or_else(|| "Invalid frame: invalid special chunk offset".to_string())?;
+        let chunk_nbytes = special_chunk_nbytes(logical_idx, nchunks, nbytes, chunksize)?;
+        synthetic_special_chunk_with_spec(special_type, chunk_nbytes, blocksize, spec)
+    }
+
+    fn special_chunk_nbytes(
+        logical_idx: usize,
+        nchunks: usize,
+        nbytes: i64,
+        chunksize: usize,
+    ) -> Result<usize, String> {
+        if nbytes < 0 {
+            return Err("Invalid frame: negative nbytes".into());
+        }
+        if chunksize > 0 {
+            if logical_idx + 1 == nchunks {
+                (nbytes as usize)
+                    .checked_sub(chunksize.saturating_mul(nchunks.saturating_sub(1)))
+                    .ok_or_else(|| "Invalid frame: special chunk nbytes underflow".to_string())
+            } else {
+                Ok(chunksize)
+            }
+        } else if nchunks == 0 {
+            Ok(0)
+        } else {
+            Err("Invalid frame: special chunk offset requires fixed chunksize".into())
+        }
+    }
+
+    fn synthetic_special_chunk_with_spec(
+        special_type: u8,
+        nbytes: usize,
+        blocksize: i32,
+        spec: &FrameChunkSpec<'_>,
+    ) -> Result<Vec<u8>, String> {
+        if nbytes > i32::MAX as usize {
+            return Err("Invalid frame: special chunk is too large".to_string());
+        }
+        let mut cparams = CParams {
+            compcode: spec.compcode,
+            typesize: spec.typesize,
+            blocksize,
+            ..Default::default()
+        };
+        cparams = compress::normalized_cparams(&cparams);
+        let typesize = cparams.typesize as usize;
+        if nbytes != 0 && !nbytes.is_multiple_of(typesize) {
+            return Err("Invalid frame: special chunk size is not a multiple of typesize".into());
+        }
+        let blocksize = compress::compute_blocksize(&cparams, nbytes as i32);
+        let mut chunk = vec![0u8; BLOSC_EXTENDED_HEADER_LENGTH];
         let header = ChunkHeader {
-            version: BLOSC2_VERSION_FORMAT_STABLE, // version 5
-            versionlz: 1,
-            // flags: extended header (DOSHUFFLE|DOBITSHUFFLE) + MEMCPYED
-            flags: BLOSC_DOSHUFFLE | BLOSC_MEMCPYED | BLOSC_DOBITSHUFFLE,
-            typesize,
-            nbytes,
-            blocksize: nbytes,
-            cbytes,
-            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            version: BLOSC2_VERSION_FORMAT_STABLE,
+            versionlz: BLOSC_BLOSCLZ_VERSION_FORMAT,
+            flags: BLOSC_DOSHUFFLE | BLOSC_DOBITSHUFFLE,
+            typesize: chunk_header_typesize(cparams.typesize),
+            nbytes: nbytes as i32,
+            blocksize,
+            cbytes: BLOSC_EXTENDED_HEADER_LENGTH as i32,
+            blosc2_flags: special_type << 4,
             ..Default::default()
         };
         header
-            .try_write(&mut chunk[..BLOSC_EXTENDED_HEADER_LENGTH])
-            .expect("offsets chunk header buffer is allocated to the extended header size");
+            .try_write(&mut chunk)
+            .map_err(|_| "Invalid frame: cannot build special chunk".to_string())?;
+        Ok(chunk)
+    }
 
-        // Copy data after header
-        chunk[BLOSC_EXTENDED_HEADER_LENGTH..].copy_from_slice(data);
+    /// Determine the `chunksize` value to record in the frame header.
+    /// Returns the fixed chunk size, allowing only the final chunk to be
+    /// shorter, or `0` when chunks are variable-sized.
+    pub(super) fn derive_frame_chunksize(schunk: &Schunk) -> i32 {
+        if schunk.chunks.is_empty() {
+            return -1;
+        }
+        fixed_tail_chunksize(&schunk.chunks)
+            .ok()
+            .and_then(|chunksize| i32::try_from(chunksize).ok())
+            .unwrap_or(0)
+    }
 
-        chunk
+    fn expected_nchunks_from_frame(nbytes: i64, chunksize: usize) -> Result<Option<usize>, String> {
+        if chunksize == 0 {
+            return Ok(None);
+        }
+        let nbytes = usize::try_from(nbytes)
+            .map_err(|_| "Invalid frame: invalid uncompressed size".to_string())?;
+        Ok(Some(nbytes.div_ceil(chunksize)))
+    }
+
+    fn validate_frame_offsets_count(
+        offsets_len: usize,
+        nbytes: i64,
+        chunksize: usize,
+    ) -> Result<(), String> {
+        if let Some(expected) = expected_nchunks_from_frame(nbytes, chunksize)? {
+            if offsets_len != expected {
+                return Err("Invalid frame: offsets count does not match fixed chunksize".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_frame_data_intervals(
+        intervals: &mut [(usize, usize)],
+        cbytes: usize,
+    ) -> Result<(), String> {
+        intervals.sort_unstable_by_key(|&(start, end)| (start, end));
+        let mut expected_start = 0usize;
+        for &(start, end) in intervals.iter() {
+            if start != expected_start || end < start {
+                return Err("Invalid frame: chunk offsets do not partition data section".into());
+            }
+            expected_start = end;
+        }
+        if expected_start != cbytes {
+            return Err("Invalid frame: chunk offsets do not cover data section".into());
+        }
+        Ok(())
+    }
+
+    /// Wrap the offsets payload in a Blosc2 chunk using C-Blosc2's default
+    /// one-shot frame parameters for the offset index.
+    fn build_offsets_chunk(data: &[u8]) -> Vec<u8> {
+        let cparams = CParams {
+            compcode: BLOSC_BLOSCLZ,
+            clevel: 5,
+            typesize: 8,
+            splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            ..Default::default()
+        };
+        compress::compress(data, &cparams).expect("offset index compression uses valid parameters")
     }
 
     // Frame format constants matching C code (frame.h)
@@ -1223,7 +1576,7 @@ pub mod frame {
     /// Build the msgpack frame header. Layout matches the C reference
     /// implementation byte for byte: 14-entry fixarray of `b2frame\0` magic,
     /// sizes, codec flags, filter pipeline, and any metalayers.
-    fn build_header(schunk: &Schunk, nbytes: i64, cbytes: i64, chunksize: usize) -> Vec<u8> {
+    fn build_header(schunk: &Schunk, nbytes: i64, cbytes: i64, chunksize: i32) -> Vec<u8> {
         // Start with 87-byte minimum header (zeroed)
         let mut h = vec![0u8; FRAME_HEADER_MIN_LEN];
         let mut pos = 0;
@@ -1256,15 +1609,18 @@ pub mod frame {
 
         // [25] general_flags: version + 0x10 (64-bit offsets)
         h[pos] = 0x10
-            | if (chunksize == 0 && !schunk.chunks.is_empty()) || schunk.vlblocks {
+            | if (schunk.chunksize == 0 && chunksize == 0 && !schunk.chunks.is_empty())
+                || schunk.vlblocks
+            {
                 BLOSC2_VERSION_FRAME_FORMAT
             } else {
                 BLOSC2_VERSION_FRAME_FORMAT_RC1
             };
+        if chunksize == 0 {
+            h[pos] |= FRAME_VARIABLE_CHUNKS;
+        }
         if schunk.vlblocks {
             h[pos] |= FRAME_VL_BLOCKS;
-        } else if chunksize == 0 && !schunk.chunks.is_empty() {
-            h[pos] |= FRAME_VARIABLE_CHUNKS;
         }
         pos += 1;
 
@@ -1304,16 +1660,16 @@ pub mod frame {
         h[pos..pos + 4].copy_from_slice(&schunk.cparams.typesize.to_be_bytes());
         pos += 4;
 
-        // [52-56] int32: blocksize (0 = auto, matching C behavior)
+        // [52-56] int32: blocksize
         h[pos] = MSGPACK_INT32;
         pos += 1;
-        h[pos..pos + 4].copy_from_slice(&0i32.to_be_bytes());
+        h[pos..pos + 4].copy_from_slice(&schunk.cparams.blocksize.to_be_bytes());
         pos += 4;
 
         // [57-61] int32: chunksize
         h[pos] = MSGPACK_INT32;
         pos += 1;
-        h[pos..pos + 4].copy_from_slice(&(chunksize as i32).to_be_bytes());
+        h[pos..pos + 4].copy_from_slice(&chunksize.to_be_bytes());
         pos += 4;
 
         // [62-64] int16: nthreads_comp
@@ -1350,11 +1706,7 @@ pub mod frame {
         h[79..79 + BLOSC2_MAX_FILTERS].copy_from_slice(&schunk.cparams.filters_meta);
 
         // [77] udcodec (at fixed offset, overlaps with filter bytes — C stores it here)
-        h[FRAME_UDCODEC] = if codec_frame_id == BLOSC_UDCODEC_FORMAT {
-            schunk.cparams.compcode
-        } else {
-            0
-        };
+        h[FRAME_UDCODEC] = schunk.cparams.compcode;
         // [78] codec_meta
         h[FRAME_CODEC_META] = schunk.cparams.compcode_meta;
 
@@ -1493,10 +1845,31 @@ pub mod frame {
         compcode: u8,
         compcode_meta: u8,
         typesize: i32,
+        nfilters: usize,
         filters: &'a [u8; BLOSC2_MAX_FILTERS],
         filters_meta: &'a [u8; BLOSC2_MAX_FILTERS],
-        use_dict: bool,
         vlblocks: bool,
+    }
+
+    struct FrameMetadata {
+        cparams: CParams,
+        dparams: DParams,
+        chunksize: usize,
+        nbytes: i64,
+        cbytes: i64,
+        metalayers: Vec<Metalayer>,
+        vlmetalayers: Vec<Metalayer>,
+        vlblocks: bool,
+        nfilters: usize,
+    }
+
+    fn decode_frame_splitmode(other_flags: u8) -> i32 {
+        match (other_flags & 0x03) + 1 {
+            1 => BLOSC_ALWAYS_SPLIT,
+            2 => BLOSC_NEVER_SPLIT,
+            3 => BLOSC_AUTO_SPLIT,
+            _ => BLOSC_FORWARD_COMPAT_SPLIT,
+        }
     }
 
     /// Check that an embedded chunk header is well-formed and matches the
@@ -1514,11 +1887,20 @@ pub mod frame {
         if ch.cbytes < ch.header_len() as i32 {
             return Err("Invalid frame: chunk cbytes smaller than header".into());
         }
+        if ch.memcpyed() && !ch.use_dict() {
+            let expected = ch
+                .header_len()
+                .checked_add(ch.nbytes as usize)
+                .ok_or_else(|| "Invalid frame: invalid memcpyed chunk size".to_string())?;
+            if ch.cbytes as usize != expected {
+                return Err("Invalid frame: invalid memcpyed chunk size".into());
+            }
+        }
         if ch.nbytes > 0 {
             if ch.typesize == 0 || ch.typesize as usize > BLOSC_MAX_TYPESIZE {
                 return Err("Invalid frame: invalid chunk typesize".into());
             }
-            if ch.blocksize <= 0 {
+            if ch.blocksize <= 0 || ch.blocksize as usize > BLOSC2_MAXBLOCKSIZE {
                 return Err("Invalid frame: invalid chunk blocksize".into());
             }
         }
@@ -1530,47 +1912,131 @@ pub mod frame {
                 return Err("Invalid frame: chunk VL-block flag does not match frame".into());
             }
         }
-        if ch.use_dict() != spec.use_dict {
-            return Err("Invalid frame: chunk dictionary flag does not match frame".into());
+        match ch.special_type() {
+            BLOSC2_SPECIAL_VALUE => {
+                if ch.use_dict() {
+                    return Ok(());
+                }
+                let value_size = (ch.cbytes as usize)
+                    .checked_sub(ch.header_len())
+                    .ok_or_else(|| "Invalid frame: invalid special value size".to_string())?;
+                if value_size == 0
+                    || value_size > BLOSC2_MAXTYPESIZE
+                    || value_size > ch.nbytes as usize
+                {
+                    return Err("Invalid frame: invalid special value size".into());
+                }
+                if !(ch.nbytes as usize).is_multiple_of(value_size) {
+                    return Err("Invalid frame: invalid special value nbytes".into());
+                }
+            }
+            BLOSC2_SPECIAL_NAN | BLOSC2_SPECIAL_ZERO | BLOSC2_SPECIAL_UNINIT => {
+                if !ch.use_dict() && ch.cbytes as usize != ch.header_len() {
+                    return Err("Invalid frame: invalid special chunk size".into());
+                }
+                if ch.nbytes > 0 && !(ch.nbytes as usize).is_multiple_of(ch.typesize as usize) {
+                    return Err("Invalid frame: invalid special value nbytes".into());
+                }
+            }
+            BLOSC2_NO_SPECIAL => {}
+            _ => return Err("Invalid frame: unknown special value type".into()),
         }
-        if ch.use_dict() && !codecs::codec_supports_dict(ch.compcode()) {
-            return Err(
-                "Invalid frame: dictionary compression is only supported for Zstd, LZ4, and LZ4HC"
-                    .into(),
-            );
+        if ch.special_type() == BLOSC2_NO_SPECIAL && !ch.memcpyed() {
+            if !matches!(
+                ch.compformat(),
+                BLOSC_BLOSCLZ_FORMAT
+                    | BLOSC_LZ4_FORMAT
+                    | BLOSC_ZLIB_FORMAT
+                    | BLOSC_ZSTD_FORMAT
+                    | BLOSC_UDCODEC_FORMAT
+            ) {
+                return Err("Invalid frame: unsupported chunk codec format".into());
+            }
+            if ch.compformat() == BLOSC_UDCODEC_FORMAT
+                && !codecs::is_registered_codec(ch.udcompcode)
+            {
+                return Err("Invalid frame: unsupported chunk codec".into());
+            }
+            if ch.use_dict() && !codecs::codec_supports_dict(ch.compcode()) {
+                return Err(
+                    "Invalid frame: dictionary compression is only supported for Zstd, LZ4, and LZ4HC"
+                        .into(),
+                );
+            }
+            if !ch.vl_blocks() {
+                let nblocks = (ch.nbytes as usize).div_ceil(ch.blocksize as usize);
+                let min_block_table_len = nblocks
+                    .checked_mul(4)
+                    .and_then(|len| ch.header_len().checked_add(len))
+                    .ok_or_else(|| "Invalid frame: invalid block table size".to_string())?;
+                if (ch.cbytes as usize) < min_block_table_len {
+                    return Err("Invalid frame: chunk too small for block table".into());
+                }
+            }
         }
-        if !matches!(
-            ch.compcode(),
-            BLOSC_BLOSCLZ | BLOSC_LZ4 | BLOSC_LZ4HC | BLOSC_ZLIB | BLOSC_ZSTD
-        ) && !crate::codecs::is_registered_codec(ch.compcode())
+        if ch.special_type() == BLOSC2_NO_SPECIAL
+            && !ch.memcpyed()
+            && !matches!(
+                ch.compcode(),
+                BLOSC_BLOSCLZ | BLOSC_LZ4 | BLOSC_LZ4HC | BLOSC_ZLIB | BLOSC_ZSTD
+            )
+            && !crate::codecs::is_registered_codec(ch.compcode())
         {
             return Err("Invalid frame: unsupported chunk codec".into());
         }
-        let codec_matches = ch.compcode() == spec.compcode
-            || (spec.compcode == BLOSC_LZ4HC && ch.compcode() == BLOSC_LZ4);
-        if !codec_matches {
-            return Err("Invalid frame: chunk codec does not match frame".into());
+        if !ch.memcpyed() && ch.special_type() == BLOSC2_NO_SPECIAL {
+            let codec_matches = ch.compcode() == spec.compcode
+                || (spec.compcode == BLOSC_LZ4HC && ch.compcode() == BLOSC_LZ4);
+            if !codec_matches {
+                return Err("Invalid frame: chunk codec does not match frame".into());
+            }
+            if ch.compcode_meta != spec.compcode_meta {
+                return Err("Invalid frame: chunk codec metadata does not match frame".into());
+            }
         }
-        if ch.compcode_meta != spec.compcode_meta {
-            return Err("Invalid frame: chunk codec metadata does not match frame".into());
-        }
-        if ch.nbytes > 0 && ch.typesize as i32 != spec.typesize {
+        let expected_chunk_typesize = if spec.typesize > BLOSC_MAX_TYPESIZE as i32 {
+            1
+        } else {
+            spec.typesize
+        };
+        if ch.nbytes > 0 && ch.typesize as i32 != expected_chunk_typesize {
             return Err("Invalid frame: chunk typesize does not match frame".into());
         }
-        if &ch.filters != spec.filters || &ch.filters_meta != spec.filters_meta {
-            return Err("Invalid frame: chunk filters do not match frame".into());
-        }
-        for &filter in &ch.filters {
-            if !matches!(
-                filter,
-                BLOSC_NOFILTER | BLOSC_SHUFFLE | BLOSC_BITSHUFFLE | BLOSC_DELTA | BLOSC_TRUNC_PREC
-            ) && !crate::filters::is_registered_filter(filter)
+        if ch.special_type() == BLOSC2_NO_SPECIAL && !ch.memcpyed() {
+            if ch.filters[..spec.nfilters] != spec.filters[..spec.nfilters]
+                || ch.filters_meta[..spec.nfilters] != spec.filters_meta[..spec.nfilters]
             {
-                return Err("Invalid frame: unsupported chunk filter".into());
+                return Err("Invalid frame: chunk filters do not match frame".into());
+            }
+            for &filter in &ch.filters[..spec.nfilters] {
+                if !matches!(
+                    filter,
+                    BLOSC_NOFILTER
+                        | BLOSC_SHUFFLE
+                        | BLOSC_BITSHUFFLE
+                        | BLOSC_DELTA
+                        | BLOSC_TRUNC_PREC
+                ) && !crate::filters::is_registered_filter(filter)
+                {
+                    return Err("Invalid frame: unsupported chunk filter".into());
+                }
             }
         }
 
         Ok(())
+    }
+
+    fn read_frame_filters(
+        data: &[u8],
+        filter_start: usize,
+        meta_start: usize,
+        nfilters: usize,
+    ) -> ([u8; BLOSC2_MAX_FILTERS], [u8; BLOSC2_MAX_FILTERS]) {
+        let mut filters = [0u8; BLOSC2_MAX_FILTERS];
+        let mut filters_meta = [0u8; BLOSC2_MAX_FILTERS];
+        filters[..nfilters].copy_from_slice(&data[filter_start..filter_start + nfilters]);
+        filters_meta[..nfilters].copy_from_slice(&data[meta_start..meta_start + nfilters]);
+        (filters, filters_meta)
     }
 
     /// Decode the metalayers section that may follow the 87-byte minimum
@@ -1676,32 +2142,17 @@ pub mod frame {
         Ok(metalayers)
     }
 
-    /// Decode a msgpack `fixstr`/`str8`/`str16` string and advance `pos`.
+    /// Decode the msgpack `fixstr` name form used by C frame metalayers.
     fn decode_msgpack_str(data: &[u8], pos: &mut usize, limit: usize) -> Result<String, String> {
         let marker = *data
             .get(*pos)
             .ok_or_else(|| "Invalid frame: truncated metalayer name".to_string())?;
         *pos += 1;
 
-        let len = if marker & 0xE0 == 0xA0 {
-            (marker & 0x1F) as usize
-        } else if marker == MSGPACK_STR8 {
-            let len = *data
-                .get(*pos)
-                .ok_or_else(|| "Invalid frame: truncated metalayer name length".to_string())?
-                as usize;
-            *pos += 1;
-            len
-        } else if marker == MSGPACK_STR16 {
-            if *pos + 2 > limit {
-                return Err("Invalid frame: truncated metalayer name length".into());
-            }
-            let len = u16::from_be_bytes(data[*pos..*pos + 2].try_into().unwrap()) as usize;
-            *pos += 2;
-            len
-        } else {
+        if marker & 0xE0 != 0xA0 {
             return Err("Invalid frame: expected metalayer name string".into());
-        };
+        }
+        let len = (marker & 0x1F) as usize;
 
         let end = (*pos)
             .checked_add(len)
@@ -1719,39 +2170,21 @@ pub mod frame {
         Ok(name)
     }
 
-    /// Decode a msgpack `bin8`/`bin16`/`bin32` payload and advance `pos`.
+    /// Decode the msgpack `bin32` payload form used by C frame metalayers.
     fn decode_msgpack_bin(data: &[u8], pos: &mut usize, limit: usize) -> Result<Vec<u8>, String> {
         let marker = *data
             .get(*pos)
             .ok_or_else(|| "Invalid frame: truncated metalayer content".to_string())?;
         *pos += 1;
 
-        let len = match marker {
-            MSGPACK_BIN8 => {
-                let len = *data.get(*pos).ok_or_else(|| {
-                    "Invalid frame: truncated metalayer content length".to_string()
-                })? as usize;
-                *pos += 1;
-                len
-            }
-            MSGPACK_BIN16 => {
-                if *pos + 2 > limit {
-                    return Err("Invalid frame: truncated metalayer content length".into());
-                }
-                let len = u16::from_be_bytes(data[*pos..*pos + 2].try_into().unwrap()) as usize;
-                *pos += 2;
-                len
-            }
-            MSGPACK_BIN32 => {
-                if *pos + 4 > limit {
-                    return Err("Invalid frame: truncated metalayer content length".into());
-                }
-                let len = u32::from_be_bytes(data[*pos..*pos + 4].try_into().unwrap()) as usize;
-                *pos += 4;
-                len
-            }
-            _ => return Err("Invalid frame: expected metalayer content bin".into()),
-        };
+        if marker != MSGPACK_BIN32 {
+            return Err("Invalid frame: expected metalayer content bin".into());
+        }
+        if *pos + 4 > limit {
+            return Err("Invalid frame: truncated metalayer content length".into());
+        }
+        let len = u32::from_be_bytes(data[*pos..*pos + 4].try_into().unwrap()) as usize;
+        *pos += 4;
 
         let end = (*pos)
             .checked_add(len)
@@ -1867,14 +2300,45 @@ pub mod frame {
             return Err("Invalid frame: truncated VL-metalayer value count".into());
         }
         let value_count = u16::from_be_bytes(trailer[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
         if value_count != count {
             return Err("Invalid frame: VL-metalayer index/value count mismatch".into());
         }
+        let values_start = pos;
+        let mut value_offsets = Vec::with_capacity(value_count);
+        for _ in 0..value_count {
+            value_offsets.push(pos);
+            let _ = decode_msgpack_bin(trailer, &mut pos, trailer.len())?;
+        }
+        let values_end = pos;
+        if values_end
+            .checked_add(23)
+            .is_none_or(|footer_end| footer_end != trailer.len())
+        {
+            return Err("Invalid frame: invalid trailer footer length".into());
+        }
+        if trailer.get(values_end) != Some(&MSGPACK_UINT32) {
+            return Err("Invalid frame: expected trailer length".into());
+        }
+        let declared_len =
+            u32::from_be_bytes(trailer[values_end + 1..values_end + 5].try_into().unwrap())
+                as usize;
+        if declared_len != trailer.len() {
+            return Err("Invalid frame: trailer length mismatch".into());
+        }
+        if trailer.get(values_end + 5) != Some(&MSGPACK_FIXEXT16) {
+            return Err("Invalid frame: expected trailer fingerprint".into());
+        }
+        let _fingerprint_type = trailer[values_end + 6];
+        let _fingerprint = &trailer[values_end + 7..values_end + 23];
 
         let mut metalayers = Vec::with_capacity(count);
         for (name, offset) in entries {
+            if offset < values_start || offset >= values_end || !value_offsets.contains(&offset) {
+                return Err("Invalid frame: invalid VL-metalayer offset".into());
+            }
             let mut value_pos = offset;
-            let compressed = decode_msgpack_bin(trailer, &mut value_pos, trailer.len())?;
+            let compressed = decode_msgpack_bin(trailer, &mut value_pos, values_end)?;
             let content = compress::decompress(&compressed)
                 .map_err(|_| "Invalid frame: invalid VL-metalayer payload".to_string())?;
             metalayers.push(Metalayer { name, content });
@@ -1920,10 +2384,11 @@ pub mod frame {
 
         let mut min_header = [0u8; BLOSC_MIN_HEADER_LENGTH];
         read_exact_at(file, pos, &mut min_header, "Failed to read chunk header")?;
-        let header = ChunkHeader::read(&min_header)
-            .map_err(|_| "Invalid frame: invalid chunk header".to_string())?;
-        if !header.is_extended() {
-            return Ok(header);
+        let extended = (min_header[BLOSC2_CHUNK_FLAGS] & BLOSC_DOSHUFFLE != 0)
+            && (min_header[BLOSC2_CHUNK_FLAGS] & BLOSC_DOBITSHUFFLE != 0);
+        if !extended {
+            return ChunkHeader::read(&min_header)
+                .map_err(|_| "Invalid frame: invalid chunk header".to_string());
         }
 
         if pos
@@ -1965,6 +2430,32 @@ pub mod frame {
             return Err("Invalid frame: offsets chunk extends past frame".into());
         }
         Ok(cbytes)
+    }
+
+    fn offsets_payload_from_file(
+        file: &mut std::fs::File,
+        pos: usize,
+        len: usize,
+    ) -> Result<Vec<u64>, String> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let mut offsets_chunk = vec![0u8; len];
+        read_exact_at(
+            file,
+            pos as u64,
+            &mut offsets_chunk,
+            "Failed to read offsets chunk",
+        )?;
+        let offsets_payload = compress::decompress(&offsets_chunk)
+            .map_err(|_| "Invalid frame: invalid offsets chunk".to_string())?;
+        if offsets_payload.len() % 8 != 0 {
+            return Err("Invalid frame: offsets payload has invalid length".into());
+        }
+        Ok(offsets_payload
+            .chunks_exact(8)
+            .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+            .collect())
     }
 
     /// Load the `chunks.b2frame` index of a sparse frame directory and
@@ -2016,7 +2507,7 @@ pub mod frame {
         if cbytes < 0 {
             return Err("Invalid frame: negative cbytes".into());
         }
-        if cbytes == 0 {
+        if cbytes == 0 && index[30..38] == 0i64.to_be_bytes() {
             return Ok((
                 index[..frame_size].to_vec(),
                 header_size,
@@ -2043,8 +2534,21 @@ pub mod frame {
         }
         let mut offsets = Vec::with_capacity(offsets_payload.len() / 8);
         for bytes in offsets_payload.chunks_exact(8) {
-            offsets.push(u64::from_le_bytes(bytes.try_into().unwrap()));
+            let offset = u64::from_le_bytes(bytes.try_into().unwrap());
+            if offset & (1u64 << 63) != 0 && special_type_from_offset(offset).is_none() {
+                return Err("Invalid frame: invalid special chunk offset".into());
+            }
+            if offset & (1u64 << 63) == 0 && offset > u32::MAX as u64 {
+                return Err("Invalid frame: sparse chunk id is too large".into());
+            }
+            offsets.push(offset);
         }
+        let nbytes = i64::from_be_bytes(index[30..38].try_into().unwrap());
+        let chunksize = i32::from_be_bytes(index[58..62].try_into().unwrap());
+        if chunksize < 0 {
+            return Err("Invalid frame: negative chunksize".into());
+        }
+        validate_frame_offsets_count(offsets.len(), nbytes, chunksize as usize)?;
 
         Ok((
             index[..frame_size].to_vec(),
@@ -2052,6 +2556,139 @@ pub mod frame {
             offsets,
             offsets_end,
         ))
+    }
+
+    fn parse_sframe_index_metadata(
+        index: &[u8],
+        header_size: usize,
+        offsets_end: usize,
+    ) -> Result<FrameMetadata, String> {
+        if index.len() < header_size || offsets_end > index.len() {
+            return Err("Invalid frame: sparse index truncated".into());
+        }
+        let metalayers = parse_metalayers(&index[..header_size])?;
+        if index[24] != MSGPACK_STR4 {
+            return Err("Expected fixstr(4) for flags".into());
+        }
+        let general_flags = index[25];
+        let frame_version = general_flags & 0x0F;
+        if frame_version > BLOSC2_VERSION_FRAME_FORMAT {
+            return Err("Invalid frame: unsupported frame version".into());
+        }
+        let vlblocks = general_flags & FRAME_VL_BLOCKS != 0;
+        let variable_chunks = general_flags & FRAME_VARIABLE_CHUNKS != 0;
+        if index[26] != 1 {
+            return Err("Invalid frame: expected sparse directory frame type".into());
+        }
+
+        let codec_flags = index[27];
+        let frame_compcode = codec_flags & 0x0F;
+        let compcode = if frame_compcode == BLOSC_UDCODEC_FORMAT {
+            index[FRAME_UDCODEC]
+        } else {
+            frame_compcode
+        };
+        let compcode_meta = index[FRAME_CODEC_META];
+        let clevel = (codec_flags >> 4) & 0x0F;
+        let splitmode = decode_frame_splitmode(index[28]);
+
+        if index[29] != MSGPACK_INT64 {
+            return Err("Expected int64 for nbytes".into());
+        }
+        let nbytes = i64::from_be_bytes(index[30..38].try_into().unwrap());
+        if nbytes < 0 {
+            return Err("Invalid frame: negative nbytes".into());
+        }
+        if index[38] != MSGPACK_INT64 {
+            return Err("Expected int64 for cbytes".into());
+        }
+        let cbytes = i64::from_be_bytes(index[39..47].try_into().unwrap());
+        if cbytes < 0 {
+            return Err("Invalid frame: negative cbytes".into());
+        }
+        if index[47] != MSGPACK_INT32 {
+            return Err("Expected int32 for typesize".into());
+        }
+        let typesize = i32::from_be_bytes(index[48..52].try_into().unwrap());
+        if !(1..=BLOSC2_MAXTYPESIZE as i32).contains(&typesize) {
+            return Err("Invalid frame: invalid typesize".into());
+        }
+        if index[52] != MSGPACK_INT32 {
+            return Err("Expected int32 for blocksize".into());
+        }
+        let blocksize = i32::from_be_bytes(index[53..57].try_into().unwrap());
+        if blocksize < 0 {
+            return Err("Invalid frame: negative blocksize".into());
+        }
+        if index[57] != MSGPACK_INT32 {
+            return Err("Expected int32 for chunksize".into());
+        }
+        let chunksize_i32 = i32::from_be_bytes(index[58..62].try_into().unwrap());
+        if chunksize_i32 < -1 || (chunksize_i32 == -1 && (nbytes != 0 || cbytes != 0)) {
+            return Err("Invalid frame: negative chunksize".into());
+        }
+        let chunksize = chunksize_i32.max(0) as usize;
+        if variable_chunks {
+            if chunksize != 0 {
+                return Err("Invalid frame: variable chunk flag with nonzero chunksize".into());
+            }
+        }
+
+        if index[62] != MSGPACK_INT16 {
+            return Err("Expected int16 for nthreads_comp".into());
+        }
+        let nthreads_comp = i16::from_be_bytes(index[63..65].try_into().unwrap());
+        if nthreads_comp < 1 {
+            return Err("Invalid frame: invalid compression thread count".into());
+        }
+        if index[65] != MSGPACK_INT16 {
+            return Err("Expected int16 for nthreads_decomp".into());
+        }
+        let nthreads_decomp = i16::from_be_bytes(index[66..68].try_into().unwrap());
+        if nthreads_decomp < 1 {
+            return Err("Invalid frame: invalid decompression thread count".into());
+        }
+        let has_vlmeta = match index[68] {
+            MSGPACK_TRUE => true,
+            MSGPACK_FALSE => false,
+            _ => return Err("Invalid frame: invalid VL-metalayer flag".into()),
+        };
+        if index[69] != MSGPACK_FIXEXT16 {
+            return Err("Expected fixext16 for filters".into());
+        }
+        if index[70] as usize > BLOSC2_MAX_FILTERS {
+            return Err("Invalid frame: too many filters".into());
+        }
+        let nfilters = index[70] as usize;
+        let (filters, filters_meta) = read_frame_filters(&index, 71, 79, nfilters);
+        let use_dict = index[FRAME_OTHER_FLAGS2] & 0x01 != 0;
+        let vlmetalayers = parse_vlmetalayers(&index[offsets_end..], has_vlmeta)?;
+        Ok(FrameMetadata {
+            cparams: CParams {
+                compcode,
+                clevel,
+                typesize,
+                blocksize,
+                splitmode,
+                filters,
+                filters_meta,
+                compcode_meta,
+                use_dict,
+                nthreads: nthreads_comp,
+                ..Default::default()
+            },
+            dparams: DParams {
+                nthreads: nthreads_decomp,
+                ..Default::default()
+            },
+            chunksize,
+            nbytes,
+            cbytes,
+            metalayers,
+            vlmetalayers,
+            vlblocks,
+            nfilters,
+        })
     }
 
     /// Assemble a contiguous frame in memory from the sparse-frame index and
@@ -2069,6 +2706,10 @@ pub mod frame {
         let mut offsets_data = Vec::with_capacity(offsets.len() * 8);
         let mut data_cbytes = 0u64;
         for &chunk_id in offsets {
+            if special_type_from_offset(chunk_id).is_some() {
+                offsets_data.extend_from_slice(&chunk_id.to_le_bytes());
+                continue;
+            }
             let chunk = std::fs::read(sframe_chunk_path(path, chunk_id))
                 .map_err(|e| format!("Failed to read sparse frame chunk: {e}"))?;
             offsets_data.extend_from_slice(&data_cbytes.to_le_bytes());
@@ -2116,33 +2757,86 @@ pub mod frame {
 
     /// Read a sparse frame directory lazily.
     pub fn read_lazy_sframe_dir(path: &Path) -> Result<LazySchunk, String> {
-        let schunk = read_sframe_dir(path)?;
-        let (_, _, offsets, _) = read_sframe_index(path)?;
+        let (index, header_size, offsets, offsets_end) = read_sframe_index(path)?;
+        let meta = parse_sframe_index_metadata(&index, header_size, offsets_end)?;
+        let chunk_spec = FrameChunkSpec {
+            compcode: meta.cparams.compcode,
+            compcode_meta: meta.cparams.compcode_meta,
+            typesize: meta.cparams.typesize,
+            nfilters: meta.nfilters,
+            filters: &meta.cparams.filters,
+            filters_meta: &meta.cparams.filters_meta,
+            vlblocks: meta.vlblocks,
+        };
         let mut chunks = Vec::with_capacity(offsets.len());
+        let mut total_nbytes = 0i64;
+        let mut total_cbytes = 0i64;
         for (idx, &chunk_id) in offsets.iter().enumerate() {
+            if let Some(special) = special_type_from_offset(chunk_id) {
+                let nbytes = special_chunk_nbytes(idx, offsets.len(), meta.nbytes, meta.chunksize)?;
+                let chunk = synthetic_special_chunk_with_spec(
+                    special,
+                    nbytes,
+                    meta.cparams.blocksize,
+                    &chunk_spec,
+                )?;
+                let header = ChunkHeader::read(&chunk)
+                    .map_err(|_| "Invalid frame: invalid special chunk header".to_string())?;
+                validate_embedded_chunk_header(&header, &chunk_spec)?;
+                total_nbytes = total_nbytes
+                    .checked_add(nbytes as i64)
+                    .ok_or_else(|| "Invalid frame: nbytes overflow".to_string())?;
+                chunks.push(LazyChunkRef {
+                    offset: chunk_id,
+                    cbytes: BLOSC_EXTENDED_HEADER_LENGTH,
+                    nbytes,
+                    special: Some(special),
+                });
+                continue;
+            }
             let chunk_path = sframe_chunk_path(path, chunk_id);
-            let chunk = std::fs::read(&chunk_path)
-                .map_err(|e| format!("Failed to read sparse frame chunk: {e}"))?;
-            let header = ChunkHeader::read(&chunk)
-                .map_err(|_| "Invalid frame: invalid sparse chunk header".to_string())?;
-            let cbytes = chunk.len();
-            if header.cbytes as usize != cbytes {
+            let file_len = std::fs::metadata(&chunk_path)
+                .map_err(|e| format!("Failed to stat sparse frame chunk: {e}"))?
+                .len();
+            let mut file = std::fs::File::open(&chunk_path)
+                .map_err(|e| format!("Failed to open sparse frame chunk: {e}"))?;
+            let header = read_chunk_header_at(&mut file, 0, file_len)?;
+            validate_embedded_chunk_header(&header, &chunk_spec)?;
+            if header.cbytes as u64 != file_len {
                 return Err("Invalid frame: sparse chunk size mismatch".into());
             }
+            let cbytes = usize::try_from(file_len)
+                .map_err(|_| "Invalid frame: sparse chunk too large".to_string())?;
+            let chunk = std::fs::read(&chunk_path)
+                .map_err(|e| format!("Failed to read sparse frame chunk: {e}"))?;
+            compress::cbuffer_validate(&chunk).map_err(|err| format!("Invalid frame: {err}"))?;
+            total_nbytes = total_nbytes
+                .checked_add(header.nbytes as i64)
+                .ok_or_else(|| "Invalid frame: nbytes overflow".to_string())?;
+            total_cbytes = total_cbytes
+                .checked_add(header.cbytes as i64)
+                .ok_or_else(|| "Invalid frame: cbytes overflow".to_string())?;
             chunks.push(LazyChunkRef {
-                offset: offsets[idx],
+                offset: chunk_id,
                 cbytes,
                 nbytes: header.nbytes as usize,
+                special: None,
             });
         }
+        if total_cbytes != meta.cbytes {
+            return Err("Invalid frame: chunk cbytes total does not match frame".into());
+        }
+        if total_nbytes != meta.nbytes {
+            return Err("Invalid frame: chunk nbytes total does not match frame".into());
+        }
         Ok(LazySchunk {
-            cparams: schunk.cparams,
-            dparams: schunk.dparams,
-            chunksize: schunk.chunksize,
-            nbytes: schunk.nbytes,
-            cbytes: schunk.cbytes,
-            metalayers: schunk.metalayers,
-            vlmetalayers: schunk.vlmetalayers,
+            cparams: meta.cparams,
+            dparams: meta.dparams,
+            chunksize: meta.chunksize,
+            nbytes: meta.nbytes,
+            cbytes: meta.cbytes,
+            metalayers: meta.metalayers,
+            vlmetalayers: meta.vlmetalayers,
             path: path.to_path_buf(),
             chunks,
             sframe: true,
@@ -2225,22 +2919,7 @@ pub mod frame {
         };
         let compcode_meta = header[FRAME_CODEC_META];
         let clevel = (codec_flags >> 4) & 0x0F;
-        if !matches!(
-            compcode,
-            BLOSC_BLOSCLZ | BLOSC_LZ4 | BLOSC_LZ4HC | BLOSC_ZLIB | BLOSC_ZSTD
-        ) && !crate::codecs::is_registered_codec(compcode)
-        {
-            return Err("Invalid frame: unsupported codec".into());
-        }
-        if clevel > 9 {
-            return Err("Invalid frame: invalid compression level".into());
-        }
-        let splitmode = match header[28] & 0x03 {
-            1 => BLOSC_ALWAYS_SPLIT,
-            2 => BLOSC_NEVER_SPLIT,
-            3 => BLOSC_AUTO_SPLIT,
-            _ => BLOSC_FORWARD_COMPAT_SPLIT,
-        };
+        let splitmode = decode_frame_splitmode(header[28]);
 
         if header[29] != MSGPACK_INT64 {
             return Err("Expected int64 for nbytes".into());
@@ -2261,7 +2940,7 @@ pub mod frame {
             return Err("Expected int32 for typesize".into());
         }
         let typesize = i32::from_be_bytes(header[48..52].try_into().unwrap());
-        if !(1..=BLOSC_MAX_TYPESIZE as i32).contains(&typesize) {
+        if !(1..=BLOSC2_MAXTYPESIZE as i32).contains(&typesize) {
             return Err("Invalid frame: invalid typesize".into());
         }
         if header[52] != MSGPACK_INT32 {
@@ -2275,16 +2954,13 @@ pub mod frame {
             return Err("Expected int32 for chunksize".into());
         }
         let chunksize_i32 = i32::from_be_bytes(header[58..62].try_into().unwrap());
-        if chunksize_i32 < 0 {
+        if chunksize_i32 < -1 || (chunksize_i32 == -1 && (nbytes != 0 || cbytes != 0)) {
             return Err("Invalid frame: negative chunksize".into());
         }
-        let chunksize = chunksize_i32 as usize;
+        let chunksize = chunksize_i32.max(0) as usize;
         if variable_chunks {
             if chunksize != 0 {
                 return Err("Invalid frame: variable chunk flag with nonzero chunksize".into());
-            }
-            if frame_version < BLOSC2_VERSION_FRAME_FORMAT {
-                return Err("Invalid frame: variable chunks require frame version 3".into());
             }
         }
 
@@ -2311,27 +2987,12 @@ pub mod frame {
         if header[69] != MSGPACK_FIXEXT16 {
             return Err("Expected fixext16 for filters".into());
         }
-        let mut filters = [0u8; BLOSC2_MAX_FILTERS];
-        let mut filters_meta = [0u8; BLOSC2_MAX_FILTERS];
-        filters.copy_from_slice(&header[71..71 + BLOSC2_MAX_FILTERS]);
-        filters_meta.copy_from_slice(&header[79..79 + BLOSC2_MAX_FILTERS]);
+        if header[70] as usize > BLOSC2_MAX_FILTERS {
+            return Err("Invalid frame: too many filters".into());
+        }
+        let nfilters = header[70] as usize;
+        let (filters, filters_meta) = read_frame_filters(&header, 71, 79, nfilters);
         let use_dict = header[FRAME_OTHER_FLAGS2] & 0x01 != 0;
-        if use_dict && !codecs::codec_supports_dict(compcode) {
-            return Err(
-                "Invalid frame: dictionary compression is only supported for Zstd, LZ4, and LZ4HC"
-                    .into(),
-            );
-        }
-        for &filter in &filters {
-            if !matches!(
-                filter,
-                BLOSC_NOFILTER | BLOSC_SHUFFLE | BLOSC_BITSHUFFLE | BLOSC_DELTA | BLOSC_TRUNC_PREC
-            ) && !crate::filters::is_registered_filter(filter)
-            {
-                return Err("Invalid frame: unsupported filter".into());
-            }
-        }
-
         let data_start = header_size;
         let data_end = data_start
             .checked_add(cbytes as usize)
@@ -2340,41 +3001,122 @@ pub mod frame {
             return Err("Invalid frame: truncated data section".into());
         }
 
-        let mut chunks = Vec::new();
-        let mut pos = data_start;
         let mut total_nbytes = 0i64;
         let mut total_cbytes = 0i64;
         let chunk_spec = FrameChunkSpec {
             compcode,
             compcode_meta,
             typesize,
+            nfilters,
             filters: &filters,
             filters_meta: &filters_meta,
-            use_dict,
             vlblocks,
         };
-        while pos < data_end {
-            let ch = read_chunk_header_at(&mut file, pos as u64, data_end as u64)?;
-            validate_embedded_chunk_header(&ch, &chunk_spec)?;
-            let chunk_cbytes = ch.cbytes as usize;
-            let chunk_end = pos
-                .checked_add(chunk_cbytes)
-                .ok_or_else(|| "Invalid frame: chunk size overflow".to_string())?;
-            if chunk_end > data_end {
-                return Err("Invalid frame: chunk extends past data section".into());
+        let offsets_len = if cbytes == 0 && nbytes == 0 {
+            0
+        } else {
+            offsets_chunk_len_from_file(&mut file, data_end, frame_size)?
+        };
+        let offsets = offsets_payload_from_file(&mut file, data_end, offsets_len)?;
+        validate_frame_offsets_count(offsets.len(), nbytes, chunksize)?;
+        let mut chunks = Vec::new();
+        if offsets.is_empty() {
+            let mut pos = data_start;
+            while pos < data_end {
+                let ch = read_chunk_header_at(&mut file, pos as u64, data_end as u64)?;
+                validate_embedded_chunk_header(&ch, &chunk_spec)?;
+                let chunk_cbytes = ch.cbytes as usize;
+                let chunk_end = pos
+                    .checked_add(chunk_cbytes)
+                    .ok_or_else(|| "Invalid frame: chunk size overflow".to_string())?;
+                if chunk_end > data_end {
+                    return Err("Invalid frame: chunk extends past data section".into());
+                }
+                let mut chunk = vec![0u8; chunk_cbytes];
+                read_exact_at(
+                    &mut file,
+                    pos as u64,
+                    &mut chunk,
+                    "Failed to read frame chunk",
+                )?;
+                compress::cbuffer_validate(&chunk)
+                    .map_err(|err| format!("Invalid frame: {err}"))?;
+                total_nbytes = total_nbytes
+                    .checked_add(ch.nbytes as i64)
+                    .ok_or_else(|| "Invalid frame: nbytes overflow".to_string())?;
+                total_cbytes = total_cbytes
+                    .checked_add(ch.cbytes as i64)
+                    .ok_or_else(|| "Invalid frame: cbytes overflow".to_string())?;
+                chunks.push(LazyChunkRef {
+                    offset: pos as u64,
+                    cbytes: chunk_cbytes,
+                    nbytes: ch.nbytes as usize,
+                    special: None,
+                });
+                pos = chunk_end;
             }
-            total_nbytes = total_nbytes
-                .checked_add(ch.nbytes as i64)
-                .ok_or_else(|| "Invalid frame: nbytes overflow".to_string())?;
-            total_cbytes = total_cbytes
-                .checked_add(ch.cbytes as i64)
-                .ok_or_else(|| "Invalid frame: cbytes overflow".to_string())?;
-            chunks.push(LazyChunkRef {
-                offset: pos as u64,
-                cbytes: chunk_cbytes,
-                nbytes: ch.nbytes as usize,
-            });
-            pos = chunk_end;
+        } else {
+            chunks.reserve(offsets.len());
+            let mut intervals = Vec::with_capacity(offsets.len());
+            for (logical_idx, &offset) in offsets.iter().enumerate() {
+                if let Some(special) = special_type_from_offset(offset) {
+                    let nbytes =
+                        special_chunk_nbytes(logical_idx, offsets.len(), nbytes, chunksize)?;
+                    let chunk =
+                        synthetic_special_chunk_with_spec(special, nbytes, blocksize, &chunk_spec)?;
+                    let header = ChunkHeader::read(&chunk)
+                        .map_err(|_| "Invalid frame: invalid special chunk header".to_string())?;
+                    validate_embedded_chunk_header(&header, &chunk_spec)?;
+                    total_nbytes = total_nbytes
+                        .checked_add(nbytes as i64)
+                        .ok_or_else(|| "Invalid frame: nbytes overflow".to_string())?;
+                    chunks.push(LazyChunkRef {
+                        offset,
+                        cbytes: BLOSC_EXTENDED_HEADER_LENGTH,
+                        nbytes,
+                        special: Some(special),
+                    });
+                    continue;
+                }
+                if offset & (1u64 << 63) != 0 {
+                    return Err("Invalid frame: invalid special chunk offset".into());
+                }
+                let pos = data_start
+                    .checked_add(offset as usize)
+                    .ok_or_else(|| "Invalid frame: chunk offset overflow".to_string())?;
+                let ch = read_chunk_header_at(&mut file, pos as u64, data_end as u64)?;
+                validate_embedded_chunk_header(&ch, &chunk_spec)?;
+                let chunk_cbytes = ch.cbytes as usize;
+                let chunk_end = pos
+                    .checked_add(chunk_cbytes)
+                    .ok_or_else(|| "Invalid frame: chunk size overflow".to_string())?;
+                if chunk_end > data_end {
+                    return Err("Invalid frame: chunk extends past data section".into());
+                }
+                let mut chunk = vec![0u8; chunk_cbytes];
+                read_exact_at(
+                    &mut file,
+                    pos as u64,
+                    &mut chunk,
+                    "Failed to read frame chunk",
+                )?;
+                compress::cbuffer_validate(&chunk)
+                    .map_err(|err| format!("Invalid frame: {err}"))?;
+                intervals.push((pos - data_start, chunk_end - data_start));
+                total_nbytes = total_nbytes
+                    .checked_add(ch.nbytes as i64)
+                    .ok_or_else(|| "Invalid frame: nbytes overflow".to_string())?;
+                total_cbytes = total_cbytes
+                    .checked_add(ch.cbytes as i64)
+                    .ok_or_else(|| "Invalid frame: cbytes overflow".to_string())?;
+                chunks.push(LazyChunkRef {
+                    offset: pos as u64,
+                    cbytes: chunk_cbytes,
+                    nbytes: ch.nbytes as usize,
+                    special: None,
+                });
+            }
+            validate_frame_data_intervals(&mut intervals, cbytes as usize)?;
         }
 
         if total_cbytes != cbytes {
@@ -2383,11 +3125,6 @@ pub mod frame {
         if total_nbytes != nbytes {
             return Err("Invalid frame: chunk nbytes total does not match frame".into());
         }
-        let offsets_len = if chunks.is_empty() {
-            0
-        } else {
-            offsets_chunk_len_from_file(&mut file, data_end, frame_size)?
-        };
         let trailer_start = data_end
             .checked_add(offsets_len)
             .ok_or_else(|| "Invalid frame: trailer offset overflow".to_string())?;
@@ -2405,13 +3142,6 @@ pub mod frame {
             )?;
         }
         let vlmetalayers = parse_vlmetalayers(&trailer, has_vlmeta)?;
-
-        if variable_chunks && chunks.len() > 1 {
-            let first_size = chunks[0].nbytes;
-            if chunks.iter().all(|chunk| chunk.nbytes == first_size) {
-                return Err("Invalid frame: variable chunk flag without variable chunks".into());
-            }
-        }
 
         Ok(LazySchunk {
             cparams: CParams {
@@ -2481,6 +3211,9 @@ pub mod frame {
         if frame_size < header_size as u64 || frame_size > data.len() as u64 {
             return Err("Invalid frame size".into());
         }
+        if frame_size != data.len() as u64 {
+            return Err("Invalid frame size".into());
+        }
 
         // [24-28] flags string
         if data[24] != MSGPACK_STR4 {
@@ -2508,22 +3241,7 @@ pub mod frame {
         };
         let compcode_meta = data[FRAME_CODEC_META];
         let clevel = (codec_flags >> 4) & 0x0F;
-        if !matches!(
-            compcode,
-            BLOSC_BLOSCLZ | BLOSC_LZ4 | BLOSC_LZ4HC | BLOSC_ZLIB | BLOSC_ZSTD
-        ) && !crate::codecs::is_registered_codec(compcode)
-        {
-            return Err("Invalid frame: unsupported codec".into());
-        }
-        if clevel > 9 {
-            return Err("Invalid frame: invalid compression level".into());
-        }
-        let splitmode = match other_flags & 0x03 {
-            1 => BLOSC_ALWAYS_SPLIT,
-            2 => BLOSC_NEVER_SPLIT,
-            3 => BLOSC_AUTO_SPLIT,
-            _ => BLOSC_FORWARD_COMPAT_SPLIT,
-        };
+        let splitmode = decode_frame_splitmode(other_flags);
 
         // [29-37] uncompressed_size
         if data[29] != MSGPACK_INT64 {
@@ -2545,7 +3263,7 @@ pub mod frame {
             return Err("Expected int32 for typesize".into());
         }
         let typesize = i32::from_be_bytes(data[48..52].try_into().unwrap());
-        if !(1..=BLOSC_MAX_TYPESIZE as i32).contains(&typesize) {
+        if !(1..=BLOSC2_MAXTYPESIZE as i32).contains(&typesize) {
             return Err("Invalid frame: invalid typesize".into());
         }
 
@@ -2563,16 +3281,13 @@ pub mod frame {
             return Err("Expected int32 for chunksize".into());
         }
         let chunksize_i32 = i32::from_be_bytes(data[58..62].try_into().unwrap());
-        if chunksize_i32 < 0 {
+        if chunksize_i32 < -1 || (chunksize_i32 == -1 && (nbytes != 0 || cbytes != 0)) {
             return Err("Invalid frame: negative chunksize".into());
         }
-        let chunksize = chunksize_i32 as usize;
+        let chunksize = chunksize_i32.max(0) as usize;
         if variable_chunks {
             if chunksize != 0 {
                 return Err("Invalid frame: variable chunk flag with nonzero chunksize".into());
-            }
-            if frame_version < BLOSC2_VERSION_FRAME_FORMAT {
-                return Err("Invalid frame: variable chunks require frame version 3".into());
             }
         }
 
@@ -2605,28 +3320,13 @@ pub mod frame {
         if data[69] != MSGPACK_FIXEXT16 {
             return Err("Expected fixext16 for filters".into());
         }
-        let _nfilters = data[70];
-        let mut filters = [0u8; BLOSC2_MAX_FILTERS];
-        let mut filters_meta = [0u8; BLOSC2_MAX_FILTERS];
-        filters.copy_from_slice(&data[71..71 + BLOSC2_MAX_FILTERS]);
-        filters_meta.copy_from_slice(&data[79..79 + BLOSC2_MAX_FILTERS]);
+        let nfilters = data[70];
+        if nfilters as usize > BLOSC2_MAX_FILTERS {
+            return Err("Invalid frame: too many filters".into());
+        }
+        let nfilters = nfilters as usize;
+        let (filters, filters_meta) = read_frame_filters(data, 71, 79, nfilters);
         let use_dict = data[FRAME_OTHER_FLAGS2] & 0x01 != 0;
-        if use_dict && !codecs::codec_supports_dict(compcode) {
-            return Err(
-                "Invalid frame: dictionary compression is only supported for Zstd, LZ4, and LZ4HC"
-                    .into(),
-            );
-        }
-        for &filter in &filters {
-            if !matches!(
-                filter,
-                BLOSC_NOFILTER | BLOSC_SHUFFLE | BLOSC_BITSHUFFLE | BLOSC_DELTA | BLOSC_TRUNC_PREC
-            ) && !crate::filters::is_registered_filter(filter)
-            {
-                return Err("Invalid frame: unsupported filter".into());
-            }
-        }
-
         // Now we need to find and read the chunks
         // The offset index is after the data chunks
         // First, find data start (= header_size) and read the offset index
@@ -2636,9 +3336,6 @@ pub mod frame {
 
         // The offsets chunk is after all data chunks
         // We need to scan forward from data_start, reading chunk headers to find all chunks
-        let mut chunks = Vec::new();
-        let mut pos = data_start;
-
         // We know the total cbytes, so data region ends at data_start + cbytes
         if cbytes < 0 {
             return Err("Invalid frame: negative cbytes".into());
@@ -2655,40 +3352,126 @@ pub mod frame {
 
         let mut total_nbytes = 0i64;
         let mut total_cbytes = 0i64;
+        let mut materialized_cbytes = 0i64;
         let chunk_spec = FrameChunkSpec {
             compcode,
             compcode_meta,
             typesize,
+            nfilters,
             filters: &filters,
             filters_meta: &filters_meta,
-            use_dict,
             vlblocks,
         };
-        while pos < data_end {
-            if pos + BLOSC_MIN_HEADER_LENGTH > data_end {
-                return Err("Invalid frame: data section ends inside chunk header".into());
+        let offsets_len = if cbytes == 0 && nbytes == 0 {
+            0
+        } else {
+            offsets_chunk_len(data, data_end, frame_size as usize)?
+        };
+        let mut chunks = Vec::new();
+        if offsets_len > 0 {
+            let offsets_end = data_end
+                .checked_add(offsets_len)
+                .ok_or_else(|| "Invalid frame: offsets chunk overflow".to_string())?;
+            let offsets_payload = compress::decompress(&data[data_end..offsets_end])
+                .map_err(|_| "Invalid frame: invalid offsets chunk".to_string())?;
+            if offsets_payload.len() % 8 != 0 {
+                return Err("Invalid frame: offsets payload has invalid length".into());
             }
+            let nchunks = offsets_payload.len() / 8;
+            validate_frame_offsets_count(nchunks, nbytes, chunksize)?;
+            let mut intervals = Vec::with_capacity(nchunks);
+            for (logical_idx, bytes) in offsets_payload.chunks_exact(8).enumerate() {
+                let offset = u64::from_le_bytes(bytes.try_into().unwrap());
+                if special_type_from_offset(offset).is_some() {
+                    let chunk = special_chunk_from_offset(
+                        offset,
+                        logical_idx,
+                        nchunks,
+                        nbytes,
+                        chunksize,
+                        blocksize,
+                        &chunk_spec,
+                    )?;
+                    let ch = ChunkHeader::read(&chunk)
+                        .map_err(|_| "Invalid frame: invalid special chunk header".to_string())?;
+                    validate_embedded_chunk_header(&ch, &chunk_spec)?;
+                    total_nbytes = total_nbytes
+                        .checked_add(ch.nbytes as i64)
+                        .ok_or_else(|| "Invalid frame: nbytes overflow".to_string())?;
+                    materialized_cbytes = materialized_cbytes
+                        .checked_add(ch.cbytes as i64)
+                        .ok_or_else(|| "Invalid frame: cbytes overflow".to_string())?;
+                    chunks.push(chunk);
+                    continue;
+                }
+                if offset & (1u64 << 63) != 0 {
+                    return Err("Invalid frame: invalid special chunk offset".into());
+                }
 
-            let ch = ChunkHeader::read(&data[pos..])
-                .map_err(|_| "Invalid frame: invalid chunk header".to_string())?;
-            validate_embedded_chunk_header(&ch, &chunk_spec)?;
-
-            let chunk_cbytes = ch.cbytes as usize;
-            let chunk_end = pos
-                .checked_add(chunk_cbytes)
-                .ok_or_else(|| "Invalid frame: chunk size overflow".to_string())?;
-            if chunk_end > data_end {
-                return Err("Invalid frame: chunk extends past data section".into());
+                let pos = data_start
+                    .checked_add(offset as usize)
+                    .ok_or_else(|| "Invalid frame: chunk offset overflow".to_string())?;
+                if pos + BLOSC_MIN_HEADER_LENGTH > data_end {
+                    return Err("Invalid frame: chunk offset outside data section".into());
+                }
+                let ch = ChunkHeader::read(&data[pos..])
+                    .map_err(|_| "Invalid frame: invalid chunk header".to_string())?;
+                validate_embedded_chunk_header(&ch, &chunk_spec)?;
+                let chunk_cbytes = ch.cbytes as usize;
+                let chunk_end = pos
+                    .checked_add(chunk_cbytes)
+                    .ok_or_else(|| "Invalid frame: chunk size overflow".to_string())?;
+                if chunk_end > data_end {
+                    return Err("Invalid frame: chunk extends past data section".into());
+                }
+                compress::cbuffer_validate(&data[pos..chunk_end])
+                    .map_err(|err| format!("Invalid frame: {err}"))?;
+                intervals.push((pos - data_start, chunk_end - data_start));
+                total_nbytes = total_nbytes
+                    .checked_add(ch.nbytes as i64)
+                    .ok_or_else(|| "Invalid frame: nbytes overflow".to_string())?;
+                total_cbytes = total_cbytes
+                    .checked_add(ch.cbytes as i64)
+                    .ok_or_else(|| "Invalid frame: cbytes overflow".to_string())?;
+                materialized_cbytes = materialized_cbytes
+                    .checked_add(ch.cbytes as i64)
+                    .ok_or_else(|| "Invalid frame: cbytes overflow".to_string())?;
+                chunks.push(data[pos..chunk_end].to_vec());
             }
+            validate_frame_data_intervals(&mut intervals, cbytes as usize)?;
+        } else {
+            let mut pos = data_start;
+            while pos < data_end {
+                if pos + BLOSC_MIN_HEADER_LENGTH > data_end {
+                    return Err("Invalid frame: data section ends inside chunk header".into());
+                }
 
-            total_nbytes = total_nbytes
-                .checked_add(ch.nbytes as i64)
-                .ok_or_else(|| "Invalid frame: nbytes overflow".to_string())?;
-            total_cbytes = total_cbytes
-                .checked_add(ch.cbytes as i64)
-                .ok_or_else(|| "Invalid frame: cbytes overflow".to_string())?;
-            chunks.push(data[pos..chunk_end].to_vec());
-            pos = chunk_end;
+                let ch = ChunkHeader::read(&data[pos..])
+                    .map_err(|_| "Invalid frame: invalid chunk header".to_string())?;
+                validate_embedded_chunk_header(&ch, &chunk_spec)?;
+
+                let chunk_cbytes = ch.cbytes as usize;
+                let chunk_end = pos
+                    .checked_add(chunk_cbytes)
+                    .ok_or_else(|| "Invalid frame: chunk size overflow".to_string())?;
+                if chunk_end > data_end {
+                    return Err("Invalid frame: chunk extends past data section".into());
+                }
+                compress::cbuffer_validate(&data[pos..chunk_end])
+                    .map_err(|err| format!("Invalid frame: {err}"))?;
+
+                total_nbytes = total_nbytes
+                    .checked_add(ch.nbytes as i64)
+                    .ok_or_else(|| "Invalid frame: nbytes overflow".to_string())?;
+                total_cbytes = total_cbytes
+                    .checked_add(ch.cbytes as i64)
+                    .ok_or_else(|| "Invalid frame: cbytes overflow".to_string())?;
+                materialized_cbytes = materialized_cbytes
+                    .checked_add(ch.cbytes as i64)
+                    .ok_or_else(|| "Invalid frame: cbytes overflow".to_string())?;
+                chunks.push(data[pos..chunk_end].to_vec());
+                pos = chunk_end;
+            }
         }
 
         if total_cbytes != cbytes {
@@ -2697,11 +3480,6 @@ pub mod frame {
         if total_nbytes != nbytes {
             return Err("Invalid frame: chunk nbytes total does not match frame".into());
         }
-        let offsets_len = if chunks.is_empty() {
-            0
-        } else {
-            offsets_chunk_len(data, data_end, frame_size as usize)?
-        };
         let trailer_start = data_end
             .checked_add(offsets_len)
             .ok_or_else(|| "Invalid frame: trailer offset overflow".to_string())?;
@@ -2710,17 +3488,6 @@ pub mod frame {
         }
         let vlmetalayers =
             parse_vlmetalayers(&data[trailer_start..frame_size as usize], has_vlmeta)?;
-        if variable_chunks && chunks.len() > 1 {
-            let mut sizes = chunks
-                .iter()
-                .map(|chunk| ChunkHeader::read(chunk).map(|header| header.nbytes));
-            if let Some(Ok(first_size)) = sizes.next() {
-                if sizes.all(|size| size == Ok(first_size)) {
-                    return Err("Invalid frame: variable chunk flag without variable chunks".into());
-                }
-            }
-        }
-
         let cparams = CParams {
             compcode,
             clevel,
@@ -2746,7 +3513,7 @@ pub mod frame {
             chunks,
             chunksize,
             nbytes,
-            cbytes,
+            cbytes: materialized_cbytes,
             metalayers,
             vlmetalayers,
             variable_chunks,
@@ -2758,6 +3525,22 @@ pub mod frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
+
+    static LAST_PREFILTER_NCHUNK: AtomicI64 = AtomicI64::new(-99);
+    static LAST_POSTFILTER_NCHUNK: AtomicI64 = AtomicI64::new(-99);
+
+    fn record_prefilter_nchunk(params: &mut compress::PrefilterParams<'_>) -> i32 {
+        LAST_PREFILTER_NCHUNK.store(params.nchunk, AtomicOrdering::SeqCst);
+        params.output.copy_from_slice(params.input);
+        0
+    }
+
+    fn record_postfilter_nchunk(params: &mut compress::PostfilterParams<'_>) -> i32 {
+        LAST_POSTFILTER_NCHUNK.store(params.nchunk, AtomicOrdering::SeqCst);
+        params.output.copy_from_slice(params.input);
+        0
+    }
 
     #[test]
     fn test_schunk_basic() {
@@ -2786,6 +3569,157 @@ mod tests {
         assert_eq!(data1, d1);
         assert_eq!(data2, d2);
         assert!(schunk.decompress_chunk(-1).is_err());
+    }
+
+    #[test]
+    fn test_filter_callbacks_receive_schunk_chunk_index() {
+        LAST_PREFILTER_NCHUNK.store(-99, AtomicOrdering::SeqCst);
+        LAST_POSTFILTER_NCHUNK.store(-99, AtomicOrdering::SeqCst);
+
+        let mut schunk = Schunk::new(
+            CParams {
+                compcode: BLOSC_LZ4,
+                clevel: 5,
+                typesize: 1,
+                filters: [0; BLOSC2_MAX_FILTERS],
+                prefilter: Some(record_prefilter_nchunk),
+                ..Default::default()
+            },
+            DParams {
+                postfilter: Some(record_postfilter_nchunk),
+                typesize: 1,
+                ..Default::default()
+            },
+        );
+
+        let first = vec![b'a'; 1024];
+        let second = vec![b'b'; 1024];
+        let updated = vec![b'c'; 1024];
+
+        schunk.append_buffer(&first).unwrap();
+        assert_eq!(LAST_PREFILTER_NCHUNK.load(AtomicOrdering::SeqCst), 0);
+        schunk.append_buffer(&second).unwrap();
+        assert_eq!(LAST_PREFILTER_NCHUNK.load(AtomicOrdering::SeqCst), 1);
+        schunk.update_chunk(1, &updated).unwrap();
+        assert_eq!(LAST_PREFILTER_NCHUNK.load(AtomicOrdering::SeqCst), 1);
+
+        assert_eq!(schunk.decompress_chunk(1).unwrap(), updated);
+        assert_eq!(LAST_POSTFILTER_NCHUNK.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_special_offset_decoding_accepts_c_mask_form() {
+        let canonical = frame::encoded_special_offset(BLOSC2_SPECIAL_ZERO);
+        assert_eq!(
+            frame::special_type_from_offset(canonical | 0x1234),
+            Some(BLOSC2_SPECIAL_ZERO)
+        );
+        assert_eq!(
+            frame::special_type_from_offset(
+                frame::encoded_special_offset(BLOSC2_SPECIAL_UNINIT) | 0x00ff_ffff
+            ),
+            Some(BLOSC2_SPECIAL_UNINIT)
+        );
+        assert_eq!(frame::special_type_from_offset(0x8500_0000_0000_0001), None);
+    }
+
+    #[test]
+    fn test_lazy_special_offset_reports_frame_cbytes() {
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 1,
+            splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            ..Default::default()
+        };
+        let mut schunk = Schunk::new(cparams.clone(), DParams::default());
+        schunk.append_buffer(&[1u8; 8]).unwrap();
+        schunk.append_buffer(&[0u8; 8]).unwrap();
+
+        let frame = schunk.to_frame();
+        let header_size = i32::from_be_bytes(frame[11..15].try_into().unwrap()) as usize;
+        let cbytes = i64::from_be_bytes(frame[39..47].try_into().unwrap()) as usize;
+        let data_start = header_size;
+        let data_end = data_start + cbytes;
+        let offsets_header = ChunkHeader::read(&frame[data_end..]).unwrap();
+        let offsets_end = data_end + offsets_header.cbytes as usize;
+        let trailer = &frame[offsets_end..];
+
+        let first_chunk_len = schunk.chunks[0].len();
+        let mut offsets_payload = vec![0u8; 16];
+        offsets_payload[..8].copy_from_slice(&0u64.to_le_bytes());
+        offsets_payload[8..]
+            .copy_from_slice(&frame::encoded_special_offset(BLOSC2_SPECIAL_ZERO).to_le_bytes());
+        let offsets_chunk = {
+            let cparams = CParams {
+                compcode: BLOSC_BLOSCLZ,
+                clevel: 5,
+                typesize: 8,
+                splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
+                filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+                ..Default::default()
+            };
+            compress::compress(&offsets_payload, &cparams).unwrap()
+        };
+
+        let mut special_frame = frame[..header_size].to_vec();
+        let new_cbytes = first_chunk_len as i64;
+        let new_frame_size = header_size + first_chunk_len + offsets_chunk.len() + trailer.len();
+        special_frame[16..24].copy_from_slice(&(new_frame_size as u64).to_be_bytes());
+        special_frame[39..47].copy_from_slice(&new_cbytes.to_be_bytes());
+        special_frame.extend_from_slice(&frame[data_start..data_start + first_chunk_len]);
+        special_frame.extend_from_slice(&offsets_chunk);
+        special_frame.extend_from_slice(trailer);
+
+        let eager = Schunk::from_frame(&special_frame).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("special-offset.b2frame");
+        std::fs::write(&path, &special_frame).unwrap();
+        let lazy = Schunk::open_lazy(&path).unwrap();
+        assert_eq!(lazy.chunk_refs()[1].cbytes, BLOSC_EXTENDED_HEADER_LENGTH);
+        assert_eq!(lazy.cbytes, new_cbytes);
+        assert_ne!(lazy.cbytes, eager.cbytes);
+        assert_eq!(lazy.decompress_chunk(1).unwrap(), vec![0u8; 8]);
+    }
+
+    #[test]
+    fn test_synthetic_special_zero_validates_cparams_and_sizes() {
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 4,
+            blocksize: 100,
+            filters: [0; BLOSC2_MAX_FILTERS],
+            ..Default::default()
+        };
+        let chunk = synthetic_special_chunk_for_params(BLOSC2_SPECIAL_ZERO, 16, &cparams).unwrap();
+        let header = ChunkHeader::read(&chunk).unwrap();
+        assert_eq!(header.special_type(), BLOSC2_SPECIAL_ZERO);
+        assert_eq!(header.typesize, 4);
+        assert_eq!(header.nbytes, 16);
+        assert_eq!(header.blocksize, 16);
+        assert_eq!(header.cbytes as usize, BLOSC_EXTENDED_HEADER_LENGTH);
+
+        assert!(synthetic_special_chunk_for_params(BLOSC2_SPECIAL_ZERO, 18, &cparams).is_err());
+        assert!(synthetic_special_chunk_for_params(
+            BLOSC2_SPECIAL_ZERO,
+            16,
+            &CParams {
+                typesize: 0,
+                ..cparams.clone()
+            },
+        )
+        .is_err());
+        assert!(synthetic_special_chunk_for_params(
+            BLOSC2_SPECIAL_ZERO,
+            16,
+            &CParams {
+                blocksize: -1,
+                ..cparams
+            },
+        )
+        .is_err());
     }
 
     #[test]
@@ -2841,7 +3775,7 @@ mod tests {
             filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
             ..Default::default()
         };
-        let mut schunk = Schunk::new(cparams, DParams::default());
+        let mut schunk = Schunk::new(cparams.clone(), DParams::default());
 
         schunk.append_buffer(b"aaaa").unwrap();
         schunk.append_buffer(b"cccc").unwrap();
@@ -2853,7 +3787,7 @@ mod tests {
         schunk.update_chunk(1, b"BBBB").unwrap();
         assert_eq!(schunk.decompress_all().unwrap(), b"aaaaBBBBcccc");
 
-        let removed = schunk.delete_chunk(0).unwrap();
+        let removed = schunk.delete_chunk_data(0).unwrap();
         assert_eq!(removed, b"aaaa");
         assert_eq!(schunk.decompress_all().unwrap(), b"BBBBcccc");
         assert_eq!(schunk.chunksize, 4);
@@ -2881,7 +3815,7 @@ mod tests {
             filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
             ..Default::default()
         };
-        let mut schunk = Schunk::new(cparams, DParams::default());
+        let mut schunk = Schunk::new(cparams.clone(), DParams::default());
         let data: Vec<u8> = (0..512u32).flat_map(|i| i.to_le_bytes()).collect();
         schunk.append_buffer(&data).unwrap();
 
@@ -2967,6 +3901,26 @@ mod tests {
         }
     }
 
+    fn sequence_frame_codec_compress(_clevel: u8, meta: u8, src: &[u8], dest: &mut [u8]) -> i32 {
+        if src.len() < 2 || dest.len() < 3 {
+            return 0;
+        }
+        dest[0] = src[0];
+        dest[1] = src[1].wrapping_sub(src[0]);
+        dest[2] = meta;
+        3
+    }
+
+    fn sequence_frame_codec_decompress(meta: u8, src: &[u8], dest: &mut [u8]) -> i32 {
+        if src.len() != 3 || src[2] != meta {
+            return -1;
+        }
+        for (idx, byte) in dest.iter_mut().enumerate() {
+            *byte = src[0].wrapping_add(src[1].wrapping_mul(idx as u8));
+        }
+        dest.len() as i32
+    }
+
     #[test]
     fn test_user_defined_filter_frame_roundtrip_and_metadata() {
         const FILTER_ID: u8 = 201;
@@ -2996,6 +3950,149 @@ mod tests {
         assert_eq!(restored.cparams.filters, filters);
         assert_eq!(restored.cparams.filters_meta, filters_meta);
         assert_eq!(restored.decompress_all().unwrap(), data);
+    }
+
+    #[test]
+    fn test_plugin_codec_frame_roundtrip_and_metadata() {
+        const CODEC_ID: u8 = 32;
+        codecs::register_codec(
+            CODEC_ID,
+            sequence_frame_codec_compress,
+            sequence_frame_codec_decompress,
+        )
+        .unwrap();
+
+        let data: Vec<u8> = (0..200u8).collect();
+        let cparams = CParams {
+            compcode: CODEC_ID,
+            compcode_meta: 19,
+            clevel: 5,
+            typesize: 1,
+            blocksize: 200,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0; BLOSC2_MAX_FILTERS],
+            ..Default::default()
+        };
+        let mut schunk = Schunk::new(cparams, DParams::default());
+        schunk.append_buffer(&data).unwrap();
+
+        let frame = schunk.to_frame();
+        assert_eq!(frame[27] & 0x0f, BLOSC_UDCODEC_FORMAT);
+        assert_eq!(frame[77], CODEC_ID);
+        assert_eq!(frame[78], 19);
+
+        let restored = Schunk::from_frame(&frame).unwrap();
+        assert_eq!(restored.cparams.compcode, CODEC_ID);
+        assert_eq!(restored.cparams.compcode_meta, 19);
+        assert_eq!(restored.decompress_all().unwrap(), data);
+    }
+
+    #[test]
+    fn test_frame_stores_builtin_codec_metadata_byte() {
+        let cparams = CParams {
+            compcode: BLOSC_LZ4HC,
+            compcode_meta: 7,
+            clevel: 5,
+            typesize: 1,
+            filters: [0; BLOSC2_MAX_FILTERS],
+            ..Default::default()
+        };
+        let mut schunk = Schunk::new(cparams, DParams::default());
+        schunk
+            .append_buffer(b"builtin codec frame metadata")
+            .unwrap();
+
+        let frame = schunk.to_frame();
+        assert_eq!(frame[27] & 0x0f, BLOSC_LZ4HC);
+        assert_eq!(frame[77], BLOSC_LZ4HC);
+        assert_eq!(frame[78], 7);
+        let restored = Schunk::from_frame(&frame).unwrap();
+        assert_eq!(restored.cparams.compcode, BLOSC_LZ4HC);
+        assert_eq!(
+            restored.decompress_all().unwrap(),
+            b"builtin codec frame metadata"
+        );
+    }
+
+    #[test]
+    fn test_unregistered_frame_udcodec_allowed_until_codec_needed() {
+        let data = b"frame memcpy payload".repeat(32);
+        let mut memcpy_schunk = Schunk::new(
+            CParams {
+                compcode: BLOSC_LZ4,
+                clevel: 0,
+                typesize: 1,
+                filters: [0; BLOSC2_MAX_FILTERS],
+                ..Default::default()
+            },
+            DParams::default(),
+        );
+        memcpy_schunk.append_buffer(&data).unwrap();
+        let mut memcpy_frame = memcpy_schunk.to_frame();
+        let header_size = i32::from_be_bytes(memcpy_frame[11..15].try_into().unwrap()) as usize;
+        memcpy_frame[27] = (memcpy_frame[27] & 0xf0) | BLOSC_UDCODEC_FORMAT;
+        memcpy_frame[77] = 160;
+        memcpy_frame[85] |= 0x01;
+        memcpy_frame[71 + BLOSC2_MAX_FILTERS - 1] = 99;
+        memcpy_frame[header_size + BLOSC2_CHUNK_FILTER_CODES + 5] = 99;
+        assert_eq!(
+            Schunk::from_frame(&memcpy_frame)
+                .unwrap()
+                .decompress_all()
+                .unwrap(),
+            data
+        );
+
+        let mut special_schunk = Schunk::new(
+            CParams {
+                compcode: BLOSC_LZ4,
+                clevel: 5,
+                typesize: 1,
+                filters: [0; BLOSC2_MAX_FILTERS],
+                ..Default::default()
+            },
+            DParams::default(),
+        );
+        special_schunk.append_buffer(&vec![0u8; 128]).unwrap();
+        let mut special_frame = special_schunk.to_frame();
+        special_frame[27] = (special_frame[27] & 0xf0) | BLOSC_UDCODEC_FORMAT;
+        special_frame[77] = 160;
+        special_frame[85] |= 0x01;
+        special_frame[71 + BLOSC2_MAX_FILTERS - 1] = 99;
+        assert_eq!(
+            Schunk::from_frame(&special_frame)
+                .unwrap()
+                .decompress_all()
+                .unwrap(),
+            vec![0u8; 128]
+        );
+
+        let mut regular_schunk = Schunk::new(
+            CParams {
+                compcode: BLOSC_LZ4,
+                clevel: 5,
+                typesize: 1,
+                filters: [0; BLOSC2_MAX_FILTERS],
+                ..Default::default()
+            },
+            DParams::default(),
+        );
+        regular_schunk.append_buffer(&data).unwrap();
+        let mut regular_frame = regular_schunk.to_frame();
+        let header_size = i32::from_be_bytes(regular_frame[11..15].try_into().unwrap()) as usize;
+        regular_frame[27] = (regular_frame[27] & 0xf0) | BLOSC_UDCODEC_FORMAT;
+        regular_frame[77] = 160;
+        regular_frame[header_size + BLOSC2_CHUNK_FLAGS] =
+            (regular_frame[header_size + BLOSC2_CHUNK_FLAGS] & !0xe0) | (BLOSC_UDCODEC_FORMAT << 5);
+        regular_frame[header_size + BLOSC2_CHUNK_UDCOMPCODE] = 160;
+        assert!(Schunk::from_frame(&regular_frame).is_err());
+
+        let mut bad_regular_filter = regular_schunk.to_frame();
+        let header_size =
+            i32::from_be_bytes(bad_regular_filter[11..15].try_into().unwrap()) as usize;
+        bad_regular_filter[71 + BLOSC2_MAX_FILTERS - 1] = 99;
+        bad_regular_filter[header_size + BLOSC2_CHUNK_FILTER_CODES + 5] = 99;
+        assert!(Schunk::from_frame(&bad_regular_filter).is_err());
     }
 
     #[test]
@@ -3048,6 +4145,8 @@ mod tests {
         };
         let mut schunk = Schunk::new(cparams, DParams::default());
         schunk.append_buffer(b"alpha\0").unwrap();
+        let zeros = vec![0u8; 8];
+        schunk.append_buffer(&zeros).unwrap();
         schunk.append_buffer(b"bravo bravo\0").unwrap();
         schunk.append_buffer(b"charlie-charlie-charlie\0").unwrap();
 
@@ -3061,10 +4160,121 @@ mod tests {
         let restored = Schunk::from_frame(&frame).unwrap();
         assert_eq!(restored.chunksize, 0);
         assert_eq!(restored.decompress_chunk(0).unwrap(), b"alpha\0");
-        assert_eq!(restored.decompress_chunk(1).unwrap(), b"bravo bravo\0");
+        assert_eq!(restored.decompress_chunk(1).unwrap(), zeros);
+        assert_eq!(restored.decompress_chunk(2).unwrap(), b"bravo bravo\0");
         assert_eq!(
-            restored.decompress_chunk(2).unwrap(),
+            restored.decompress_chunk(3).unwrap(),
             b"charlie-charlie-charlie\0"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("variable-special.b2frame");
+        schunk.to_sframe_dir(&path).unwrap();
+        assert!(path.join("00000001.chunk").is_file());
+        let restored = Schunk::open_sframe(&path).unwrap();
+        assert_eq!(restored.decompress_chunk(1).unwrap(), zeros);
+    }
+
+    #[test]
+    fn test_final_short_chunk_keeps_fixed_frame_chunksize() {
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 1,
+            splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            ..Default::default()
+        };
+        let mut schunk = Schunk::new(cparams, DParams::default());
+        schunk.append_buffer(b"first chunk").unwrap();
+        schunk.append_buffer(b"secondchunk").unwrap();
+        schunk.append_buffer(b"short").unwrap();
+
+        assert_eq!(schunk.chunksize, 11);
+
+        let frame = schunk.to_frame();
+        assert_eq!(frame[25] & 0x0F, BLOSC2_VERSION_FRAME_FORMAT_RC1);
+        assert_eq!(frame[25] & FRAME_VARIABLE_CHUNKS, 0);
+        assert_eq!(i32::from_be_bytes(frame[58..62].try_into().unwrap()), 11);
+
+        let restored = Schunk::from_frame(&frame).unwrap();
+        assert_eq!(restored.chunksize, 11);
+        assert_eq!(
+            restored.decompress_all().unwrap(),
+            b"first chunksecondchunkshort"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("final-short.b2frame");
+        schunk.to_file(path.to_str().unwrap()).unwrap();
+        let lazy = Schunk::open_lazy(&path).unwrap();
+        assert_eq!(lazy.chunksize, 11);
+        assert_eq!(
+            lazy.decompress_all().unwrap(),
+            b"first chunksecondchunkshort"
+        );
+    }
+
+    #[test]
+    fn test_empty_frame_uses_c_negative_chunksize() {
+        let schunk = Schunk::new(CParams::default(), DParams::default());
+        let frame = schunk.to_frame();
+        assert_eq!(frame[25] & 0x0F, BLOSC2_VERSION_FRAME_FORMAT_RC1);
+        assert_eq!(frame[25] & FRAME_VARIABLE_CHUNKS, 0);
+        assert_eq!(i32::from_be_bytes(frame[58..62].try_into().unwrap()), -1);
+
+        let restored = Schunk::from_frame(&frame).unwrap();
+        assert_eq!(restored.nchunks(), 0);
+        assert_eq!(restored.chunksize, 0);
+        assert_eq!(restored.nbytes, 0);
+        assert_eq!(restored.cbytes, 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.b2frame");
+        std::fs::write(&path, &frame).unwrap();
+        let lazy = Schunk::open_lazy(&path).unwrap();
+        assert_eq!(lazy.nchunks(), 0);
+        assert_eq!(lazy.chunksize, 0);
+
+        let sframe = dir.path().join("empty-sframe.b2frame");
+        schunk.to_sframe_dir(&sframe).unwrap();
+        let index = std::fs::read(sframe.join("chunks.b2frame")).unwrap();
+        assert_eq!(index[25] & 0x0F, BLOSC2_VERSION_FRAME_FORMAT_RC1);
+        assert_eq!(index[25] & FRAME_VARIABLE_CHUNKS, 0);
+        assert_eq!(i32::from_be_bytes(index[58..62].try_into().unwrap()), -1);
+        let restored = Schunk::open_sframe(&sframe).unwrap();
+        assert_eq!(restored.nchunks(), 0);
+        let lazy = Schunk::open_lazy_sframe(&sframe).unwrap();
+        assert_eq!(lazy.nchunks(), 0);
+    }
+
+    #[test]
+    fn test_non_tail_short_chunk_uses_variable_frame_flag() {
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 1,
+            splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            ..Default::default()
+        };
+        let mut schunk = Schunk::new(cparams, DParams::default());
+        schunk.append_buffer(b"first chunk").unwrap();
+        schunk.append_buffer(b"short").unwrap();
+        schunk.append_buffer(b"secondchunk").unwrap();
+
+        assert_eq!(schunk.chunksize, 0);
+
+        let frame = schunk.to_frame();
+        assert_eq!(frame[25] & 0x0F, BLOSC2_VERSION_FRAME_FORMAT);
+        assert_ne!(frame[25] & FRAME_VARIABLE_CHUNKS, 0);
+        assert_eq!(i32::from_be_bytes(frame[58..62].try_into().unwrap()), 0);
+
+        let restored = Schunk::from_frame(&frame).unwrap();
+        assert_eq!(restored.chunksize, 0);
+        assert_eq!(
+            restored.decompress_all().unwrap(),
+            b"first chunkshortsecondchunk"
         );
     }
 
@@ -3092,6 +4302,22 @@ mod tests {
         let restored = Schunk::from_frame(&frame).unwrap();
         assert!(restored.cparams.use_dict);
         assert_eq!(restored.decompress_chunk(0).unwrap(), data);
+
+        let dir = tempfile::tempdir().unwrap();
+        let frame_path = dir.path().join("dict-fallback.b2frame");
+        schunk.to_file(frame_path.to_str().unwrap()).unwrap();
+        let lazy = Schunk::open_lazy(&frame_path).unwrap();
+        assert!(lazy.cparams.use_dict);
+        assert_eq!(lazy.decompress_chunk(0).unwrap(), data);
+
+        let sframe_path = dir.path().join("dict-fallback-sframe.b2frame");
+        schunk.to_sframe_dir(&sframe_path).unwrap();
+        let eager_sframe = Schunk::open_sframe(&sframe_path).unwrap();
+        assert!(eager_sframe.cparams.use_dict);
+        assert_eq!(eager_sframe.decompress_chunk(0).unwrap(), data);
+        let lazy_sframe = Schunk::open_lazy_sframe(&sframe_path).unwrap();
+        assert!(lazy_sframe.cparams.use_dict);
+        assert_eq!(lazy_sframe.decompress_chunk(0).unwrap(), data);
     }
 
     #[test]
@@ -3121,6 +4347,69 @@ mod tests {
     }
 
     #[test]
+    fn test_dictionary_frame_accepts_per_chunk_fallback() {
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 1,
+            blocksize: 64,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            use_dict: true,
+            ..Default::default()
+        };
+        let mut schunk = Schunk::new(cparams, DParams::default());
+        let data = b"small non-special payload".to_vec();
+
+        schunk.append_buffer(&data).unwrap();
+        let chunk_header = ChunkHeader::read(schunk.compressed_chunk(0).unwrap()).unwrap();
+        assert_eq!(chunk_header.special_type(), BLOSC2_NO_SPECIAL);
+        assert!(!chunk_header.use_dict());
+
+        let frame = schunk.to_frame();
+        assert_eq!(frame[85] & 0x01, 0x01);
+
+        let restored = Schunk::from_frame(&frame).unwrap();
+        assert!(restored.cparams.use_dict);
+        assert_eq!(restored.decompress_chunk(0).unwrap(), data);
+    }
+
+    #[test]
+    fn test_frame_accepts_chunk_dictionary_without_frame_flag() {
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 4,
+            blocksize: 4096,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            use_dict: true,
+            ..Default::default()
+        };
+        let mut schunk = Schunk::new(cparams, DParams::default());
+        let data: Vec<u8> = (0..200_000u32)
+            .flat_map(|i| (i % 4096).to_le_bytes())
+            .collect();
+        schunk.append_buffer(&data).unwrap();
+        assert!(ChunkHeader::read(schunk.compressed_chunk(0).unwrap())
+            .unwrap()
+            .use_dict());
+
+        let mut frame = schunk.to_frame();
+        frame[85] &= !0x01;
+        let restored = Schunk::from_frame(&frame).unwrap();
+        assert!(!restored.cparams.use_dict);
+        assert_eq!(restored.decompress_chunk(0).unwrap(), data);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chunk-dict-no-frame-flag.b2frame");
+        std::fs::write(&path, &frame).unwrap();
+        let lazy = Schunk::open_lazy(&path).unwrap();
+        assert!(!lazy.cparams.use_dict);
+        assert_eq!(lazy.decompress_chunk(0).unwrap(), data);
+    }
+
+    #[test]
     fn test_fixed_chunks_keep_fixed_frame_flag() {
         let cparams = CParams {
             compcode: BLOSC_LZ4,
@@ -3145,6 +4434,90 @@ mod tests {
         let restored = Schunk::from_frame(&frame).unwrap();
         assert_eq!(restored.chunksize, 4);
         assert_eq!(restored.decompress_all().unwrap(), b"one\0two\0six\0");
+    }
+
+    #[test]
+    fn test_fixed_frame_writer_materializes_special_chunks() {
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 1,
+            splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            ..Default::default()
+        };
+        let mut schunk = Schunk::new(cparams, DParams::default());
+        let first = vec![1u8; 4096];
+        let zeroes = vec![0u8; 4096];
+        let last = vec![2u8; 4096];
+        let expected = [first.clone(), zeroes.clone(), last.clone()].concat();
+        schunk.append_buffer(&first).unwrap();
+        schunk.append_buffer(&zeroes).unwrap();
+        schunk.append_buffer(&last).unwrap();
+        assert_eq!(schunk.chunksize, 4096);
+        assert_eq!(
+            ChunkHeader::read(&schunk.chunks[1]).unwrap().special_type(),
+            BLOSC2_SPECIAL_ZERO
+        );
+        assert_eq!(
+            schunk.chunk_offsets(),
+            vec![
+                0,
+                schunk.chunks[0].len() as u64,
+                (schunk.chunks[0].len() + schunk.chunks[1].len()) as u64
+            ]
+        );
+
+        let frame = schunk.to_frame();
+        let header_size = i32::from_be_bytes(frame[11..15].try_into().unwrap()) as usize;
+        let cbytes = i64::from_be_bytes(frame[39..47].try_into().unwrap()) as usize;
+        let expected_cbytes = schunk.chunks.iter().map(Vec::len).sum::<usize>();
+        assert_eq!(cbytes, expected_cbytes);
+
+        let data_start = header_size;
+        let data_end = data_start + cbytes;
+        let mut pos = data_start;
+        for chunk in &schunk.chunks {
+            assert_eq!(&frame[pos..pos + chunk.len()], chunk);
+            pos += chunk.len();
+        }
+
+        let offsets_header = ChunkHeader::read(&frame[data_end..]).unwrap();
+        let offsets_end = data_end + offsets_header.cbytes as usize;
+        let offsets_payload = compress::decompress(&frame[data_end..offsets_end]).unwrap();
+        let offsets: Vec<u64> = offsets_payload
+            .chunks_exact(8)
+            .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            offsets,
+            vec![
+                0,
+                schunk.chunks[0].len() as u64,
+                (schunk.chunks[0].len() + schunk.chunks[1].len()) as u64
+            ]
+        );
+        assert_eq!(
+            Schunk::from_frame(&frame)
+                .unwrap()
+                .decompress_all()
+                .unwrap(),
+            expected
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixed-special.b2frame");
+        schunk.to_sframe_dir(&path).unwrap();
+        assert!(path.join("00000000.chunk").is_file());
+        assert!(path.join("00000001.chunk").is_file());
+        assert!(!path.join("00000002.chunk").exists());
+        assert_eq!(
+            Schunk::open_sframe(&path)
+                .unwrap()
+                .decompress_all()
+                .unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -3319,6 +4692,30 @@ mod tests {
     }
 
     #[test]
+    fn test_file_open_uses_declared_frame_size_with_trailing_bytes() {
+        let mut schunk = Schunk::new(CParams::default(), DParams::default());
+        schunk.append_buffer(b"first chunk").unwrap();
+        schunk.append_buffer(b"second chunk").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trailing.b2frame");
+        let mut frame = schunk.to_frame();
+        frame.extend_from_slice(b"trailing bytes after first frame");
+        std::fs::write(&path, frame).unwrap();
+
+        let eager = Schunk::open(path.to_str().unwrap()).unwrap();
+        let lazy = Schunk::open_lazy(&path).unwrap();
+        assert_eq!(
+            eager.decompress_all().unwrap(),
+            schunk.decompress_all().unwrap()
+        );
+        assert_eq!(
+            lazy.decompress_all().unwrap(),
+            schunk.decompress_all().unwrap()
+        );
+    }
+
+    #[test]
     fn test_lazy_schunk_variable_chunks() {
         let cparams = CParams {
             compcode: BLOSC_ZSTD,
@@ -3370,14 +4767,29 @@ mod tests {
         for chunk in &chunks {
             schunk.append_buffer(chunk).unwrap();
         }
+        let zero_chunk = vec![0u8; chunks[0].len()];
+        schunk.append_buffer(&zero_chunk).unwrap();
+        let special_header = ChunkHeader::read(schunk.compressed_chunk(3).unwrap()).unwrap();
+        assert_eq!(special_header.special_type(), BLOSC2_SPECIAL_ZERO);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("array.b2frame");
         schunk.to_sframe_dir(&path).unwrap();
         assert!(path.join("chunks.b2frame").is_file());
         assert!(path.join("00000000.chunk").is_file());
+        assert!(path.join("00000001.chunk").is_file());
+        assert!(path.join("00000002.chunk").is_file());
+        assert!(!path.join("00000003.chunk").exists());
 
         let restored = Schunk::open_sframe(&path).unwrap();
+        let restored_cbytes: i64 = (0..restored.nchunks())
+            .map(|idx| {
+                ChunkHeader::read(restored.compressed_chunk(idx).unwrap())
+                    .unwrap()
+                    .cbytes as i64
+            })
+            .sum();
+        assert_eq!(restored.cbytes, restored_cbytes);
         assert_eq!(restored.metalayer("kind"), Some(&b"sframe"[..]));
         assert_eq!(restored.vlmetalayer("owner"), Some(&b"rust"[..]));
         for (idx, expected) in chunks.iter().enumerate() {
@@ -3386,6 +4798,9 @@ mod tests {
                 expected.as_slice()
             );
         }
+        assert_eq!(restored.decompress_chunk(3).unwrap(), zero_chunk);
+        let restored_special = ChunkHeader::read(restored.compressed_chunk(3).unwrap()).unwrap();
+        assert_eq!(restored_special.special_type(), BLOSC2_SPECIAL_ZERO);
 
         let opened = Schunk::open(path.to_str().unwrap()).unwrap();
         assert_eq!(
@@ -3394,8 +4809,14 @@ mod tests {
         );
 
         let lazy = Schunk::open_lazy_sframe(&path).unwrap();
-        assert_eq!(lazy.nchunks(), 3);
+        assert_eq!(lazy.nchunks(), 4);
         assert_eq!(lazy.chunk_refs()[1].offset, 1);
+        assert_eq!(
+            lazy.chunk_refs()[3].offset,
+            frame::encoded_special_offset(BLOSC2_SPECIAL_ZERO)
+        );
+        assert_eq!(lazy.chunk_refs()[3].special, Some(BLOSC2_SPECIAL_ZERO));
+        assert!(lazy.chunk_refs()[3].cbytes > 0);
         assert_eq!(lazy.decompress_chunk(2).unwrap(), chunks[2]);
         assert_eq!(lazy.get_slice(chunks[0].len() - 4, 12).unwrap(), {
             let mut expected = Vec::new();
@@ -3403,6 +4824,44 @@ mod tests {
             expected.extend_from_slice(&chunks[1][..8]);
             expected
         });
+    }
+
+    #[test]
+    fn test_frame_roundtrip_preserves_splitmode() {
+        for splitmode in [
+            BLOSC_ALWAYS_SPLIT,
+            BLOSC_NEVER_SPLIT,
+            BLOSC_AUTO_SPLIT,
+            BLOSC_FORWARD_COMPAT_SPLIT,
+        ] {
+            let cparams = CParams {
+                compcode: BLOSC_LZ4,
+                clevel: 5,
+                typesize: 1,
+                splitmode,
+                filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+                ..Default::default()
+            };
+            let mut schunk = Schunk::new(cparams, DParams::default());
+            schunk.append_buffer(b"splitmode payload").unwrap();
+
+            let frame = schunk.to_frame();
+            let restored = Schunk::from_frame(&frame).unwrap();
+            assert_eq!(restored.cparams.splitmode, splitmode);
+
+            let dir = tempfile::tempdir().unwrap();
+            let frame_path = dir.path().join("splitmode.b2frame");
+            std::fs::write(&frame_path, &frame).unwrap();
+            let lazy = Schunk::open_lazy(&frame_path).unwrap();
+            assert_eq!(lazy.cparams.splitmode, splitmode);
+
+            let sframe_path = dir.path().join("splitmode-sframe.b2frame");
+            schunk.to_sframe_dir(&sframe_path).unwrap();
+            let restored = Schunk::open_sframe(&sframe_path).unwrap();
+            assert_eq!(restored.cparams.splitmode, splitmode);
+            let lazy = Schunk::open_lazy_sframe(&sframe_path).unwrap();
+            assert_eq!(lazy.cparams.splitmode, splitmode);
+        }
     }
 
     #[test]
@@ -3427,7 +4886,12 @@ mod tests {
 
         let frame = schunk.to_frame();
         assert_ne!(frame[25] & FRAME_VL_BLOCKS, 0);
+        assert_eq!(frame[25] & FRAME_VARIABLE_CHUNKS, 0);
         assert_eq!(frame[25] & 0x0F, BLOSC2_VERSION_FRAME_FORMAT);
+        assert_eq!(
+            i32::from_be_bytes(frame[58..62].try_into().unwrap()) as usize,
+            b"red\0green-green\0blue-blue-blue-blue\0".len()
+        );
 
         let restored = Schunk::from_frame(&frame).unwrap();
         assert_eq!(
@@ -3457,6 +4921,24 @@ mod tests {
             lazy.decompress_chunk(0).unwrap(),
             b"red\0green-green\0blue-blue-blue-blue\0"
         );
+
+        let mut variable = Schunk::new(
+            CParams {
+                compcode: BLOSC_LZ4,
+                clevel: 5,
+                typesize: 1,
+                ..Default::default()
+            },
+            DParams::default(),
+        );
+        variable.append_vlblocks(&[b"one".as_slice()]).unwrap();
+        variable
+            .append_vlblocks(&[b"longer".as_slice(), b"chunk".as_slice()])
+            .unwrap();
+        let frame = variable.to_frame();
+        assert_ne!(frame[25] & FRAME_VL_BLOCKS, 0);
+        assert_ne!(frame[25] & FRAME_VARIABLE_CHUNKS, 0);
+        assert_eq!(i32::from_be_bytes(frame[58..62].try_into().unwrap()), 0);
     }
 
     #[test]
@@ -3501,7 +4983,8 @@ mod tests {
 
         schunk.add_metalayer("author", b"pure-rust").unwrap();
         schunk.add_metalayer("revision", &[1, 2, 3, 4]).unwrap();
-        schunk.add_metalayer("author", b"updated").unwrap();
+        assert!(schunk.add_metalayer("author", b"duplicate").is_err());
+        schunk.update_metalayer("author", b"updated").unwrap();
 
         assert_eq!(schunk.metalayers.len(), 2);
         assert_eq!(schunk.metalayer("author"), Some(&b"updated"[..]));
@@ -3526,6 +5009,7 @@ mod tests {
 
         let large_name = "x".repeat(32);
         assert!(schunk.add_metalayer(&large_name, b"data").is_err());
+        assert!(schunk.update_metalayer("missing", b"data").is_err());
     }
 
     #[test]
@@ -3558,6 +5042,19 @@ mod tests {
         bad_name[name_marker_pos] = 0xC1;
         assert!(Schunk::from_frame(&bad_name).is_err());
 
+        let mut str8_name = frame.clone();
+        str8_name[name_marker_pos] = 0xD9;
+        assert!(Schunk::from_frame(&str8_name).is_err());
+
+        let mut bin8_content = frame.clone();
+        let content_marker_pos = frame
+            .windows(b"value".len())
+            .position(|window| window == b"value")
+            .unwrap()
+            - 5;
+        bin8_content[content_marker_pos] = 0xC4;
+        assert!(Schunk::from_frame(&bin8_content).is_err());
+
         let mut extra = frame.clone();
         extra.insert(header_size, 0);
         let new_header_size = (header_size + 1) as i32;
@@ -3583,7 +5080,8 @@ mod tests {
         let long_content = b"variable metalayer payload ".repeat(32);
         schunk.add_vlmetalayer("vlmeta1", &long_content).unwrap();
         schunk.add_vlmetalayer("vlmeta2", b"small").unwrap();
-        schunk.add_vlmetalayer("vlmeta2", b"updated").unwrap();
+        assert!(schunk.add_vlmetalayer("vlmeta2", b"duplicate").is_err());
+        schunk.update_vlmetalayer("vlmeta2", b"updated").unwrap();
 
         assert_eq!(schunk.vlmetalayer("vlmeta1"), Some(long_content.as_slice()));
         assert_eq!(
@@ -3610,6 +5108,7 @@ mod tests {
 
         assert!(schunk.add_vlmetalayer("", b"data").is_err());
         assert!(schunk.add_vlmetalayer(&"x".repeat(32), b"data").is_err());
+        assert!(schunk.update_vlmetalayer("missing", b"data").is_err());
     }
 
     #[test]
@@ -3646,9 +5145,31 @@ mod tests {
         bad_offset[offset_pos..offset_pos + 4].copy_from_slice(&(-1i32).to_be_bytes());
         assert!(Schunk::from_frame(&bad_offset).is_err());
 
+        let mut str8_name = frame.clone();
+        let name_marker_pos = trailer_start + 6 + 3;
+        str8_name[name_marker_pos] = 0xD9;
+        assert!(Schunk::from_frame(&str8_name).is_err());
+
+        let mut bin8_content = frame.clone();
+        let index_size = u16::from_be_bytes(
+            frame[trailer_start + 4..trailer_start + 6]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let content_marker_pos = trailer_start + 3 + index_size + 3;
+        bin8_content[content_marker_pos] = 0xC4;
+        assert!(Schunk::from_frame(&bin8_content).is_err());
+
         let mut flag_mismatch = frame.clone();
         flag_mismatch[68] = 0xC2;
         assert!(Schunk::from_frame(&flag_mismatch).is_err());
+
+        let footer_start = frame.len() - 23;
+        let mut nonzero_fingerprint = frame.clone();
+        nonzero_fingerprint[footer_start + 6] = 17;
+        nonzero_fingerprint[footer_start + 7] = 0xA5;
+        let restored = Schunk::from_frame(&nonzero_fingerprint).unwrap();
+        assert_eq!(restored.vlmetalayer("vlmeta"), Some(&b"content"[..]));
     }
 
     #[test]
@@ -3707,7 +5228,7 @@ mod tests {
         let frame = schunk.to_frame();
 
         let mut bad_codec = frame.clone();
-        bad_codec[27] = 0x06 | (5 << 4);
+        bad_codec[27] = 0x07 | (5 << 4);
         assert!(Schunk::from_frame(&bad_codec).is_err());
 
         let mut bad_frame_type = frame.clone();
@@ -3716,11 +5237,17 @@ mod tests {
 
         let mut bad_clevel = frame.clone();
         bad_clevel[27] = BLOSC_LZ4 | (10 << 4);
-        assert!(Schunk::from_frame(&bad_clevel).is_err());
+        assert_eq!(
+            Schunk::from_frame(&bad_clevel)
+                .unwrap()
+                .decompress_all()
+                .unwrap(),
+            data
+        );
 
-        let mut bad_filter = frame.clone();
-        bad_filter[71 + BLOSC2_MAX_FILTERS - 1] = 99;
-        assert!(Schunk::from_frame(&bad_filter).is_err());
+        let mut bad_filter_count = frame.clone();
+        bad_filter_count[70] = BLOSC2_MAX_FILTERS as u8 + 1;
+        assert!(Schunk::from_frame(&bad_filter_count).is_err());
 
         let mut bad_comp_threads = frame.clone();
         bad_comp_threads[63..65].copy_from_slice(&0i16.to_be_bytes());
@@ -3773,7 +5300,7 @@ mod tests {
             filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
             ..Default::default()
         };
-        let mut schunk = Schunk::new(cparams, DParams::default());
+        let mut schunk = Schunk::new(cparams.clone(), DParams::default());
         let data: Vec<u8> = (0..1000u32).flat_map(|i| i.to_le_bytes()).collect();
         schunk.append_buffer(&data).unwrap();
         let frame = schunk.to_frame();
@@ -3787,6 +5314,54 @@ mod tests {
         bad_filter[header_size + BLOSC2_CHUNK_FILTER_CODES + 5] = 99;
         assert!(Schunk::from_frame(&bad_filter).is_err());
 
+        let mut reserved_compformat = frame.clone();
+        reserved_compformat[header_size + BLOSC2_CHUNK_FLAGS] =
+            (reserved_compformat[header_size + BLOSC2_CHUNK_FLAGS] & !0xe0) | (2 << 5);
+        assert!(Schunk::from_frame(&reserved_compformat).is_err());
+
+        let mut memcpy_schunk = Schunk::new(
+            CParams {
+                compcode: BLOSC_LZ4,
+                clevel: 0,
+                typesize: 4,
+                filters: [0; BLOSC2_MAX_FILTERS],
+                ..Default::default()
+            },
+            DParams::default(),
+        );
+        memcpy_schunk.append_buffer(&data).unwrap();
+        let mut memcpy_frame = memcpy_schunk.to_frame();
+        let memcpy_header_size =
+            i32::from_be_bytes(memcpy_frame[11..15].try_into().unwrap()) as usize;
+        memcpy_frame[memcpy_header_size + BLOSC2_CHUNK_FLAGS] =
+            (memcpy_frame[memcpy_header_size + BLOSC2_CHUNK_FLAGS] & !0xe0)
+                | (BLOSC_SCHUNK_FORMAT << 5);
+        assert_eq!(
+            Schunk::from_frame(&memcpy_frame)
+                .unwrap()
+                .decompress_chunk(0)
+                .unwrap(),
+            data
+        );
+
+        let mut special_schunk = Schunk::new(cparams, DParams::default());
+        special_schunk.append_buffer(b"alpha").unwrap();
+        special_schunk.append_buffer(&[0u8; 8]).unwrap();
+        special_schunk.append_buffer(b"charlie-charlie").unwrap();
+        let mut special_frame = special_schunk.to_frame();
+        let special_header_size =
+            i32::from_be_bytes(special_frame[11..15].try_into().unwrap()) as usize;
+        let special_pos = special_header_size + special_schunk.chunks[0].len();
+        special_frame[special_pos + BLOSC2_CHUNK_FLAGS] =
+            (special_frame[special_pos + BLOSC2_CHUNK_FLAGS] & !0xe0) | (BLOSC_UDCODEC_FORMAT << 5);
+        assert_eq!(
+            Schunk::from_frame(&special_frame)
+                .unwrap()
+                .decompress_chunk(1)
+                .unwrap(),
+            vec![0u8; 8]
+        );
+
         let mut bad_flags = frame.clone();
         bad_flags[header_size + BLOSC2_CHUNK_BLOSC2_FLAGS2] = BLOSC2_VL_BLOCKS;
         assert!(Schunk::from_frame(&bad_flags).is_err());
@@ -3798,5 +5373,107 @@ mod tests {
         let mut mismatched_filter = frame.clone();
         mismatched_filter[71 + BLOSC2_MAX_FILTERS - 1] = BLOSC_NOFILTER;
         assert!(Schunk::from_frame(&mismatched_filter).is_err());
+
+        let mut ignored_filter_slots = frame.clone();
+        ignored_filter_slots[70] = 1;
+        ignored_filter_slots[71] = BLOSC_NOFILTER;
+        ignored_filter_slots[79] = 0;
+        ignored_filter_slots[72..77].fill(99);
+        ignored_filter_slots[80..85].fill(99);
+        assert_eq!(
+            Schunk::from_frame(&ignored_filter_slots)
+                .unwrap()
+                .decompress_chunk(0)
+                .unwrap(),
+            data
+        );
+    }
+
+    #[test]
+    fn test_frame_rejects_malformed_materialized_chunks_and_offsets() {
+        let data = b"abcdefgh".repeat(16);
+        let mut memcpy_schunk = Schunk::new(
+            CParams {
+                compcode: BLOSC_LZ4,
+                clevel: 0,
+                typesize: 1,
+                filters: [0; BLOSC2_MAX_FILTERS],
+                ..Default::default()
+            },
+            DParams::default(),
+        );
+        memcpy_schunk.append_buffer(&data).unwrap();
+        let frame = memcpy_schunk.to_frame();
+        let header_size = i32::from_be_bytes(frame[11..15].try_into().unwrap()) as usize;
+        let old_cbytes = i64::from_be_bytes(frame[39..47].try_into().unwrap()) as usize;
+        let chunk_cbytes = i32::from_le_bytes(
+            frame[header_size + 12..header_size + 16]
+                .try_into()
+                .unwrap(),
+        );
+
+        let mut bad_memcpy = frame.clone();
+        bad_memcpy[header_size + 12..header_size + 16]
+            .copy_from_slice(&(chunk_cbytes - 1).to_le_bytes());
+        bad_memcpy.remove(header_size + old_cbytes - 1);
+        bad_memcpy[39..47].copy_from_slice(&((old_cbytes - 1) as i64).to_be_bytes());
+        let bad_memcpy_len = bad_memcpy.len() as u64;
+        bad_memcpy[16..24].copy_from_slice(&bad_memcpy_len.to_be_bytes());
+        assert!(Schunk::from_frame(&bad_memcpy).is_err());
+
+        let mut bad_blocksize = frame.clone();
+        bad_blocksize
+            [header_size + BLOSC2_CHUNK_BLOCKSIZE..header_size + BLOSC2_CHUNK_BLOCKSIZE + 4]
+            .copy_from_slice(&((BLOSC2_MAXBLOCKSIZE as i32).wrapping_add(1)).to_le_bytes());
+        assert!(Schunk::from_frame(&bad_blocksize).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let bad_blocksize_path = dir.path().join("bad-blocksize.b2frame");
+        std::fs::write(&bad_blocksize_path, &bad_blocksize).unwrap();
+        assert!(Schunk::open_lazy(&bad_blocksize_path).is_err());
+
+        let mut equal_chunks = Schunk::new(
+            CParams {
+                compcode: BLOSC_LZ4,
+                clevel: 0,
+                typesize: 1,
+                filters: [0; BLOSC2_MAX_FILTERS],
+                ..Default::default()
+            },
+            DParams::default(),
+        );
+        equal_chunks.append_buffer(b"chunk-one").unwrap();
+        equal_chunks.append_buffer(b"chunk-two").unwrap();
+        let frame = equal_chunks.to_frame();
+        let header_size = i32::from_be_bytes(frame[11..15].try_into().unwrap()) as usize;
+        let data_cbytes = i64::from_be_bytes(frame[39..47].try_into().unwrap()) as usize;
+        let data_end = header_size + data_cbytes;
+        let offsets_header = ChunkHeader::read(&frame[data_end..]).unwrap();
+        let offsets_end = data_end + offsets_header.cbytes as usize;
+        let mut offsets_payload = compress::decompress(&frame[data_end..offsets_end]).unwrap();
+        offsets_payload[8..16].copy_from_slice(&0u64.to_le_bytes());
+        let offsets_chunk = compress::compress(
+            &offsets_payload,
+            &CParams {
+                compcode: BLOSC_BLOSCLZ,
+                clevel: 5,
+                typesize: 8,
+                splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
+                filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut duplicate_offset = Vec::new();
+        duplicate_offset.extend_from_slice(&frame[..data_end]);
+        duplicate_offset.extend_from_slice(&offsets_chunk);
+        duplicate_offset.extend_from_slice(&frame[offsets_end..]);
+        let duplicate_offset_len = duplicate_offset.len() as u64;
+        duplicate_offset[16..24].copy_from_slice(&duplicate_offset_len.to_be_bytes());
+
+        assert!(Schunk::from_frame(&duplicate_offset).is_err());
+
+        let path = dir.path().join("duplicate-offset.b2frame");
+        std::fs::write(&path, &duplicate_offset).unwrap();
+        assert!(Schunk::open_lazy(&path).is_err());
     }
 }

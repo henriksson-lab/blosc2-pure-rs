@@ -1,15 +1,18 @@
 #![cfg(feature = "_ffi")]
 use blosc2_pure_rs::b2nd::{B2ndArray, B2ndMeta};
 use blosc2_pure_rs::compress::{
-    compress, decompress, vlchunk_get_nblocks, vlcompress, vldecompress, vldecompress_block,
-    CParams,
+    cbuffer_metainfo, cbuffer_sizes, cbuffer_validate, compress, decompress, vlchunk_get_nblocks,
+    vlcompress, vldecompress, vldecompress_block, CParams,
 };
 use blosc2_pure_rs::constants::*;
+use blosc2_pure_rs::header::ChunkHeader;
 mod common;
 use blosc2_pure_rs::schunk::Schunk;
 use common::ffi;
 use std::ffi::CString;
+use std::fs;
 use std::os::raw::c_void;
+use std::path::Path;
 
 unsafe extern "C" {
     fn free(ptr: *mut c_void);
@@ -204,6 +207,92 @@ fn test_blosclz_optimization_fixtures_c_decompress() {
             "Rust BloscLZ -> C mismatch for {name}"
         );
     }
+}
+
+#[test]
+fn test_blosclz_cdata_fixtures_match_c_decompress() {
+    let _b = init_blosc2();
+    let fixtures = ["c-blosc2/compat/blosc-blosclz-3.0.0.cdata"];
+
+    for fixture in fixtures {
+        if !Path::new(fixture).exists() {
+            eprintln!("skipping missing BloscLZ C fixture: {fixture}");
+            continue;
+        }
+
+        let chunk = fs::read(fixture)
+            .unwrap_or_else(|e| panic!("failed to read BloscLZ C fixture {fixture}: {e}"));
+        let rust_decompressed = decompress(&chunk)
+            .unwrap_or_else(|e| panic!("Rust failed to decompress {fixture}: {e}"));
+
+        let mut c_decompressed = vec![0u8; rust_decompressed.len()];
+        let c_dsize = unsafe {
+            ffi::blosc2_decompress(
+                chunk.as_ptr() as *const _,
+                chunk.len() as i32,
+                c_decompressed.as_mut_ptr() as *mut _,
+                c_decompressed.len() as i32,
+            )
+        };
+        assert_eq!(
+            c_dsize,
+            rust_decompressed.len() as i32,
+            "C decompression size mismatch for {fixture}"
+        );
+        assert_eq!(
+            rust_decompressed, c_decompressed,
+            "Rust and C fixture decompression differ for {fixture}"
+        );
+    }
+}
+
+#[test]
+fn test_legacy_blosc1_bitshuffle_fixture_matches_c_decompress() {
+    let _b = init_blosc2();
+    let fixture = "c-blosc2/compat/blosc-1.17.1-lz4-bitshuffle8-nomemcpy.cdata";
+    if !Path::new(fixture).exists() {
+        eprintln!("skipping missing legacy Blosc1 fixture: {fixture}");
+        return;
+    }
+
+    let chunk = fs::read(fixture)
+        .unwrap_or_else(|e| panic!("failed to read legacy Blosc1 fixture {fixture}: {e}"));
+    assert_eq!(chunk[BLOSC2_CHUNK_VERSION], BLOSC1_VERSION_FORMAT);
+    assert_eq!(
+        chunk[BLOSC2_CHUNK_FLAGS],
+        BLOSC_DOBITSHUFFLE | (BLOSC_LZ4_FORMAT << 5)
+    );
+
+    let header = ChunkHeader::read(&chunk).unwrap();
+    assert!(!header.is_extended());
+    assert_eq!(header.header_len(), BLOSC_MIN_HEADER_LENGTH);
+    assert_eq!(header.typesize, 8);
+    assert_eq!(header.compcode(), BLOSC_LZ4);
+    assert_eq!(header.filters[BLOSC2_MAX_FILTERS - 1], BLOSC_BITSHUFFLE);
+    assert_eq!(cbuffer_sizes(&chunk).unwrap(), (641_092, 22_760, 524_288));
+
+    let (typesize, compcode, filters) =
+        cbuffer_metainfo(&chunk[..BLOSC_MIN_HEADER_LENGTH]).unwrap();
+    assert_eq!(typesize, 8);
+    assert_eq!(compcode, BLOSC_LZ4);
+    assert_eq!(filters[BLOSC2_MAX_FILTERS - 1], BLOSC_BITSHUFFLE);
+    assert!(cbuffer_validate(&chunk).is_ok());
+
+    let rust_decompressed = decompress(&chunk)
+        .unwrap_or_else(|e| panic!("Rust failed to decompress legacy fixture {fixture}: {e}"));
+    assert_eq!(rust_decompressed.len(), 641_092);
+
+    let mut c_decompressed = vec![0u8; rust_decompressed.len()];
+    let c_dsize = unsafe {
+        ffi::blosc2_decompress(
+            chunk.as_ptr() as *const _,
+            chunk.len() as i32,
+            c_decompressed.as_mut_ptr() as *mut _,
+            c_decompressed.len() as i32,
+        )
+    };
+    assert_eq!(c_dsize, rust_decompressed.len() as i32);
+    assert_eq!(rust_decompressed, c_decompressed);
 }
 
 /// Test with various filter combinations

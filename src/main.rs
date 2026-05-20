@@ -36,7 +36,7 @@ enum Commands {
         #[arg(short = 'l', long, default_value_t = 9, value_parser = clap::value_parser!(u8).range(0..=9))]
         clevel: u8,
         /// Type size in bytes
-        #[arg(short, long, default_value_t = 1, value_parser = clap::value_parser!(i32).range(1..=BLOSC_MAX_TYPESIZE as i64))]
+        #[arg(short, long, default_value_t = 1, value_parser = clap::value_parser!(i32).range(1..=BLOSC2_MAXTYPESIZE as i64))]
         typesize: i32,
         /// Explicit block size in bytes (0 = automatic)
         #[arg(short = 'b', long, default_value_t = 0, value_parser = clap::value_parser!(i32).range(0..))]

@@ -20,14 +20,14 @@ fn build_ffi() {
         .define("BUILD_FUZZERS", "OFF")
         .define("BUILD_BENCHMARKS", "OFF")
         .define("BUILD_EXAMPLES", "OFF")
-        .define("BUILD_SHARED", "OFF")
-        .define("BUILD_STATIC", "ON")
+        .define("BUILD_SHARED", "ON")
+        .define("BUILD_STATIC", "OFF")
         .define("BUILD_PLUGINS", "ON")
         .build();
 
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-search=native={}/lib64", dst.display());
-    println!("cargo:rustc-link-lib=static=blosc2");
+    println!("cargo:rustc-link-lib=dylib=blosc2");
     println!("cargo:rustc-link-lib=pthread");
     println!("cargo:rustc-link-lib=m");
 

@@ -6,6 +6,8 @@ Blosc2 is a block-oriented compressor optimized for binary data such as numerica
 
 The library is feature complete except for one edge case (get in touch if this is a problem). The speed is more or less comparable to the C implementation (benchmarks below).
 
+* 2026-05-20: New audit approach - many smaller(?) issues fixed, but further auditing needed **Be careful in using this crate as it can lead to data loss; more testing needed**
+* 2026-05-19: Another audit pass with fixes
 * 2026-04-27: Speed is now broadly comparable to, or faster than, C-Blosc2 on the default benchmark workload.
 * 2026-04-22: Ready for testing, passing current battery of tests. But be vigilant that errors may still remain; report if possible
 

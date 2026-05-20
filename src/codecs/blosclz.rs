@@ -12,8 +12,8 @@
 //!
 //! The encoder uses a small (≤ 16 KiB) hash table to find matches, performs
 //! a quick *entropy probe* (see [`get_cratio_with_htab`]) to bail out on
-//! incompressible input, and uses SIMD-accelerated match scanners and
-//! match-copy routines on x86 when available.
+//! incompressible input, and uses SIMD-accelerated match scanners on x86
+//! when available.
 
 /// Maximum number of bytes that can be emitted as a single literal run
 /// before the encoder must restart a new run (control byte rolls over).
@@ -25,37 +25,6 @@ const MAX_DISTANCE: u32 = 8191;
 const MAX_FARDISTANCE: u32 = 65535 + MAX_DISTANCE - 1;
 /// log2 of the hash table size used for match search at the maximum level.
 const HASH_LOG: u8 = 14;
-
-/// Per-offset shift amount used by the SSSE3 16-byte repeating-pattern
-/// copy: after one 16-byte block is written, the source pointer advances
-/// by this many bytes so that the next block continues the repeat.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-const COPY_MATCH_16_SHIFTS: [u8; 17] = [0, 1, 2, 1, 4, 1, 4, 2, 8, 7, 6, 5, 4, 3, 2, 1, 16];
-
-/// Build the lookup table of `pshufb` shuffle masks for repeating a short
-/// pattern (offset 1..=16) across a 16-byte SSSE3 register. Index 0 is
-/// unused; index 16 is the identity mask.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-const fn copy_match_16_masks() -> [[u8; 16]; 17] {
-    let mut masks = [[0u8; 16]; 17];
-    let mut offset = 1usize;
-    while offset <= 16 {
-        let mut i = 0usize;
-        while i < 16 {
-            masks[offset][i] = if offset == 16 {
-                i as u8
-            } else {
-                (i % offset) as u8
-            };
-            i += 1;
-        }
-        offset += 1;
-    }
-    masks
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-const COPY_MATCH_16_MASKS: [[u8; 16]; 17] = copy_match_16_masks();
 
 /// LZ4-style Fibonacci hash: multiply by the golden-ratio constant and
 /// keep the top `32 - hash_shift` bits.
@@ -228,286 +197,6 @@ fn get_match_generic(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usiz
         }
     }
     ip
-}
-
-/// SSSE3 fast-path for short overlapping copies (distance ∈ [1, 16]).
-/// Uses `pshufb` with a precomputed mask to replicate the pattern across
-/// 16-byte writes (x86_64 variant).
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "ssse3")]
-unsafe fn copy_match_repeat_16_x86_64(
-    base: *mut u8,
-    mut op: usize,
-    mut ref_pos: usize,
-    mut len: usize,
-) -> usize {
-    use std::arch::x86_64::{
-        __m128i, _mm_load_si128, _mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128,
-    };
-
-    let distance = op - ref_pos;
-    debug_assert!((1..=16).contains(&distance));
-    let shift = usize::from(COPY_MATCH_16_SHIFTS[distance]);
-    let mask = COPY_MATCH_16_MASKS[distance].as_ptr() as *const __m128i;
-
-    while len >= 16 {
-        let src = _mm_loadu_si128(base.add(ref_pos) as *const __m128i);
-        let block = _mm_shuffle_epi8(src, _mm_load_si128(mask));
-        _mm_storeu_si128(base.add(op) as *mut __m128i, block);
-        ref_pos += shift;
-        op += 16;
-        len -= 16;
-    }
-
-    for i in 0..len {
-        *base.add(op + i) = *base.add(ref_pos + i);
-    }
-    op + len
-}
-
-/// SSSE3 fast-path for short overlapping copies (32-bit x86 variant).
-#[cfg(target_arch = "x86")]
-#[target_feature(enable = "ssse3")]
-unsafe fn copy_match_repeat_16_x86(
-    base: *mut u8,
-    mut op: usize,
-    mut ref_pos: usize,
-    mut len: usize,
-) -> usize {
-    use std::arch::x86::{
-        __m128i, _mm_load_si128, _mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128,
-    };
-
-    let distance = op - ref_pos;
-    debug_assert!((1..=16).contains(&distance));
-    let shift = usize::from(COPY_MATCH_16_SHIFTS[distance]);
-    let mask = COPY_MATCH_16_MASKS[distance].as_ptr() as *const __m128i;
-
-    while len >= 16 {
-        let src = _mm_loadu_si128(base.add(ref_pos) as *const __m128i);
-        let block = _mm_shuffle_epi8(src, _mm_load_si128(mask));
-        _mm_storeu_si128(base.add(op) as *mut __m128i, block);
-        ref_pos += shift;
-        op += 16;
-        len -= 16;
-    }
-
-    for i in 0..len {
-        *base.add(op + i) = *base.add(ref_pos + i);
-    }
-    op + len
-}
-
-/// Overlapping match copy specialised by distance, using the largest
-/// power-of-two-ish word writes that fit within one period. Falls back
-/// to a byte loop for the tail.
-#[inline(always)]
-unsafe fn copy_match_overlap_exact(
-    base: *mut u8,
-    mut op: usize,
-    mut ref_pos: usize,
-    mut len: usize,
-) -> usize {
-    let distance = op - ref_pos;
-
-    /// Copy 2 bytes from `from` to `op`.
-    #[inline(always)]
-    unsafe fn copy2(base: *mut u8, op: usize, from: usize) -> usize {
-        let v = std::ptr::read_unaligned(base.add(from) as *const u16);
-        std::ptr::write_unaligned(base.add(op) as *mut u16, v);
-        op + 2
-    }
-
-    /// Copy 4 bytes from `from` to `op`.
-    #[inline(always)]
-    unsafe fn copy4(base: *mut u8, op: usize, from: usize) -> usize {
-        let v = std::ptr::read_unaligned(base.add(from) as *const u32);
-        std::ptr::write_unaligned(base.add(op) as *mut u32, v);
-        op + 4
-    }
-
-    /// Copy 8 bytes from `from` to `op`.
-    #[inline(always)]
-    unsafe fn copy8(base: *mut u8, op: usize, from: usize) -> usize {
-        let v = std::ptr::read_unaligned(base.add(from) as *const u64);
-        std::ptr::write_unaligned(base.add(op) as *mut u64, v);
-        op + 8
-    }
-
-    /// Copy 16 bytes from `from` to `op`.
-    #[inline(always)]
-    unsafe fn copy16(base: *mut u8, op: usize, from: usize) -> usize {
-        let v = std::ptr::read_unaligned(base.add(from) as *const u128);
-        std::ptr::write_unaligned(base.add(op) as *mut u128, v);
-        op + 16
-    }
-
-    match distance {
-        32 => {
-            while len >= 32 {
-                op = copy16(base, op, ref_pos);
-                op = copy16(base, op, ref_pos + 16);
-                len -= 32;
-            }
-        }
-        30 => {
-            while len >= 30 {
-                op = copy16(base, op, ref_pos);
-                op = copy8(base, op, ref_pos + 16);
-                op = copy4(base, op, ref_pos + 24);
-                op = copy2(base, op, ref_pos + 28);
-                len -= 30;
-            }
-        }
-        28 => {
-            while len >= 28 {
-                op = copy16(base, op, ref_pos);
-                op = copy8(base, op, ref_pos + 16);
-                op = copy4(base, op, ref_pos + 24);
-                len -= 28;
-            }
-        }
-        26 => {
-            while len >= 26 {
-                op = copy16(base, op, ref_pos);
-                op = copy8(base, op, ref_pos + 16);
-                op = copy2(base, op, ref_pos + 24);
-                len -= 26;
-            }
-        }
-        24 => {
-            while len >= 24 {
-                op = copy16(base, op, ref_pos);
-                op = copy8(base, op, ref_pos + 16);
-                len -= 24;
-            }
-        }
-        22 => {
-            while len >= 22 {
-                op = copy16(base, op, ref_pos);
-                op = copy4(base, op, ref_pos + 16);
-                op = copy2(base, op, ref_pos + 20);
-                len -= 22;
-            }
-        }
-        20 => {
-            while len >= 20 {
-                op = copy16(base, op, ref_pos);
-                op = copy4(base, op, ref_pos + 16);
-                len -= 20;
-            }
-        }
-        18 => {
-            while len >= 18 {
-                op = copy16(base, op, ref_pos);
-                op = copy2(base, op, ref_pos + 16);
-                len -= 18;
-            }
-        }
-        16 => {
-            while len >= 16 {
-                op = copy16(base, op, ref_pos);
-                len -= 16;
-            }
-        }
-        d if d > 16 => {
-            while len >= 16 {
-                op = copy16(base, op, ref_pos);
-                ref_pos += 16;
-                len -= 16;
-            }
-        }
-        8 => {
-            while len >= 8 {
-                op = copy8(base, op, ref_pos);
-                len -= 8;
-            }
-        }
-        4 => {
-            while len >= 4 {
-                op = copy4(base, op, ref_pos);
-                len -= 4;
-            }
-        }
-        2 => {
-            while len >= 2 {
-                op = copy2(base, op, ref_pos);
-                len -= 2;
-            }
-        }
-        _ => {}
-    }
-
-    for i in 0..len {
-        *base.add(op + i) = *base.add(ref_pos + i);
-    }
-    op + len
-}
-
-/// Dispatch for overlapping match copies with small distances.
-///
-/// Picks an optimised path for the common shuffle-friendly distances of 2
-/// and 4, an SSSE3 `pshufb`-based path for other short distances when
-/// available, and otherwise falls back to [`copy_match_overlap_exact`].
-#[inline(always)]
-unsafe fn copy_match_small_overlap(
-    base: *mut u8,
-    op: usize,
-    ref_pos: usize,
-    match_len: usize,
-    use_ssse3_repeat: bool,
-) -> usize {
-    let distance = op - ref_pos;
-
-    if distance == 4 {
-        let seed = std::ptr::read_unaligned(base.add(ref_pos) as *const u32) as u64;
-        let pat = seed | (seed << 32);
-        let mut d = base.add(op);
-        let end = base.add(op + match_len);
-        while d < end {
-            std::ptr::write_unaligned(d as *mut u64, pat);
-            d = d.add(8);
-        }
-        op + match_len
-    } else if distance == 2 {
-        let seed = std::ptr::read_unaligned(base.add(ref_pos) as *const u16) as u64;
-        let pat = seed.wrapping_mul(0x0001_0001_0001_0001);
-        let mut d = base.add(op);
-        let end = base.add(op + match_len);
-        while d < end {
-            std::ptr::write_unaligned(d as *mut u64, pat);
-            d = d.add(8);
-        }
-        op + match_len
-    } else if use_ssse3_repeat && match_len >= 16 && distance <= 16 {
-        #[cfg(target_arch = "x86_64")]
-        {
-            copy_match_repeat_16_x86_64(base, op, ref_pos, match_len)
-        }
-        #[cfg(target_arch = "x86")]
-        {
-            copy_match_repeat_16_x86(base, op, ref_pos, match_len)
-        }
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        {
-            copy_match_overlap_exact(base, op, ref_pos, match_len)
-        }
-    } else {
-        copy_match_overlap_exact(base, op, ref_pos, match_len)
-    }
-}
-
-/// LZ4-style 8-byte "wild copy": stream 8 bytes at a time from `ref_pos`
-/// to `op` until `op` reaches `end`. The caller must ensure `end` leaves
-/// enough trailing slack for the final overrun.
-#[inline(always)]
-unsafe fn wild_copy_8(base: *mut u8, mut op: usize, mut ref_pos: usize, end: usize) {
-    while op < end {
-        let v = std::ptr::read_unaligned(base.add(ref_pos) as *const u64);
-        std::ptr::write_unaligned(base.add(op) as *mut u64, v);
-        op += 8;
-        ref_pos += 8;
-    }
 }
 
 /// Choose between a run extender and a match extender based on `run`,
@@ -753,8 +442,8 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
         return 0;
     }
 
-    let ipshift: usize = 3;
-    let minlen: usize = 3;
+    let ipshift: usize = 4;
+    let minlen: usize = 4;
 
     let hashlog_table: [u8; 10] = [
         0,
@@ -1253,11 +942,6 @@ pub fn decompress(input: &[u8], output: &mut [u8]) -> i32 {
     let mut op: usize = 0;
     let op_limit = maxout;
     let input_ptr = input.as_ptr();
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    let use_ssse3_repeat = std::arch::is_x86_feature_detected!("ssse3");
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    let use_ssse3_repeat = false;
-
     // SAFETY: all pointer reads below are guarded by explicit `ip + N >= ip_limit`
     // bounds checks before the reads, matching the original safe-slice indexing.
     // `input_ptr` points to `input.as_ptr()`, so `input_ptr.add(k)` is in-bounds
@@ -1324,50 +1008,10 @@ pub fn decompress(input: &[u8], output: &mut [u8]) -> i32 {
             let ref_pos = ref_offset as usize;
             let match_len = len as usize;
 
-            if ref_pos == op - 1 {
-                // Run: fill with repeated byte
-                let val = output[ref_pos];
-                output[op..op + match_len].fill(val);
-                op += match_len;
-            } else if op - ref_pos >= 8 && op + match_len + 8 <= op_limit {
-                // C uses a single 8-byte wild-copy loop for medium/large match
-                // distances. Keeping one inline path here is closer to that
-                // structure and avoids Rust-only branch stratification.
-                unsafe {
-                    wild_copy_8(output.as_mut_ptr(), op, ref_pos, op + match_len);
-                }
-                op += match_len;
-            } else {
-                // Small-overlap case (distance ∈ [2, 7]). Distances 2 and 4 are
-                // common in shuffled data and benefit from an explicit u64
-                // broadcast. Other distances fall back to byte-by-byte (LLVM may
-                // lower to memmove, which is still correct under LZ77 overlap).
-                let distance = op - ref_pos;
-                let has_8_slack = op + match_len + 8 <= op_limit;
-                if has_8_slack && matches!(distance, 2 | 4) {
-                    unsafe {
-                        op = copy_match_small_overlap(
-                            output.as_mut_ptr(),
-                            op,
-                            ref_pos,
-                            match_len,
-                            false,
-                        );
-                    }
-                } else {
-                    // General case (distance ∈ {3,5,6,7} or not enough slack).
-                    // SAFETY: `ref_pos < op`, `op + match_len <= op_limit`.
-                    unsafe {
-                        op = copy_match_small_overlap(
-                            output.as_mut_ptr(),
-                            op,
-                            ref_pos,
-                            match_len,
-                            use_ssse3_repeat && op + match_len + 16 <= op_limit,
-                        );
-                    }
-                }
+            for i in 0..match_len {
+                output[op + i] = output[ref_pos + i];
             }
+            op += match_len;
         } else {
             // Literal
             ctrl += 1;
@@ -1501,6 +1145,65 @@ mod tests {
         let mut compressed = vec![0u8; data.len() + 100];
         let _csize = compress(1, &data, &mut compressed);
         // May or may not compress; that's fine
+    }
+
+    #[test]
+    fn decompress_rejects_truncated_and_impossible_matches() {
+        let cases: &[&[u8]] = &[
+            &[0x00],
+            &[0x00, b'a', 0x20, 0x10],
+            &[0x00, b'a', 0xe0, 0x00],
+            &[0x00, b'a', 0xff, 0xff, 0xff],
+            &[0x00, b'a', 0xff, 0x00, 0xff, 0x00],
+        ];
+
+        for case in cases {
+            let mut output = [0u8; 64];
+            assert_eq!(
+                decompress(case, &mut output),
+                0,
+                "malformed BloscLZ block should be rejected: {case:02x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decompress_mutated_blocks_do_not_panic_or_overrun() {
+        let data: Vec<u8> = b"mutation-robustness-blosclz-"
+            .iter()
+            .cycle()
+            .take(4096)
+            .copied()
+            .collect();
+        let mut compressed = vec![0u8; data.len() + 256];
+        let csize = compress(9, &data, &mut compressed);
+        assert!(csize > 0, "compression must succeed");
+        compressed.truncate(csize as usize);
+
+        let mut positions = vec![0, 1, 2, compressed.len() / 2, compressed.len() - 1];
+        positions.extend((0..compressed.len()).step_by((compressed.len() / 17).max(1)));
+        positions.sort_unstable();
+        positions.dedup();
+
+        for pos in positions {
+            for mask in [0x01, 0x20, 0x80, 0xff] {
+                let mut mutated = compressed.clone();
+                mutated[pos] ^= mask;
+                let mut output = vec![0u8; data.len()];
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    decompress(&mutated, &mut output)
+                }));
+                assert!(
+                    result.is_ok(),
+                    "decompress panicked for mutation at byte {pos} with mask {mask:#04x}"
+                );
+                let written = result.unwrap();
+                assert!(
+                    written >= 0 && written as usize <= data.len(),
+                    "decoder returned unexpected size {written} for mutation at byte {pos}"
+                );
+            }
+        }
     }
 
     // Targeted tests that pin down `get_match_generic`'s return convention

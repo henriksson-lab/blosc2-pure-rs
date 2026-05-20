@@ -6,6 +6,8 @@
 
 /// Blosc1 pre-2.x chunk format version (legacy 16-byte header).
 pub const BLOSC1_VERSION_FORMAT: u8 = 2;
+/// Early Blosc2 alpha chunk format version with partially undefined filter slots.
+pub const BLOSC2_VERSION_FORMAT_ALPHA: u8 = 3;
 /// First stable Blosc2 chunk format version.
 pub const BLOSC2_VERSION_FORMAT_STABLE: u8 = 5;
 /// Chunk format version that adds variable-length blocks support.
@@ -31,14 +33,93 @@ pub const BLOSC2_MAX_OVERHEAD: usize = BLOSC_EXTENDED_HEADER_LENGTH;
 
 /// Maximum source buffer size that can be compressed.
 pub const BLOSC2_MAX_BUFFERSIZE: i32 = i32::MAX - BLOSC2_MAX_OVERHEAD as i32;
+/// Maximum block size accepted by C-Blosc2.
+pub const BLOSC2_MAXBLOCKSIZE: usize = 536_866_816;
 /// Minimum buffer size that can be compressed.
 pub const BLOSC_MIN_BUFFERSIZE: usize = 32;
 /// Maximum atomic type size; beyond this the source is treated as a stream of bytes.
 pub const BLOSC_MAX_TYPESIZE: usize = 255;
+/// Maximum caller-supplied type size accepted by C-Blosc2.
+pub const BLOSC2_MAXTYPESIZE: usize = BLOSC2_MAXBLOCKSIZE;
 /// Maximum size in bytes for a Zstd compression dictionary.
 pub const BLOSC2_MAXDICTSIZE: usize = 32 * 1024;
 /// Minimum dictionary size considered useful; below this, dictionary compression is bypassed.
 pub const BLOSC2_MINUSEFULDICT: usize = 256;
+
+/// C API return code: success.
+pub const BLOSC2_ERROR_SUCCESS: i32 = 0;
+/// C API return code: generic failure.
+pub const BLOSC2_ERROR_FAILURE: i32 = -1;
+/// C API return code: bad stream.
+pub const BLOSC2_ERROR_STREAM: i32 = -2;
+/// C API return code: invalid data.
+pub const BLOSC2_ERROR_DATA: i32 = -3;
+/// C API return code: allocation failure.
+pub const BLOSC2_ERROR_MEMORY_ALLOC: i32 = -4;
+/// C API return code: not enough input bytes.
+pub const BLOSC2_ERROR_READ_BUFFER: i32 = -5;
+/// C API return code: not enough output space.
+pub const BLOSC2_ERROR_WRITE_BUFFER: i32 = -6;
+/// C API return code: codec not supported.
+pub const BLOSC2_ERROR_CODEC_SUPPORT: i32 = -7;
+/// C API return code: invalid codec parameter.
+pub const BLOSC2_ERROR_CODEC_PARAM: i32 = -8;
+/// C API return code: codec dictionary error.
+pub const BLOSC2_ERROR_CODEC_DICT: i32 = -9;
+/// C API return code: format version not supported.
+pub const BLOSC2_ERROR_VERSION_SUPPORT: i32 = -10;
+/// C API return code: invalid chunk/header metadata.
+pub const BLOSC2_ERROR_INVALID_HEADER: i32 = -11;
+/// C API return code: invalid function parameter.
+pub const BLOSC2_ERROR_INVALID_PARAM: i32 = -12;
+/// C API return code: file read failure.
+pub const BLOSC2_ERROR_FILE_READ: i32 = -13;
+/// C API return code: file write failure.
+pub const BLOSC2_ERROR_FILE_WRITE: i32 = -14;
+/// C API return code: file open failure.
+pub const BLOSC2_ERROR_FILE_OPEN: i32 = -15;
+/// C API return code: item not found.
+pub const BLOSC2_ERROR_NOT_FOUND: i32 = -16;
+/// C API return code: bad run-length encoding.
+pub const BLOSC2_ERROR_RUN_LENGTH: i32 = -17;
+/// C API return code: filter pipeline failure.
+pub const BLOSC2_ERROR_FILTER_PIPELINE: i32 = -18;
+/// C API return code: chunk insert failure.
+pub const BLOSC2_ERROR_CHUNK_INSERT: i32 = -19;
+/// C API return code: chunk append failure.
+pub const BLOSC2_ERROR_CHUNK_APPEND: i32 = -20;
+/// C API return code: chunk update failure.
+pub const BLOSC2_ERROR_CHUNK_UPDATE: i32 = -21;
+/// C API return code: 2 GiB limit exceeded.
+pub const BLOSC2_ERROR_2GB_LIMIT: i32 = -22;
+/// C API return code: super-chunk copy failure.
+pub const BLOSC2_ERROR_SCHUNK_COPY: i32 = -23;
+/// C API return code: wrong frame type.
+pub const BLOSC2_ERROR_FRAME_TYPE: i32 = -24;
+/// C API return code: file truncate failure.
+pub const BLOSC2_ERROR_FILE_TRUNCATE: i32 = -25;
+/// C API return code: thread creation failure.
+pub const BLOSC2_ERROR_THREAD_CREATE: i32 = -26;
+/// C API return code: postfilter failure.
+pub const BLOSC2_ERROR_POSTFILTER: i32 = -27;
+/// C API return code: special-frame failure.
+pub const BLOSC2_ERROR_FRAME_SPECIAL: i32 = -28;
+/// C API return code: special super-chunk failure.
+pub const BLOSC2_ERROR_SCHUNK_SPECIAL: i32 = -29;
+/// C API return code: I/O plugin failure.
+pub const BLOSC2_ERROR_PLUGIN_IO: i32 = -30;
+/// C API return code: file remove failure.
+pub const BLOSC2_ERROR_FILE_REMOVE: i32 = -31;
+/// C API return code: null pointer.
+pub const BLOSC2_ERROR_NULL_POINTER: i32 = -32;
+/// C API return code: invalid index.
+pub const BLOSC2_ERROR_INVALID_INDEX: i32 = -33;
+/// C API return code: metalayer not found.
+pub const BLOSC2_ERROR_METALAYER_NOT_FOUND: i32 = -34;
+/// C API return code: maximum buffer size exceeded.
+pub const BLOSC2_ERROR_MAX_BUFSIZE_EXCEEDED: i32 = -35;
+/// C API return code: tuner failure.
+pub const BLOSC2_ERROR_TUNER: i32 = -36;
 
 /// Maximum number of filters in the filter pipeline.
 pub const BLOSC2_MAX_FILTERS: usize = 6;
@@ -52,8 +133,10 @@ pub const BLOSC_BITSHUFFLE: u8 = 2;
 pub const BLOSC_DELTA: u8 = 3;
 /// Filter ID: truncate mantissa precision. Positive `filters_meta` keeps bits; negative zeros bits.
 pub const BLOSC_TRUNC_PREC: u8 = 4;
-/// First filter ID reserved for user-defined filters.
-pub const BLOSC2_USER_DEFINED_FILTERS_START: u8 = 32;
+/// First filter ID reserved for user-registered filters.
+///
+/// IDs 32..=159 are reserved for globally registered Blosc2 filters.
+pub const BLOSC2_USER_DEFINED_FILTERS_START: u8 = 160;
 
 /// Codec ID: BloscLZ.
 pub const BLOSC_BLOSCLZ: u8 = 0;
@@ -65,8 +148,10 @@ pub const BLOSC_LZ4HC: u8 = 2;
 pub const BLOSC_ZLIB: u8 = 4;
 /// Codec ID: Zstd.
 pub const BLOSC_ZSTD: u8 = 5;
-/// First codec ID reserved for user-defined codecs.
-pub const BLOSC2_USER_DEFINED_CODECS_START: u8 = 32;
+/// First codec ID reserved for user-registered codecs.
+///
+/// IDs 32..=159 are reserved for globally registered Blosc2 codecs.
+pub const BLOSC2_USER_DEFINED_CODECS_START: u8 = 160;
 
 /// Codec format code (bits 5-7 of the header flags byte) for BloscLZ.
 pub const BLOSC_BLOSCLZ_FORMAT: u8 = 0;
@@ -79,7 +164,9 @@ pub const BLOSC_ZLIB_FORMAT: u8 = 3;
 /// Codec format code for Zstd.
 pub const BLOSC_ZSTD_FORMAT: u8 = 4;
 /// Codec format code signalling that the actual codec is stored in the user-defined codec slot.
-pub const BLOSC_UDCODEC_FORMAT: u8 = 7;
+pub const BLOSC_UDCODEC_FORMAT: u8 = 6;
+/// Codec format code signalling that the codec is defined by the enclosing super-chunk.
+pub const BLOSC_SCHUNK_FORMAT: u8 = 7;
 
 /// On-disk format version for BloscLZ-compressed streams.
 pub const BLOSC_BLOSCLZ_VERSION_FORMAT: u8 = 1;
@@ -115,8 +202,8 @@ pub const BLOSC_DONT_SPLIT: u8 = 0x10;
 pub const BLOSC2_USEDICT: u8 = 0x01;
 /// blosc2_flags (byte 31, bit 1): data was produced on a big-endian host.
 pub const BLOSC2_BIGENDIAN: u8 = 0x02;
-/// blosc2_flags (byte 31, bit 2): codec was instrumented (development use).
-pub const BLOSC2_INSTR_CODEC: u8 = 0x04;
+/// blosc2_flags (byte 31, bit 7): codec was instrumented (development use).
+pub const BLOSC2_INSTR_CODEC: u8 = 0x80;
 /// blosc2_flags (byte 31, bit 3): this chunk is a lazy chunk (carries only metadata).
 pub const BLOSC2_LAZY_CHUNK: u8 = 0x08;
 
@@ -132,6 +219,9 @@ pub const BLOSC2_SPECIAL_VALUE: u8 = 0x3;
 pub const BLOSC2_SPECIAL_UNINIT: u8 = 0x4;
 /// Mask used to extract the 3-bit special-value type from blosc2_flags.
 pub const BLOSC2_SPECIAL_MASK: u8 = 0x7;
+
+/// Maximum fixed or variable-length metalayers supported by C-Blosc2 frame writers.
+pub const BLOSC2_MAX_METALAYERS: usize = 16;
 
 /// blosc2_flags2 (byte 30, bit 0): the chunk uses variable-length blocks.
 pub const BLOSC2_VL_BLOCKS: u8 = 0x01;

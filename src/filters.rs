@@ -54,7 +54,7 @@ pub fn register_filter(
     backward: FilterBackwardFn,
 ) -> Result<(), &'static str> {
     if filter_id < BLOSC2_USER_DEFINED_FILTERS_START {
-        return Err("User-defined filter IDs must be >= 32");
+        return Err("User-defined filter IDs must be >= 160");
     }
     user_filters()
         .write()
@@ -133,13 +133,10 @@ pub fn unshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
         dest[..blocksize].copy_from_slice(&src[..blocksize]);
         return;
     }
-    if typesize == 4 && simd::try_unshuffle(typesize, src, dest) {
+    if simd::try_unshuffle(typesize, src, dest) {
         return;
     }
     if unshuffle_common_width(typesize, src, dest) {
-        return;
-    }
-    if simd::try_unshuffle(typesize, src, dest) {
         return;
     }
 
@@ -342,9 +339,12 @@ mod simd {
         true
     }
 
-    /// AVX2 shuffle entry point (typesize=4, blocks of at least 128 bytes).
+    /// AVX2 shuffle entry point for the common C-optimized widths.
     fn try_shuffle_avx2(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
-        if dest.len() < src.len() || typesize != 4 || src.len() < 128 {
+        if dest.len() < src.len() || !matches!(typesize, 2 | 4 | 8) {
+            return false;
+        }
+        if src.len() < typesize * std::mem::size_of::<arch::__m256i>() {
             return false;
         }
         if !std::arch::is_x86_feature_detected!("avx2") {
@@ -359,7 +359,7 @@ mod simd {
 
     /// Try to run a SIMD unshuffle. Returns `true` if `dest` was written.
     pub fn try_unshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
-        if typesize == 4 && try_unshuffle_avx2(typesize, src, dest) {
+        if try_unshuffle_avx2(typesize, src, dest) {
             return true;
         }
         if typesize != 4 || src.len() < 64 || dest.len() < src.len() {
@@ -377,12 +377,12 @@ mod simd {
         true
     }
 
-    /// AVX2 unshuffle entry point (typesize=4, blocks of at least 128 bytes).
+    /// AVX2 unshuffle entry point for the common C-optimized widths.
     fn try_unshuffle_avx2(typesize: usize, src: &[u8], dest: &mut [u8]) -> bool {
-        if src.len() < 128 || dest.len() < src.len() || !src.len().is_multiple_of(typesize) {
+        if dest.len() < src.len() || !matches!(typesize, 2 | 4 | 8) {
             return false;
         }
-        if typesize != 4 {
+        if src.len() < typesize * std::mem::size_of::<arch::__m256i>() {
             return false;
         }
         if !std::arch::is_x86_feature_detected!("avx2") {
@@ -397,41 +397,85 @@ mod simd {
         true
     }
 
-    /// AVX2 byte-unshuffle dispatcher: uses the optimized `unshuffle4_avx2`
-    /// kernel for typesize=4 and falls back to a scalar transpose otherwise.
+    /// AVX2 byte-unshuffle dispatcher for the C-optimized widths.
     #[target_feature(enable = "avx2")]
     unsafe fn unshuffle_avx2(typesize: usize, src: &[u8], dest: &mut [u8]) {
-        if typesize == 4 {
-            unsafe { unshuffle4_avx2(src, dest) };
-            return;
-        }
-        // Fallback for unsupported typesizes in this AVX2 path: scalar transpose.
-        let blocksize = src.len();
-        let nelements = blocksize / typesize;
-        for element in 0..nelements {
-            let dest_base = element * typesize;
-            for byte_idx in 0..typesize {
-                dest[dest_base + byte_idx] = src[byte_idx * nelements + element];
-            }
+        match typesize {
+            2 => unsafe { unshuffle2_avx2(src, dest) },
+            4 => unsafe { unshuffle4_avx2(src, dest) },
+            8 => unsafe { unshuffle8_avx2(src, dest) },
+            _ => unreachable!("try_unshuffle_avx2 filters unsupported widths"),
         }
     }
 
-    /// AVX2 byte-shuffle dispatcher: uses the optimized `shuffle4_avx2`
-    /// kernel for typesize=4, with a scalar transpose fallback for other widths.
+    /// AVX2 byte-shuffle dispatcher for the C-optimized widths.
     #[target_feature(enable = "avx2")]
     unsafe fn shuffle_avx2(typesize: usize, src: &[u8], dest: &mut [u8]) {
-        if typesize == 4 {
-            unsafe { shuffle4_avx2(src, dest) };
-            return;
+        match typesize {
+            2 => unsafe { shuffle2_avx2(src, dest) },
+            4 => unsafe { shuffle4_avx2(src, dest) },
+            8 => unsafe { shuffle8_avx2(src, dest) },
+            _ => unreachable!("try_shuffle_avx2 filters unsupported widths"),
+        }
+    }
+
+    /// AVX2 shuffle kernel for 2-byte elements.
+    #[target_feature(enable = "avx2")]
+    unsafe fn shuffle2_avx2(src: &[u8], dest: &mut [u8]) {
+        const BYTESOFTYPE: usize = 2;
+        let blocksize = src.len();
+        let vectorized_chunk_size = BYTESOFTYPE * std::mem::size_of::<arch::__m256i>();
+        let vectorizable_bytes = blocksize - (blocksize % vectorized_chunk_size);
+        let vectorizable_elements = vectorizable_bytes / BYTESOFTYPE;
+        let total_elements = blocksize / BYTESOFTYPE;
+
+        let src_ptr = src.as_ptr();
+        let dest_ptr = dest.as_mut_ptr();
+        let shmask = arch::_mm256_set_epi8(
+            0x0f, 0x0d, 0x0b, 0x09, 0x07, 0x05, 0x03, 0x01, 0x0e, 0x0c, 0x0a, 0x08, 0x06, 0x04,
+            0x02, 0x00, 0x0f, 0x0d, 0x0b, 0x09, 0x07, 0x05, 0x03, 0x01, 0x0e, 0x0c, 0x0a, 0x08,
+            0x06, 0x04, 0x02, 0x00,
+        );
+
+        let mut j = 0usize;
+        while j < vectorizable_elements {
+            let ymm0 = [
+                arch::_mm256_loadu_si256(src_ptr.add(j * BYTESOFTYPE) as *const arch::__m256i),
+                arch::_mm256_loadu_si256(
+                    src_ptr.add(j * BYTESOFTYPE + std::mem::size_of::<arch::__m256i>())
+                        as *const arch::__m256i,
+                ),
+            ];
+            let mut ymm1 = [
+                arch::_mm256_shuffle_epi8(ymm0[0], shmask),
+                arch::_mm256_shuffle_epi8(ymm0[1], shmask),
+            ];
+
+            let p0 = arch::_mm256_permute4x64_epi64::<0xD8>(ymm1[0]);
+            let p1 = arch::_mm256_permute4x64_epi64::<0x8D>(ymm1[1]);
+            ymm1[0] = arch::_mm256_blend_epi32::<0xF0>(p0, p1);
+            let mixed = arch::_mm256_blend_epi32::<0x0F>(p0, p1);
+            ymm1[1] = arch::_mm256_permute4x64_epi64::<0x4E>(mixed);
+
+            for (k, reg) in ymm1.iter().enumerate() {
+                arch::_mm256_storeu_si256(
+                    dest_ptr.add(j + k * total_elements) as *mut arch::__m256i,
+                    *reg,
+                );
+            }
+            j += std::mem::size_of::<arch::__m256i>();
         }
 
-        let blocksize = src.len();
-        let nelements = blocksize / typesize;
-        for byte_idx in 0..typesize {
-            let dest_base = byte_idx * nelements;
-            for element in 0..nelements {
-                dest[dest_base + element] = src[element * typesize + byte_idx];
+        for byte_idx in 0..BYTESOFTYPE {
+            let dest_base = byte_idx * total_elements;
+            for element in vectorizable_elements..total_elements {
+                dest[dest_base + element] = src[element * BYTESOFTYPE + byte_idx];
             }
+        }
+
+        let tail_start = total_elements * BYTESOFTYPE;
+        if tail_start < blocksize {
+            dest[tail_start..blocksize].copy_from_slice(&src[tail_start..blocksize]);
         }
     }
 
@@ -496,6 +540,117 @@ mod simd {
             for element in vectorizable_elements..total_elements {
                 dest[dest_base + element] = src[element * BYTESOFTYPE + byte_idx];
             }
+        }
+
+        let tail_start = total_elements * BYTESOFTYPE;
+        if tail_start < blocksize {
+            dest[tail_start..blocksize].copy_from_slice(&src[tail_start..blocksize]);
+        }
+    }
+
+    /// AVX2 shuffle kernel for 8-byte elements.
+    #[target_feature(enable = "avx2")]
+    unsafe fn shuffle8_avx2(src: &[u8], dest: &mut [u8]) {
+        const BYTESOFTYPE: usize = 8;
+        let blocksize = src.len();
+        let vectorized_chunk_size = BYTESOFTYPE * std::mem::size_of::<arch::__m256i>();
+        let vectorizable_bytes = blocksize - (blocksize % vectorized_chunk_size);
+        let vectorizable_elements = vectorizable_bytes / BYTESOFTYPE;
+        let total_elements = blocksize / BYTESOFTYPE;
+
+        let src_ptr = src.as_ptr();
+        let dest_ptr = dest.as_mut_ptr();
+
+        let mut j = 0usize;
+        while j < vectorizable_elements {
+            let mut ymm0 = [arch::_mm256_setzero_si256(); 8];
+            let mut ymm1 = [arch::_mm256_setzero_si256(); 8];
+
+            for k in 0..8 {
+                ymm0[k] = arch::_mm256_loadu_si256(
+                    src_ptr.add(j * BYTESOFTYPE + k * std::mem::size_of::<arch::__m256i>())
+                        as *const arch::__m256i,
+                );
+                ymm1[k] = arch::_mm256_shuffle_epi32::<0x4E>(ymm0[k]);
+                ymm1[k] = arch::_mm256_unpacklo_epi8(ymm0[k], ymm1[k]);
+            }
+            for (k, l) in (0..4).zip((0..8).step_by(2)) {
+                ymm0[k * 2] = arch::_mm256_unpacklo_epi16(ymm1[l], ymm1[l + 1]);
+                ymm0[k * 2 + 1] = arch::_mm256_unpackhi_epi16(ymm1[l], ymm1[l + 1]);
+            }
+            for k in 0..4 {
+                let l = if k < 2 { k } else { k + 2 };
+                ymm1[k * 2] = arch::_mm256_unpacklo_epi32(ymm0[l], ymm0[l + 2]);
+                ymm1[k * 2 + 1] = arch::_mm256_unpackhi_epi32(ymm0[l], ymm0[l + 2]);
+            }
+            for k in 0..4 {
+                ymm0[k * 2] = arch::_mm256_unpacklo_epi64(ymm1[k], ymm1[k + 4]);
+                ymm0[k * 2 + 1] = arch::_mm256_unpackhi_epi64(ymm1[k], ymm1[k + 4]);
+            }
+            for k in 0..8 {
+                ymm1[k] = arch::_mm256_permute4x64_epi64::<0x72>(ymm0[k]);
+                ymm0[k] = arch::_mm256_permute4x64_epi64::<0xD8>(ymm0[k]);
+                ymm0[k] = arch::_mm256_unpacklo_epi16(ymm0[k], ymm1[k]);
+            }
+
+            for (k, reg) in ymm0.iter().enumerate() {
+                arch::_mm256_storeu_si256(
+                    dest_ptr.add(j + k * total_elements) as *mut arch::__m256i,
+                    *reg,
+                );
+            }
+            j += std::mem::size_of::<arch::__m256i>();
+        }
+
+        for byte_idx in 0..BYTESOFTYPE {
+            let dest_base = byte_idx * total_elements;
+            for element in vectorizable_elements..total_elements {
+                dest[dest_base + element] = src[element * BYTESOFTYPE + byte_idx];
+            }
+        }
+
+        let tail_start = total_elements * BYTESOFTYPE;
+        if tail_start < blocksize {
+            dest[tail_start..blocksize].copy_from_slice(&src[tail_start..blocksize]);
+        }
+    }
+
+    /// AVX2 unshuffle kernel for 2-byte elements.
+    #[target_feature(enable = "avx2")]
+    unsafe fn unshuffle2_avx2(src: &[u8], dest: &mut [u8]) {
+        const BYTESOFTYPE: usize = 2;
+        let blocksize = src.len();
+        let total_elements = blocksize / BYTESOFTYPE;
+        let vectorizable_elements =
+            total_elements - (total_elements % std::mem::size_of::<arch::__m256i>());
+
+        let src_ptr = src.as_ptr();
+        let dst_ptr = dest.as_mut_ptr();
+
+        let mut i = 0usize;
+        while i < vectorizable_elements {
+            let mut ymm0 = [
+                arch::_mm256_loadu_si256(src_ptr.add(i) as *const arch::__m256i),
+                arch::_mm256_loadu_si256(src_ptr.add(i + total_elements) as *const arch::__m256i),
+            ];
+            for reg in &mut ymm0 {
+                *reg = arch::_mm256_permute4x64_epi64::<0xD8>(*reg);
+            }
+            let out0 = arch::_mm256_unpacklo_epi8(ymm0[0], ymm0[1]);
+            let out1 = arch::_mm256_unpackhi_epi8(ymm0[0], ymm0[1]);
+            arch::_mm256_storeu_si256(dst_ptr.add(i * BYTESOFTYPE) as *mut arch::__m256i, out0);
+            arch::_mm256_storeu_si256(
+                dst_ptr.add(i * BYTESOFTYPE + std::mem::size_of::<arch::__m256i>())
+                    as *mut arch::__m256i,
+                out1,
+            );
+            i += std::mem::size_of::<arch::__m256i>();
+        }
+
+        for element in vectorizable_elements..total_elements {
+            let dest_base = element * BYTESOFTYPE;
+            dest[dest_base] = src[element];
+            dest[dest_base + 1] = src[element + total_elements];
         }
 
         let tail_start = total_elements * BYTESOFTYPE;
@@ -598,6 +753,67 @@ mod simd {
             dest[dest_base + 1] = src[element + total_elements];
             dest[dest_base + 2] = src[element + 2 * total_elements];
             dest[dest_base + 3] = src[element + 3 * total_elements];
+        }
+
+        let tail_start = total_elements * BYTESOFTYPE;
+        if tail_start < blocksize {
+            dest[tail_start..blocksize].copy_from_slice(&src[tail_start..blocksize]);
+        }
+    }
+
+    /// AVX2 unshuffle kernel for 8-byte elements.
+    #[target_feature(enable = "avx2")]
+    unsafe fn unshuffle8_avx2(src: &[u8], dest: &mut [u8]) {
+        const BYTESOFTYPE: usize = 8;
+        let blocksize = src.len();
+        let total_elements = blocksize / BYTESOFTYPE;
+        let vectorizable_elements =
+            total_elements - (total_elements % std::mem::size_of::<arch::__m256i>());
+
+        let src_ptr = src.as_ptr();
+        let dst_ptr = dest.as_mut_ptr();
+
+        let mut i = 0usize;
+        while i < vectorizable_elements {
+            let mut ymm0 = [arch::_mm256_setzero_si256(); 8];
+            let mut ymm1 = [arch::_mm256_setzero_si256(); 8];
+            for j in 0..8 {
+                ymm0[j] = arch::_mm256_loadu_si256(
+                    src_ptr.add(i + j * total_elements) as *const arch::__m256i
+                );
+            }
+            for j in 0..4 {
+                ymm1[j] = arch::_mm256_unpacklo_epi8(ymm0[j * 2], ymm0[j * 2 + 1]);
+                ymm1[4 + j] = arch::_mm256_unpackhi_epi8(ymm0[j * 2], ymm0[j * 2 + 1]);
+            }
+            for j in 0..4 {
+                ymm0[j] = arch::_mm256_unpacklo_epi16(ymm1[j * 2], ymm1[j * 2 + 1]);
+                ymm0[4 + j] = arch::_mm256_unpackhi_epi16(ymm1[j * 2], ymm1[j * 2 + 1]);
+            }
+            for reg in &mut ymm0 {
+                *reg = arch::_mm256_permute4x64_epi64::<0xD8>(*reg);
+            }
+            for j in 0..4 {
+                ymm1[j] = arch::_mm256_unpacklo_epi32(ymm0[j * 2], ymm0[j * 2 + 1]);
+                ymm1[4 + j] = arch::_mm256_unpackhi_epi32(ymm0[j * 2], ymm0[j * 2 + 1]);
+            }
+
+            let order = [0usize, 2, 1, 3, 4, 6, 5, 7];
+            for (store_idx, &reg_idx) in order.iter().enumerate() {
+                arch::_mm256_storeu_si256(
+                    dst_ptr.add(i * BYTESOFTYPE + store_idx * std::mem::size_of::<arch::__m256i>())
+                        as *mut arch::__m256i,
+                    ymm1[reg_idx],
+                );
+            }
+            i += std::mem::size_of::<arch::__m256i>();
+        }
+
+        for element in vectorizable_elements..total_elements {
+            let dest_base = element * BYTESOFTYPE;
+            for byte_idx in 0..BYTESOFTYPE {
+                dest[dest_base + byte_idx] = src[byte_idx * total_elements + element];
+            }
         }
 
         let tail_start = total_elements * BYTESOFTYPE;
@@ -816,6 +1032,31 @@ fn trans_bit_8x8(mut x: u64) -> u64 {
     x ^ t ^ (t << 28)
 }
 
+/// Big-endian counterpart of [`trans_bit_8x8`], matching C-Blosc2's scalar path.
+#[inline]
+#[cfg(target_endian = "big")]
+fn trans_bit_8x8_be(mut x: u64) -> u64 {
+    let mut t: u64;
+    t = (x ^ (x >> 9)) & 0x0055005500550055;
+    x = x ^ t ^ (t << 9);
+    t = (x ^ (x >> 18)) & 0x0000333300003333;
+    x = x ^ t ^ (t << 18);
+    t = (x ^ (x >> 36)) & 0x000000000F0F0F0F;
+    x ^ t ^ (t << 36)
+}
+
+#[inline]
+fn trans_bit_8x8_native(x: u64) -> u64 {
+    #[cfg(target_endian = "little")]
+    {
+        trans_bit_8x8(x)
+    }
+    #[cfg(target_endian = "big")]
+    {
+        trans_bit_8x8_be(x)
+    }
+}
+
 /// Transpose bits within bytes (step 2 of bitshuffle).
 fn trans_bit_byte(src: &[u8], dest: &mut [u8], size: usize, elem_size: usize) {
     let nbyte = elem_size * size;
@@ -823,11 +1064,15 @@ fn trans_bit_byte(src: &[u8], dest: &mut [u8], size: usize, elem_size: usize) {
 
     for ii in 0..nbyte_bitrow {
         let x_bytes = &src[ii * 8..(ii + 1) * 8];
-        let mut x = u64::from_le_bytes(x_bytes.try_into().unwrap());
-        x = trans_bit_8x8(x);
+        let mut x = trans_bit_8x8_native(u64::from_ne_bytes(x_bytes.try_into().unwrap()));
 
         for kk in 0..8usize {
-            dest[kk * nbyte_bitrow + ii] = (x & 0xFF) as u8;
+            let row = if cfg!(target_endian = "little") {
+                kk
+            } else {
+                7 - kk
+            };
+            dest[row * nbyte_bitrow + ii] = (x & 0xFF) as u8;
             x >>= 8;
         }
     }
@@ -927,11 +1172,15 @@ fn shuffle_bit_eightelem(src: &[u8], dest: &mut [u8], size: usize, elem_size: us
         let mut ii = 0;
         while ii + 8 * elem_size - 1 < nbyte {
             let x_bytes = &src[ii + jj..ii + jj + 8];
-            let mut x = u64::from_le_bytes(x_bytes.try_into().unwrap());
-            x = trans_bit_8x8(x);
+            let mut x = trans_bit_8x8_native(u64::from_ne_bytes(x_bytes.try_into().unwrap()));
 
             for kk in 0..8usize {
-                let out_index = ii + jj / 8 + kk * elem_size;
+                let elem = if cfg!(target_endian = "little") {
+                    kk
+                } else {
+                    7 - kk
+                };
+                let out_index = ii + jj / 8 + elem * elem_size;
                 dest[out_index] = (x & 0xFF) as u8;
                 x >>= 8;
             }
@@ -1191,23 +1440,39 @@ pub fn delta_encode(
         n if n % 8 == 0 => 8,
         _ => 1,
     };
+    let main_len = if effective_typesize == 1 {
+        nbytes
+    } else {
+        nbytes - (nbytes % effective_typesize)
+    };
+
     if offset == 0 {
         // Reference block: delta against previous elements in dref.
-        let head = effective_typesize.min(nbytes);
-        if dref.len() < nbytes.max(head) {
+        if main_len == 0 {
+            dest[..nbytes].copy_from_slice(&src[..nbytes]);
+            return;
+        }
+        let head = effective_typesize;
+        if dref.len() < main_len.max(head) {
             return;
         }
         dest[..head].copy_from_slice(&dref[..head]);
-        for i in effective_typesize..nbytes {
+        for i in effective_typesize..main_len {
             dest[i] = src[i] ^ dref[i - effective_typesize];
+        }
+        if main_len < nbytes {
+            dest[main_len..nbytes].copy_from_slice(&src[main_len..nbytes]);
         }
     } else {
         // Non-reference block: delta against dref.
-        if dref.len() < nbytes {
+        if dref.len() < main_len {
             return;
         }
-        for i in 0..nbytes {
+        for i in 0..main_len {
             dest[i] = src[i] ^ dref[i];
+        }
+        if main_len < nbytes {
+            dest[main_len..nbytes].copy_from_slice(&src[main_len..nbytes]);
         }
     }
 }
@@ -1232,17 +1497,23 @@ pub fn delta_decode(
         n if n % 8 == 0 => 8,
         _ => 1,
     };
+    let main_len = if effective_typesize == 1 {
+        nbytes
+    } else {
+        nbytes - (nbytes % effective_typesize)
+    };
+
     if offset == 0 {
         // Reference block: self-referential decode (dest[i] ^= dest[i-typesize])
-        for i in effective_typesize..nbytes {
+        for i in effective_typesize..main_len {
             dest[i] ^= dest[i - effective_typesize];
         }
     } else if let Some(dref) = dref {
         // Non-reference block: undo delta against dref
-        if dref.len() < nbytes {
+        if dref.len() < main_len {
             return;
         }
-        for i in 0..nbytes {
+        for i in 0..main_len {
             dest[i] ^= dref[i];
         }
     }
@@ -1320,13 +1591,17 @@ pub fn pipeline_forward(
                 // C treats filters_meta as int8_t — negative values have Python-style
                 // "drop this many mantissa bits" semantics.
                 let prec = filters_meta[i] as i8;
-                trunc_prec_forward(inp, out, typesize, prec);
+                if !trunc_prec_forward(inp, out, typesize, prec) {
+                    out.copy_from_slice(inp);
+                    return 0;
+                }
             }
             _ => {
                 if let Some(filter) = registered_filter(filter) {
                     (filter.forward)(filters_meta[i], typesize, block_offset, inp, out);
                 } else {
                     out.copy_from_slice(inp);
+                    return 0;
                 }
             }
         }
@@ -1412,6 +1687,7 @@ pub fn pipeline_backward(
                     (filter_fn.backward)(filters_meta[i], typesize, block_offset, inp, out);
                 } else {
                     out.copy_from_slice(inp);
+                    return 0;
                 }
             }
         }
@@ -1434,23 +1710,18 @@ pub fn pipeline_backward(
 /// - `< 0`: number of mantissa bits to drop
 /// - `= 0`: keep zero bits (drop the entire mantissa)
 ///
-/// If `|prec_bits|` exceeds the mantissa width, or would clear the whole
-/// mantissa, the block is passed through unchanged (matching the C error
-/// path which returns -1).
+/// Returns `false` when C would reject the filter (unsupported typesize,
+/// invalid precision, or clearing the whole mantissa).
 const BITS_MANTISSA_F32: i32 = 23;
 const BITS_MANTISSA_F64: i32 = 52;
 
-fn trunc_prec_forward(src: &[u8], dest: &mut [u8], typesize: usize, prec_bits: i8) {
+fn trunc_prec_forward(src: &[u8], dest: &mut [u8], typesize: usize, prec_bits: i8) -> bool {
     let len = src.len();
     if dest.len() < len {
-        return;
+        return false;
     }
-    // Rust's wider typesize support: C returns error for anything but 4 or 8.
-    // We pass the data through unchanged to avoid producing cross-incompatible
-    // output that C would not have been able to generate.
     if !matches!(typesize, 4 | 8) {
-        dest[..len].copy_from_slice(src);
-        return;
+        return false;
     }
 
     let (mantissa_bits, n_elements) = match typesize {
@@ -1461,15 +1732,11 @@ fn trunc_prec_forward(src: &[u8], dest: &mut [u8], typesize: usize, prec_bits: i
 
     let p = prec_bits as i32;
     if p.abs() > mantissa_bits {
-        // C logs an error and returns -1. We mirror by passing through.
-        dest[..len].copy_from_slice(src);
-        return;
+        return false;
     }
     let zeroed_bits = if p >= 0 { mantissa_bits - p } else { -p };
     if zeroed_bits >= mantissa_bits {
-        // C returns -1 in this case too.
-        dest[..len].copy_from_slice(src);
-        return;
+        return false;
     }
 
     match typesize {
@@ -1477,16 +1744,16 @@ fn trunc_prec_forward(src: &[u8], dest: &mut [u8], typesize: usize, prec_bits: i
             let mask = !((1u32 << zeroed_bits) - 1);
             for i in 0..n_elements {
                 let off = i * 4;
-                let v = u32::from_le_bytes(src[off..off + 4].try_into().unwrap());
-                dest[off..off + 4].copy_from_slice(&(v & mask).to_le_bytes());
+                let v = u32::from_ne_bytes(src[off..off + 4].try_into().unwrap());
+                dest[off..off + 4].copy_from_slice(&(v & mask).to_ne_bytes());
             }
         }
         8 => {
             let mask = !((1u64 << zeroed_bits) - 1);
             for i in 0..n_elements {
                 let off = i * 8;
-                let v = u64::from_le_bytes(src[off..off + 8].try_into().unwrap());
-                dest[off..off + 8].copy_from_slice(&(v & mask).to_le_bytes());
+                let v = u64::from_ne_bytes(src[off..off + 8].try_into().unwrap());
+                dest[off..off + 8].copy_from_slice(&(v & mask).to_ne_bytes());
             }
         }
         _ => unreachable!(),
@@ -1497,6 +1764,7 @@ fn trunc_prec_forward(src: &[u8], dest: &mut [u8], typesize: usize, prec_bits: i
     if tail_start < len {
         dest[tail_start..len].copy_from_slice(&src[tail_start..]);
     }
+    true
 }
 
 #[cfg(test)]
@@ -1549,9 +1817,15 @@ mod tests {
 
     #[test]
     fn test_shuffle_dispatch_matches_scalar_for_simd_widths_and_leftovers() {
-        for typesize in [4, 8] {
-            for extra_bytes in [0, 1, 3, 5, 7] {
-                let len = 256 + extra_bytes;
+        for typesize in [2, 4, 8] {
+            let avx2_chunk = typesize * 32;
+            for len in [
+                avx2_chunk - 1,
+                avx2_chunk,
+                avx2_chunk + 1,
+                avx2_chunk * 2 + typesize - 1,
+                avx2_chunk * 3 + 7,
+            ] {
                 let data: Vec<u8> = (0..len)
                     .map(|i: usize| (i.wrapping_mul(29).wrapping_add(typesize)) as u8)
                     .collect();
@@ -1564,14 +1838,14 @@ mod tests {
                 shuffle(typesize, &data, &mut actual);
                 assert_eq!(
                     actual, expected,
-                    "shuffle dispatch diverged from scalar for typesize={typesize} extra_bytes={extra_bytes}"
+                    "shuffle dispatch diverged from scalar for typesize={typesize} len={len}"
                 );
 
                 scalar_unshuffle_for_test(typesize, &expected, &mut scalar_restored);
                 unshuffle(typesize, &actual, &mut restored);
                 assert_eq!(
                     restored, scalar_restored,
-                    "unshuffle dispatch diverged from scalar for typesize={typesize} extra_bytes={extra_bytes}"
+                    "unshuffle dispatch diverged from scalar for typesize={typesize} len={len}"
                 );
                 assert_eq!(restored, data);
             }
@@ -1847,6 +2121,44 @@ mod tests {
     }
 
     #[test]
+    fn test_delta_preserves_partial_tail_for_fixed_widths() {
+        for typesize in [2usize, 4, 8] {
+            let nbytes = typesize * 3 + (typesize - 1);
+            let src: Vec<u8> = (0..nbytes)
+                .map(|i: usize| (i.wrapping_mul(17).wrapping_add(3)) as u8)
+                .collect();
+            let dref: Vec<u8> = (0..nbytes)
+                .map(|i: usize| (i.wrapping_mul(29).wrapping_add(11)) as u8)
+                .collect();
+            let main_len = nbytes - (nbytes % typesize);
+
+            let mut encoded = vec![0u8; nbytes];
+            delta_encode(&dref, 1, nbytes, typesize, &src, &mut encoded);
+            assert_eq!(
+                &encoded[main_len..],
+                &src[main_len..],
+                "delta_encode must leave partial tail bytes unchanged for typesize={typesize}"
+            );
+
+            let mut decoded = encoded.clone();
+            delta_decode(Some(&dref), 1, nbytes, typesize, &mut decoded);
+            assert_eq!(decoded, src);
+
+            let mut ref_encoded = vec![0u8; nbytes];
+            delta_encode(&src, 0, nbytes, typesize, &src, &mut ref_encoded);
+            assert_eq!(
+                &ref_encoded[main_len..],
+                &src[main_len..],
+                "reference-block delta must leave partial tail bytes unchanged for typesize={typesize}"
+            );
+
+            let mut ref_decoded = ref_encoded;
+            delta_decode(None, 0, nbytes, typesize, &mut ref_decoded);
+            assert_eq!(ref_decoded, src);
+        }
+    }
+
+    #[test]
     fn test_bitunshuffle_v2_with_leftovers_falls_back_to_memcpy() {
         let data: Vec<u8> = (0..20u8).collect();
         let mut dest = vec![0u8; data.len()];
@@ -1929,12 +2241,90 @@ mod tests {
     }
 
     #[test]
+    fn test_pipeline_rejects_unknown_filters() {
+        let src: Vec<u8> = (0..16).collect();
+        let mut buf1 = vec![0u8; 16];
+        let mut buf2 = vec![0u8; 16];
+        let filters = [BLOSC2_USER_DEFINED_FILTERS_START, 0, 0, 0, 0, 0];
+        let filters_meta = [0; BLOSC2_MAX_FILTERS];
+
+        assert_eq!(
+            pipeline_forward(
+                &src,
+                &mut buf1,
+                &mut buf2,
+                &filters,
+                &filters_meta,
+                4,
+                0,
+                None,
+            ),
+            0
+        );
+
+        buf1.copy_from_slice(&src);
+        assert_eq!(
+            pipeline_backward(
+                &mut buf1,
+                &mut buf2,
+                16,
+                &filters,
+                &filters_meta,
+                BLOSC2_VERSION_FORMAT,
+                4,
+                0,
+                None,
+                1,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn test_pipeline_rejects_invalid_trunc_prec() {
+        let src: Vec<u8> = (0..16).collect();
+        let mut buf1 = vec![0u8; 16];
+        let mut buf2 = vec![0u8; 16];
+
+        let filters = [BLOSC_TRUNC_PREC, 0, 0, 0, 0, 0];
+        let filters_meta = [16; BLOSC2_MAX_FILTERS];
+        assert_eq!(
+            pipeline_forward(
+                &src,
+                &mut buf1,
+                &mut buf2,
+                &filters,
+                &filters_meta,
+                2,
+                0,
+                None,
+            ),
+            0
+        );
+
+        let filters_meta = [0; BLOSC2_MAX_FILTERS];
+        assert_eq!(
+            pipeline_forward(
+                &src,
+                &mut buf1,
+                &mut buf2,
+                &filters,
+                &filters_meta,
+                4,
+                0,
+                None,
+            ),
+            0
+        );
+    }
+
+    #[test]
     fn test_trunc_prec_preserves_tail_bytes() {
         let src = [0xFFu8, 0xFF, 0xFF, 0xFF, 0xAA, 0xBB];
         let mut dest = [0u8; 6];
 
         // prec_bits=16 > BITS_MANTISSA_F32(23), valid. Zero low 7 mantissa bits.
-        trunc_prec_forward(&src, &mut dest, 4, 16);
+        assert!(trunc_prec_forward(&src, &mut dest, 4, 16));
 
         assert_eq!(&dest[4..], &src[4..]);
     }
@@ -1950,7 +2340,7 @@ mod tests {
         let src = original.to_le_bytes();
         let mut dest = [0u8; 4];
 
-        trunc_prec_forward(&src, &mut dest, 4, 10);
+        assert!(trunc_prec_forward(&src, &mut dest, 4, 10));
 
         let out = f32::from_le_bytes(dest);
         let out_bits = out.to_bits();
@@ -1977,7 +2367,7 @@ mod tests {
         let src = original.to_le_bytes();
         let mut dest = [0u8; 8];
 
-        trunc_prec_forward(&src, &mut dest, 8, 20);
+        assert!(trunc_prec_forward(&src, &mut dest, 8, 20));
 
         let out = f64::from_le_bytes(dest);
         let out_bits = out.to_bits();
