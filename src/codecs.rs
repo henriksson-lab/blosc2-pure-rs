@@ -2,13 +2,14 @@
 //!
 //! Provides a uniform interface over the bundled codecs — BloscLZ, LZ4,
 //! LZ4HC, Zlib and Zstd — together with optional zstd/LZ4 dictionary
-//! variants and a registry for plugin/user-defined codecs (IDs ≥ 32).
+//! variants and registries for plugin/user-defined codecs (IDs >= 32).
 //!
 //! The actual BloscLZ implementation lives in the [`blosclz`] sub-module;
 //! the other codecs are delegated to their respective Rust crates.
 
 pub mod blosclz;
 
+use crate::b2nd::B2ndMeta;
 use crate::constants::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -26,13 +27,233 @@ pub type CodecCompressFn = fn(clevel: u8, meta: u8, src: &[u8], dest: &mut [u8])
 /// [`register_codec`].
 pub type CodecDecompressFn = fn(meta: u8, src: &[u8], dest: &mut [u8]) -> i32;
 
+/// C-compatible callback return codes used by richer codec callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum PluginCallbackStatus {
+    Success = 0,
+    Failure = 1,
+}
+
+/// Compression-parameter snapshot exposed to codec plugin callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodecCParamsContext {
+    pub compcode: u8,
+    pub compcode_meta: u8,
+    pub clevel: u8,
+    pub typesize: i32,
+    pub blocksize: i32,
+    pub splitmode: i32,
+    pub filters: [u8; BLOSC2_MAX_FILTERS],
+    pub filters_meta: [u8; BLOSC2_MAX_FILTERS],
+    pub nthreads: i16,
+    pub nchunk: i64,
+    pub user_data: usize,
+}
+
+/// Decompression-parameter snapshot exposed to codec plugin callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodecDParamsContext {
+    pub nthreads: i16,
+    pub typesize: i32,
+    pub nchunk: i64,
+    pub user_data: usize,
+}
+
+/// Per-block context exposed to C-compatible codec plugin callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodecChunkContext {
+    pub schunk: usize,
+    pub nchunk: i64,
+    pub nblock: i32,
+    pub block_offset: usize,
+    pub blocksize: usize,
+    pub bsize: usize,
+}
+
+/// Rich codec callback parameters, modeled after C-Blosc2 plugin callbacks.
+#[derive(Debug, Clone, Copy)]
+pub struct CodecCallbackContext<'a> {
+    pub compcode: u8,
+    pub complib: Option<u8>,
+    pub meta: u8,
+    pub clevel: u8,
+    pub cparams: Option<&'a CodecCParamsContext>,
+    pub dparams: Option<&'a CodecDParamsContext>,
+    pub chunk: CodecChunkContext,
+    pub b2nd_metalayer: Option<&'a [u8]>,
+    pub user_data: usize,
+}
+
+/// Rich compression callback signature for C-compatible codecs.
+pub type ContextCodecCompressFn =
+    for<'a> fn(&mut CodecCallbackContext<'a>, src: &[u8], dest: &mut [u8]) -> i32;
+/// Rich decompression callback signature for C-compatible codecs.
+pub type ContextCodecDecompressFn =
+    for<'a> fn(&mut CodecCallbackContext<'a>, src: &[u8], dest: &mut [u8]) -> i32;
+
+/// C-shaped user codec descriptor for source-level `blosc2_codec` parity.
+#[derive(Clone, Copy)]
+pub struct Blosc2Codec {
+    pub compcode: u8,
+    pub compname: &'static str,
+    pub complib: u8,
+    pub version: u8,
+    pub encoder: CodecCompressFn,
+    pub decoder: CodecDecompressFn,
+}
+
 #[derive(Clone, Copy)]
 struct UserCodec {
-    compress: CodecCompressFn,
-    decompress: CodecDecompressFn,
+    name: Option<&'static str>,
+    complib: Option<u8>,
+    version: Option<u8>,
+    compress: UserCodecCompress,
+    decompress: UserCodecDecompress,
+}
+
+#[derive(Clone, Copy)]
+enum UserCodecCompress {
+    Legacy(CodecCompressFn),
+    Context(ContextCodecCompressFn),
+}
+
+impl UserCodecCompress {
+    fn same_callback(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Legacy(a), Self::Legacy(b)) => a as usize == b as usize,
+            (Self::Context(a), Self::Context(b)) => a as usize == b as usize,
+            _ => false,
+        }
+    }
+
+    fn run(
+        self,
+        ctx: &mut CodecCallbackContext<'_>,
+        clevel: u8,
+        meta: u8,
+        src: &[u8],
+        dest: &mut [u8],
+    ) -> i32 {
+        match self {
+            Self::Legacy(callback) => callback(clevel, meta, src, dest),
+            Self::Context(callback) => callback(ctx, src, dest),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum UserCodecDecompress {
+    Legacy(CodecDecompressFn),
+    Context(ContextCodecDecompressFn),
+}
+
+impl UserCodecDecompress {
+    fn same_callback(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Legacy(a), Self::Legacy(b)) => a as usize == b as usize,
+            (Self::Context(a), Self::Context(b)) => a as usize == b as usize,
+            _ => false,
+        }
+    }
+
+    fn run(self, ctx: &mut CodecCallbackContext<'_>, meta: u8, src: &[u8], dest: &mut [u8]) -> i32 {
+        match self {
+            Self::Legacy(callback) => callback(meta, src, dest),
+            Self::Context(callback) => callback(ctx, src, dest),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct KnownGlobalCodec {
+    compcode: u8,
+    name: &'static str,
+    version: u8,
+}
+
+const KNOWN_GLOBAL_CODECS: &[KnownGlobalCodec] = &[
+    KnownGlobalCodec {
+        compcode: BLOSC_CODEC_NDLZ,
+        name: "ndlz",
+        version: 1,
+    },
+    KnownGlobalCodec {
+        compcode: BLOSC_CODEC_ZFP_FIXED_ACCURACY,
+        name: "zfp_acc",
+        version: 1,
+    },
+    KnownGlobalCodec {
+        compcode: BLOSC_CODEC_ZFP_FIXED_PRECISION,
+        name: "zfp_prec",
+        version: 1,
+    },
+    KnownGlobalCodec {
+        compcode: BLOSC_CODEC_ZFP_FIXED_RATE,
+        name: "zfp_rate",
+        version: 1,
+    },
+    KnownGlobalCodec {
+        compcode: BLOSC_CODEC_OPENHTJ2K,
+        name: "openhtj2k",
+        version: 1,
+    },
+    KnownGlobalCodec {
+        compcode: BLOSC_CODEC_GROK,
+        name: "grok",
+        version: 1,
+    },
+    KnownGlobalCodec {
+        compcode: BLOSC_CODEC_OPENZL,
+        name: "openzl",
+        version: 1,
+    },
+];
+
+impl UserCodec {
+    fn same_callbacks(self, other: Self) -> bool {
+        self.name == other.name
+            && self.complib == other.complib
+            && self.version == other.version
+            && self.compress.same_callback(other.compress)
+            && self.decompress.same_callback(other.decompress)
+    }
+}
+
+fn known_global_codec_by_code(compcode: u8) -> Option<KnownGlobalCodec> {
+    KNOWN_GLOBAL_CODECS
+        .iter()
+        .copied()
+        .find(|codec| codec.compcode == compcode)
+}
+
+fn known_global_codec_by_name(name: &str) -> Option<KnownGlobalCodec> {
+    KNOWN_GLOBAL_CODECS
+        .iter()
+        .copied()
+        .find(|codec| codec.name == name)
+}
+
+/// Returns `true` for C-Blosc2 global plugin codec IDs known by this crate.
+///
+/// These entries provide C-compatible IDs and metadata. They do not imply that
+/// the codec implementation has been ported.
+pub fn is_known_global_codec(compcode: u8) -> bool {
+    known_global_codec_by_code(compcode).is_some()
+}
+
+/// Returns `true` for known C-Blosc2 ZFP plugin codec modes.
+pub fn is_known_zfp_codec(compcode: u8) -> bool {
+    matches!(
+        compcode,
+        BLOSC_CODEC_ZFP_FIXED_ACCURACY
+            | BLOSC_CODEC_ZFP_FIXED_PRECISION
+            | BLOSC_CODEC_ZFP_FIXED_RATE
+    )
 }
 
 static USER_CODECS: OnceLock<RwLock<HashMap<u8, UserCodec>>> = OnceLock::new();
+static USER_CODEC_ORDER: OnceLock<RwLock<Vec<u8>>> = OnceLock::new();
 
 thread_local! {
     static ZSTD_CCTX: RefCell<Option<Box<ZSTD_CCtx>>> = const { RefCell::new(None) };
@@ -51,29 +272,344 @@ fn user_codecs() -> &'static RwLock<HashMap<u8, UserCodec>> {
     USER_CODECS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Register a plugin or user-defined codec under `compcode`.
+fn user_codec_order() -> &'static RwLock<Vec<u8>> {
+    USER_CODEC_ORDER.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+fn remember_codec_order(compcode: u8) -> Result<(), &'static str> {
+    let mut order = user_codec_order()
+        .write()
+        .map_err(|_| "Codec registry poisoned")?;
+    if !order.contains(&compcode) {
+        order.push(compcode);
+    }
+    Ok(())
+}
+
+/// Register a user-defined codec under `compcode`.
 ///
 /// C-Blosc2 reserves IDs 32..=159 for global plugin codecs and 160..=255 for
-/// user-defined codecs. Lower IDs are reserved for built-in codecs. Subsequent
-/// calls with the same ID overwrite the existing entry.
+/// user-defined codecs. Lower IDs are reserved for built-in codecs. Duplicate
+/// IDs are rejected so existing chunks do not change behavior after accidental
+/// callback replacement.
 pub fn register_codec(
     compcode: u8,
     compress: CodecCompressFn,
     decompress: CodecDecompressFn,
 ) -> Result<(), &'static str> {
-    if compcode < 32 {
-        return Err("Registered codec IDs must be >= 32");
+    register_codec_impl(
+        compcode,
+        None,
+        compress,
+        decompress,
+        BLOSC2_USER_DEFINED_CODECS_START..=u8::MAX,
+    )
+}
+
+/// Register a named user-defined codec under `compcode`.
+///
+/// The name is used by C-Blosc2-style compressor name/code lookup helpers.
+pub fn register_named_codec(
+    compcode: u8,
+    name: &'static str,
+    compress: CodecCompressFn,
+    decompress: CodecDecompressFn,
+) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("User-defined codec name cannot be empty");
     }
-    user_codecs()
+    register_codec_impl(
+        compcode,
+        Some(name),
+        compress,
+        decompress,
+        BLOSC2_USER_DEFINED_CODECS_START..=u8::MAX,
+    )
+}
+
+/// C-name registration wrapper for [`Blosc2Codec`].
+pub fn blosc2_register_codec(codec: &Blosc2Codec) -> i32 {
+    blosc2_register_codec_c(Some(codec))
+}
+
+/// C-style nullable registration wrapper for [`Blosc2Codec`].
+pub fn blosc2_register_codec_c(codec: Option<&Blosc2Codec>) -> i32 {
+    let Some(codec) = codec else {
+        return BLOSC2_ERROR_INVALID_PARAM;
+    };
+    match register_blosc2_codec_impl(codec) {
+        Ok(()) => BLOSC2_ERROR_SUCCESS,
+        Err("User-defined codec IDs must be >= 160")
+        | Err("Codec ID outside allowed range")
+        | Err("User-defined codec ID already registered")
+        | Err("User-defined codec name already registered") => BLOSC2_ERROR_CODEC_PARAM,
+        Err("User-defined codec name cannot be empty") => BLOSC2_ERROR_INVALID_PARAM,
+        Err(_) => BLOSC2_ERROR_FAILURE,
+    }
+}
+
+fn register_blosc2_codec_impl(codec: &Blosc2Codec) -> Result<(), &'static str> {
+    if codec.compcode < BLOSC2_USER_DEFINED_CODECS_START {
+        return Err("User-defined codec IDs must be >= 160");
+    }
+    let mut codecs = user_codecs()
         .write()
-        .map_err(|_| "Codec registry poisoned")?
-        .insert(
-            compcode,
-            UserCodec {
-                compress,
-                decompress,
-            },
-        );
+        .map_err(|_| "Codec registry poisoned")?;
+
+    let registered = UserCodec {
+        name: Some(codec.compname),
+        complib: Some(codec.complib),
+        version: Some(codec.version),
+        compress: UserCodecCompress::Legacy(codec.encoder),
+        decompress: UserCodecDecompress::Legacy(codec.decoder),
+    };
+    if let Some(existing) = codecs.get(&codec.compcode) {
+        if existing.name == registered.name {
+            return Ok(());
+        }
+        return Err("User-defined codec ID already registered");
+    }
+    codecs.insert(codec.compcode, registered);
+    drop(codecs);
+    remember_codec_order(codec.compcode)?;
+    Ok(())
+}
+
+fn register_codec_impl(
+    compcode: u8,
+    name: Option<&'static str>,
+    compress: CodecCompressFn,
+    decompress: CodecDecompressFn,
+    allowed: std::ops::RangeInclusive<u8>,
+) -> Result<(), &'static str> {
+    if compcode < BLOSC2_USER_DEFINED_CODECS_START {
+        return Err("User-defined codec IDs must be >= 160");
+    }
+    if !allowed.contains(&compcode) {
+        return Err("Codec ID outside allowed range");
+    }
+    let mut codecs = user_codecs()
+        .write()
+        .map_err(|_| "Codec registry poisoned")?;
+    let codec = UserCodec {
+        name,
+        complib: None,
+        version: None,
+        compress: UserCodecCompress::Legacy(compress),
+        decompress: UserCodecDecompress::Legacy(decompress),
+    };
+    if let Some(existing) = codecs.get(&compcode) {
+        if name.is_some() && existing.name == name {
+            return Ok(());
+        }
+        if name.is_some() && existing.name != name {
+            return Err("Global plugin codec ID already registered");
+        }
+        return if existing.same_callbacks(codec) {
+            Ok(())
+        } else {
+            Err("User-defined codec ID already registered")
+        };
+    }
+    codecs.insert(compcode, codec);
+    drop(codecs);
+    remember_codec_order(compcode)?;
+    Ok(())
+}
+
+/// Register a global plugin codec under `compcode`.
+///
+/// This mirrors C-Blosc2's internal plugin registration path: IDs 32..=159 are
+/// accepted for globally registered plugins, while user-defined IDs still use
+/// [`register_codec`]. Duplicate IDs are rejected because this Rust registry has
+/// no separate plugin name to distinguish an idempotent re-registration from an
+/// accidental replacement.
+pub fn register_global_codec(
+    compcode: u8,
+    compress: CodecCompressFn,
+    decompress: CodecDecompressFn,
+) -> Result<(), &'static str> {
+    register_global_codec_impl(compcode, None, None, None, compress, decompress)
+}
+
+/// Register a named global plugin codec under `compcode`.
+pub fn register_named_global_codec(
+    compcode: u8,
+    name: &'static str,
+    compress: CodecCompressFn,
+    decompress: CodecDecompressFn,
+) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("Global plugin codec name cannot be empty");
+    }
+    register_global_codec_impl(compcode, Some(name), None, None, compress, decompress)
+}
+
+/// Register a named global plugin codec with C-style metadata.
+///
+/// `complib` and `version` are used by compressor name/library lookups and by
+/// chunk headers, matching C's globally registered codec descriptors.
+pub fn register_global_codec_with_metadata(
+    compcode: u8,
+    name: &'static str,
+    complib: u8,
+    version: u8,
+    compress: CodecCompressFn,
+    decompress: CodecDecompressFn,
+) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("Global plugin codec name cannot be empty");
+    }
+    register_global_codec_impl(
+        compcode,
+        Some(name),
+        Some(complib),
+        Some(version),
+        compress,
+        decompress,
+    )
+}
+
+/// Register a user-defined codec with C-compatible contextual callbacks.
+pub fn register_context_codec(
+    compcode: u8,
+    compress: ContextCodecCompressFn,
+    decompress: ContextCodecDecompressFn,
+) -> Result<(), &'static str> {
+    register_context_codec_impl(
+        compcode,
+        None,
+        None,
+        None,
+        compress,
+        decompress,
+        BLOSC2_USER_DEFINED_CODECS_START..=u8::MAX,
+        "User-defined codec IDs must be >= 160",
+        "User-defined codec ID already registered",
+    )
+}
+
+/// Register a global plugin codec with C-compatible contextual callbacks.
+pub fn register_global_context_codec(
+    compcode: u8,
+    compress: ContextCodecCompressFn,
+    decompress: ContextCodecDecompressFn,
+) -> Result<(), &'static str> {
+    register_context_codec_impl(
+        compcode,
+        None,
+        None,
+        None,
+        compress,
+        decompress,
+        BLOSC2_GLOBAL_REGISTERED_CODECS_START..=BLOSC2_GLOBAL_REGISTERED_CODECS_STOP,
+        "Global plugin codec IDs must be in 32..=159",
+        "Global plugin codec ID already registered",
+    )
+}
+
+/// Register a named global plugin codec with C-style metadata and contextual callbacks.
+pub fn register_global_context_codec_with_metadata(
+    compcode: u8,
+    name: &'static str,
+    complib: u8,
+    version: u8,
+    compress: ContextCodecCompressFn,
+    decompress: ContextCodecDecompressFn,
+) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("Global plugin codec name cannot be empty");
+    }
+    register_context_codec_impl(
+        compcode,
+        Some(name),
+        Some(complib),
+        Some(version),
+        compress,
+        decompress,
+        BLOSC2_GLOBAL_REGISTERED_CODECS_START..=BLOSC2_GLOBAL_REGISTERED_CODECS_STOP,
+        "Global plugin codec IDs must be in 32..=159",
+        "Global plugin codec ID already registered",
+    )
+}
+
+fn register_global_codec_impl(
+    compcode: u8,
+    name: Option<&'static str>,
+    complib: Option<u8>,
+    version: Option<u8>,
+    compress: CodecCompressFn,
+    decompress: CodecDecompressFn,
+) -> Result<(), &'static str> {
+    if !(BLOSC2_GLOBAL_REGISTERED_CODECS_START..=BLOSC2_GLOBAL_REGISTERED_CODECS_STOP)
+        .contains(&compcode)
+    {
+        return Err("Global plugin codec IDs must be in 32..=159");
+    }
+    let mut codecs = user_codecs()
+        .write()
+        .map_err(|_| "Codec registry poisoned")?;
+    let codec = UserCodec {
+        name,
+        complib,
+        version,
+        compress: UserCodecCompress::Legacy(compress),
+        decompress: UserCodecDecompress::Legacy(decompress),
+    };
+    if let Some(existing) = codecs.get(&compcode) {
+        if name.is_some() && existing.name == name {
+            return Ok(());
+        }
+        return if existing.same_callbacks(codec) {
+            Ok(())
+        } else {
+            Err("Global plugin codec ID already registered")
+        };
+    }
+    codecs.insert(compcode, codec);
+    drop(codecs);
+    remember_codec_order(compcode)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn register_context_codec_impl(
+    compcode: u8,
+    name: Option<&'static str>,
+    complib: Option<u8>,
+    version: Option<u8>,
+    compress: ContextCodecCompressFn,
+    decompress: ContextCodecDecompressFn,
+    allowed: std::ops::RangeInclusive<u8>,
+    range_error: &'static str,
+    duplicate_error: &'static str,
+) -> Result<(), &'static str> {
+    if !allowed.contains(&compcode) {
+        return Err(range_error);
+    }
+    let mut codecs = user_codecs()
+        .write()
+        .map_err(|_| "Codec registry poisoned")?;
+    let codec = UserCodec {
+        name,
+        complib,
+        version,
+        compress: UserCodecCompress::Context(compress),
+        decompress: UserCodecDecompress::Context(decompress),
+    };
+    if let Some(existing) = codecs.get(&compcode) {
+        if name.is_some() && existing.name == name {
+            return Ok(());
+        }
+        return if existing.same_callbacks(codec) {
+            Ok(())
+        } else {
+            Err(duplicate_error)
+        };
+    }
+    codecs.insert(compcode, codec);
+    drop(codecs);
+    remember_codec_order(compcode)?;
     Ok(())
 }
 
@@ -83,6 +619,79 @@ pub fn is_registered_codec(compcode: u8) -> bool {
     user_codecs()
         .read()
         .is_ok_and(|codecs| codecs.contains_key(&compcode))
+}
+
+/// Return the registered codec name for a plugin/user-defined codec.
+pub fn registered_codec_name(compcode: u8) -> Option<&'static str> {
+    known_global_codec_by_code(compcode)
+        .map(|codec| codec.name)
+        .or_else(|| {
+            user_codecs()
+                .read()
+                .ok()
+                .and_then(|codecs| codecs.get(&compcode).and_then(|codec| codec.name))
+        })
+}
+
+/// Return C-Blosc2-style compression library info for a registered codec name.
+pub fn registered_codec_complib_info(name: &str) -> Option<(u8, &'static str, &'static str)> {
+    if let Some(codec) = known_global_codec_by_name(name) {
+        return Some((codec.compcode, codec.name, "unknown"));
+    }
+    let codecs = user_codecs().read().ok()?;
+    let order = user_codec_order().read().ok()?;
+    order.iter().find_map(|code| {
+        let codec = codecs.get(code)?;
+        let codec_name = codec.name?;
+        if codec_name != name {
+            return None;
+        }
+        let complib = codec.complib?;
+        let libname = order
+            .iter()
+            .find_map(|code| {
+                let codec = codecs.get(code)?;
+                (codec.complib == Some(complib)).then_some(codec.name?)
+            })
+            .unwrap_or(codec_name);
+        codec.version.map(|_version| (complib, libname, "unknown"))
+    })
+}
+
+/// Return the registered codec name for a compressor-library code.
+pub fn registered_codec_name_by_complib(complib: u8) -> Option<&'static str> {
+    if let Some(codec) = known_global_codec_by_code(complib) {
+        return Some(codec.name);
+    }
+    let codecs = user_codecs().read().ok()?;
+    let order = user_codec_order().read().ok()?;
+    order.iter().find_map(|code| {
+        let codec = codecs.get(code)?;
+        (codec.complib == Some(complib)).then_some(codec.name?)
+    })
+}
+
+/// Return the codec-format version registered for a plugin/user-defined codec.
+pub fn registered_codec_version(compcode: u8) -> Option<u8> {
+    if let Some(codec) = known_global_codec_by_code(compcode) {
+        return Some(codec.version);
+    }
+    user_codecs()
+        .read()
+        .ok()
+        .and_then(|codecs| codecs.get(&compcode).and_then(|codec| codec.version))
+}
+
+/// Return the registered codec ID for a plugin/user-defined codec name.
+pub fn registered_codec_code(name: &str) -> Option<u8> {
+    if let Some(codec) = known_global_codec_by_name(name) {
+        return Some(codec.compcode);
+    }
+    let codecs = user_codecs().read().ok()?;
+    let order = user_codec_order().read().ok()?;
+    order
+        .iter()
+        .find_map(|&code| (codecs.get(&code)?.name == Some(name)).then_some(code))
 }
 
 /// Returns `true` if `compcode` supports compression and decompression
@@ -102,7 +711,7 @@ pub fn compress_block(compcode: u8, clevel: u8, src: &[u8], dest: &mut [u8]) -> 
     compress_block_with_meta(compcode, clevel, 0, src, dest)
 }
 
-/// Compress a block, passing an additional `meta` byte to user-defined codecs.
+/// Compress a block, passing an additional `meta` byte to plugin/user-defined codecs.
 ///
 /// `meta` is forwarded only to user codecs; the built-in codecs ignore it.
 /// Returns the number of compressed bytes, or 0 if the block does not compress.
@@ -113,17 +722,56 @@ pub fn compress_block_with_meta(
     src: &[u8],
     dest: &mut [u8],
 ) -> i32 {
+    compress_block_with_context(compcode, clevel, meta, src, dest, None)
+}
+
+/// Compress a block, forwarding rich context to registered plugin codecs.
+pub fn compress_block_with_context(
+    compcode: u8,
+    clevel: u8,
+    meta: u8,
+    src: &[u8],
+    dest: &mut [u8],
+    context: Option<CodecCallbackContext<'_>>,
+) -> i32 {
     match compcode {
         BLOSC_BLOSCLZ => blosclz::compress(clevel as i32, src, dest),
         BLOSC_LZ4 => lz4_compress(clevel, src, dest),
         BLOSC_LZ4HC => lz4hc_compress(clevel, src, dest),
         BLOSC_ZLIB => zlib_compress(src, dest, clevel),
         BLOSC_ZSTD => zstd_compress(src, dest, clevel),
+        BLOSC_CODEC_NDLZ => ndlz_compress(meta, src, dest, context.as_ref()),
         _ => user_codecs()
             .read()
             .ok()
             .and_then(|codecs| codecs.get(&compcode).copied())
-            .map_or(0, |codec| (codec.compress)(clevel, meta, src, dest)),
+            .map_or(0, |codec| {
+                let mut callback_context = context.unwrap_or(CodecCallbackContext {
+                    compcode,
+                    complib: codec.complib,
+                    meta,
+                    clevel,
+                    cparams: None,
+                    dparams: None,
+                    chunk: CodecChunkContext {
+                        schunk: 0,
+                        nchunk: -1,
+                        nblock: -1,
+                        block_offset: 0,
+                        blocksize: src.len(),
+                        bsize: src.len(),
+                    },
+                    b2nd_metalayer: None,
+                    user_data: 0,
+                });
+                callback_context.compcode = compcode;
+                callback_context.complib = codec.complib;
+                callback_context.meta = meta;
+                callback_context.clevel = clevel;
+                codec
+                    .compress
+                    .run(&mut callback_context, clevel, meta, src, dest)
+            }),
     }
 }
 
@@ -159,28 +807,62 @@ pub fn decompress_block(compcode: u8, src: &[u8], dest: &mut [u8]) -> i32 {
 /// `meta` is forwarded only to user codecs; the built-in codecs ignore it.
 /// Returns the number of decompressed bytes, or a negative value on error.
 pub fn decompress_block_with_meta(compcode: u8, meta: u8, src: &[u8], dest: &mut [u8]) -> i32 {
+    decompress_block_with_context(compcode, meta, src, dest, None)
+}
+
+/// Decompress a block, forwarding rich context to registered plugin codecs.
+pub fn decompress_block_with_context(
+    compcode: u8,
+    meta: u8,
+    src: &[u8],
+    dest: &mut [u8],
+    context: Option<CodecCallbackContext<'_>>,
+) -> i32 {
     match compcode {
         BLOSC_BLOSCLZ => blosclz::decompress(src, dest),
         BLOSC_LZ4 | BLOSC_LZ4HC => lz4_decompress(src, dest),
         BLOSC_ZLIB => zlib_decompress(src, dest),
         BLOSC_ZSTD => zstd_decompress(src, dest),
+        BLOSC_CODEC_NDLZ => ndlz_decompress(meta, src, dest),
         _ => user_codecs()
             .read()
             .ok()
             .and_then(|codecs| codecs.get(&compcode).copied())
-            .map_or(-1, |codec| (codec.decompress)(meta, src, dest)),
+            .map_or(-1, |codec| {
+                let mut callback_context = context.unwrap_or(CodecCallbackContext {
+                    compcode,
+                    complib: codec.complib,
+                    meta,
+                    clevel: 0,
+                    cparams: None,
+                    dparams: None,
+                    chunk: CodecChunkContext {
+                        schunk: 0,
+                        nchunk: -1,
+                        nblock: -1,
+                        block_offset: 0,
+                        blocksize: dest.len(),
+                        bsize: dest.len(),
+                    },
+                    b2nd_metalayer: None,
+                    user_data: 0,
+                });
+                callback_context.compcode = compcode;
+                callback_context.complib = codec.complib;
+                callback_context.meta = meta;
+                codec.decompress.run(&mut callback_context, meta, src, dest)
+            }),
     }
 }
 
 /// Decompress a block that was compressed with a preset dictionary.
 ///
-/// Falls back to plain [`decompress_block`] for codecs that do not
-/// support dictionaries.
+/// Returns 0 for codecs that do not support dictionary decompression.
 pub fn decompress_block_with_dict(compcode: u8, src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
     match compcode {
         BLOSC_LZ4 | BLOSC_LZ4HC => lz4_decompress_with_dict(src, dest, dict),
         BLOSC_ZSTD => zstd_decompress_with_dict(src, dest, dict),
-        _ => decompress_block(compcode, src, dest),
+        _ => 0,
     }
 }
 
@@ -216,8 +898,8 @@ fn lz4hc_compress(clevel: u8, src: &[u8], dest: &mut [u8]) -> i32 {
 /// (both share the same wire format).
 fn lz4_decompress(src: &[u8], dest: &mut [u8]) -> i32 {
     match lz4_pure::block::decompress_to_buffer(src, Some(dest.len() as i32), dest) {
-        Ok(n) => n as i32,
-        Err(_) => -1,
+        Ok(n) if n == dest.len() => n as i32,
+        Ok(_) | Err(_) => 0,
     }
 }
 
@@ -305,16 +987,16 @@ fn lz4_decompress_with_dict(src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
     use lz4_pure::sys::{c_char, LZ4_decompress_safe_usingDict};
 
     let Some(src_len) = len_as_c_int(src.len()) else {
-        return -1;
+        return 0;
     };
     let Some(dest_len) = len_as_c_int(dest.len()) else {
-        return -1;
+        return 0;
     };
     let Some(dict_len) = len_as_c_int(dict.len()) else {
-        return -1;
+        return 0;
     };
 
-    unsafe {
+    let written = unsafe {
         LZ4_decompress_safe_usingDict(
             src.as_ptr() as *const c_char,
             dest.as_mut_ptr() as *mut c_char,
@@ -323,6 +1005,11 @@ fn lz4_decompress_with_dict(src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
             dict.as_ptr() as *const c_char,
             dict_len,
         )
+    };
+    if written == dest_len {
+        written
+    } else {
+        0
     }
 }
 
@@ -355,9 +1042,12 @@ fn zlib_decompress(src: &[u8], dest: &mut [u8]) -> i32 {
 
     let mut decompress = Decompress::new(true);
     match decompress.decompress(src, dest, FlushDecompress::Finish) {
-        Ok(flate2::Status::StreamEnd) => decompress.total_out() as i32,
-        Ok(_) => -1,
-        Err(_) => -1,
+        Ok(flate2::Status::StreamEnd) if decompress.total_out() as usize == dest.len() => {
+            decompress.total_out() as i32
+        }
+        Ok(flate2::Status::StreamEnd) => 0,
+        Ok(_) => 0,
+        Err(_) => 0,
     }
 }
 
@@ -423,8 +1113,8 @@ fn zstd_decompress(src: &[u8], dest: &mut [u8]) -> i32 {
         *entropy_rep = ZSTD_decoder_entropy_rep::default();
         ZSTD_decompressDCtx(dctx, entropy_rep, xxh, dest, src)
     });
-    if ERR_isError(n) {
-        -1
+    if ERR_isError(n) || n != dest.len() {
+        0
     } else {
         n as i32
     }
@@ -445,11 +1135,581 @@ fn zstd_decompress_with_dict(src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
             n
         }
     });
-    if ERR_isError(n) {
-        -1
+    if ERR_isError(n) || n != dest.len() {
+        0
     } else {
         n as i32
     }
+}
+
+fn read_u16_le(src: &[u8], pos: usize) -> Option<u16> {
+    let bytes: [u8; 2] = src.get(pos..pos + 2)?.try_into().ok()?;
+    Some(u16::from_le_bytes(bytes))
+}
+
+fn read_i32_le(src: &[u8], pos: usize) -> Option<i32> {
+    let bytes: [u8; 4] = src.get(pos..pos + 4)?.try_into().ok()?;
+    Some(i32::from_le_bytes(bytes))
+}
+
+fn ndlz_compress(
+    meta: u8,
+    src: &[u8],
+    dest: &mut [u8],
+    context: Option<&CodecCallbackContext<'_>>,
+) -> i32 {
+    let Some(b2nd_metalayer) = context.and_then(|context| context.b2nd_metalayer) else {
+        return -1;
+    };
+    let Ok(b2nd_meta) = B2ndMeta::deserialize(b2nd_metalayer) else {
+        return -1;
+    };
+    if b2nd_meta.shape.len() != 2 || b2nd_meta.blockshape.len() != 2 {
+        return -1;
+    }
+    ndlz_compress_block_2d(
+        meta,
+        [b2nd_meta.blockshape[0], b2nd_meta.blockshape[1]],
+        src,
+        dest,
+    )
+}
+
+fn ndlz_decompress(meta: u8, src: &[u8], dest: &mut [u8]) -> i32 {
+    match meta {
+        4 | 8 => ndlz_decompress_cell(meta as usize, src, dest),
+        _ => -1,
+    }
+}
+
+fn ndlz_rows_key(cell: &[u8], cell_shape: usize, rows: impl IntoIterator<Item = usize>) -> Vec<u8> {
+    let mut key = Vec::new();
+    for row in rows {
+        let start = row * cell_shape;
+        key.extend_from_slice(&cell[start..start + cell_shape]);
+    }
+    key
+}
+
+fn ndlz_register_literal_rows(
+    cell: &[u8],
+    cell_shape: usize,
+    literal_start: usize,
+    row_pairs: &mut HashMap<Vec<u8>, usize>,
+    row_triples: &mut HashMap<Vec<u8>, usize>,
+) {
+    for row in 0..cell_shape - 1 {
+        row_pairs.insert(
+            ndlz_rows_key(cell, cell_shape, row..row + 2),
+            literal_start + row * cell_shape,
+        );
+    }
+    for row in 0..cell_shape - 2 {
+        row_triples.insert(
+            ndlz_rows_key(cell, cell_shape, row..row + 3),
+            literal_start + row * cell_shape,
+        );
+    }
+}
+
+/// Compress one 2D NDLZ block using C-Blosc2's block wire format.
+///
+/// This emits literal cells, same-value cells, full-cell back references, and
+/// row pair/triple back references to previously emitted literal rows.
+pub fn ndlz_compress_block_2d(meta: u8, blockshape: [i32; 2], src: &[u8], dest: &mut [u8]) -> i32 {
+    let cell_shape = match meta {
+        4 | 8 => meta as usize,
+        _ => return -1,
+    };
+    if blockshape[0] < 0 || blockshape[1] < 0 {
+        return -1;
+    }
+    let rows = blockshape[0] as usize;
+    let cols = blockshape[1] as usize;
+    let Some(expected_len) = rows.checked_mul(cols) else {
+        return -1;
+    };
+    if src.len() != expected_len || dest.len() < 9 {
+        return -1;
+    }
+
+    let stop_rows = rows.div_ceil(cell_shape);
+    let stop_cols = cols.div_ceil(cell_shape);
+    let mut op = 0usize;
+    dest[op] = 2;
+    op += 1;
+    dest[op..op + 4].copy_from_slice(&blockshape[0].to_le_bytes());
+    op += 4;
+    dest[op..op + 4].copy_from_slice(&blockshape[1].to_le_bytes());
+    op += 4;
+    let mut full_cell_matches: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut row_pair_matches: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut row_triple_matches: HashMap<Vec<u8>, usize> = HashMap::new();
+
+    for cell_row in 0..stop_rows {
+        'cell_cols: for cell_col in 0..stop_cols {
+            let pad_rows = if cell_row == stop_rows - 1 && !rows.is_multiple_of(cell_shape) {
+                rows % cell_shape
+            } else {
+                cell_shape
+            };
+            let pad_cols = if cell_col == stop_cols - 1 && !cols.is_multiple_of(cell_shape) {
+                cols % cell_shape
+            } else {
+                cell_shape
+            };
+            let orig = cell_row * cell_shape * cols + cell_col * cell_shape;
+            let full_cell = pad_rows == cell_shape && pad_cols == cell_shape;
+            let mut cell = Vec::new();
+            if full_cell {
+                cell.reserve_exact(cell_shape * cell_shape);
+                for row in 0..cell_shape {
+                    let start = orig + row * cols;
+                    cell.extend_from_slice(&src[start..start + cell_shape]);
+                }
+            }
+
+            if full_cell && cell.iter().all(|&byte| byte == cell[0]) {
+                if op + 2 > dest.len() {
+                    return 0;
+                }
+                dest[op] = 0x40;
+                dest[op + 1] = cell[0];
+                op += 2;
+                continue;
+            }
+
+            if full_cell {
+                if let Some(&literal_start) = full_cell_matches.get(&cell) {
+                    let Some(offset) = op.checked_sub(literal_start) else {
+                        return -1;
+                    };
+                    if offset > 0 && offset < u16::MAX as usize {
+                        if op + 3 > dest.len() {
+                            return 0;
+                        }
+                        dest[op] = 0xc0;
+                        dest[op + 1..op + 3].copy_from_slice(&(offset as u16).to_le_bytes());
+                        op += 3;
+                        continue;
+                    }
+                }
+            }
+
+            if full_cell {
+                let token_pos = op;
+                if cell_shape == 8 {
+                    for row in 0..=cell_shape - 3 {
+                        let key = ndlz_rows_key(&cell, cell_shape, row..row + 3);
+                        if let Some(&ref_start) = row_triple_matches.get(&key) {
+                            let Some(offset) = token_pos.checked_sub(ref_start) else {
+                                return -1;
+                            };
+                            if offset > 0 && offset < u16::MAX as usize {
+                                let literal_rows = cell_shape - 3;
+                                if op + 3 + literal_rows * cell_shape > dest.len() {
+                                    return 0;
+                                }
+                                dest[op] = (21 << 3) | row as u8;
+                                dest[op + 1..op + 3]
+                                    .copy_from_slice(&(offset as u16).to_le_bytes());
+                                op += 3;
+                                for literal_row in 0..cell_shape {
+                                    if literal_row < row || literal_row >= row + 3 {
+                                        let start = literal_row * cell_shape;
+                                        dest[op..op + cell_shape]
+                                            .copy_from_slice(&cell[start..start + cell_shape]);
+                                        op += cell_shape;
+                                    }
+                                }
+                                continue 'cell_cols;
+                            }
+                        }
+                    }
+
+                    for row in 0..=cell_shape - 2 {
+                        let key = ndlz_rows_key(&cell, cell_shape, row..row + 2);
+                        if let Some(&ref_start) = row_pair_matches.get(&key) {
+                            let Some(offset) = token_pos.checked_sub(ref_start) else {
+                                return -1;
+                            };
+                            if offset > 0 && offset < u16::MAX as usize {
+                                let literal_rows = cell_shape - 2;
+                                if op + 3 + literal_rows * cell_shape > dest.len() {
+                                    return 0;
+                                }
+                                dest[op] = (17 << 3) | row as u8;
+                                dest[op + 1..op + 3]
+                                    .copy_from_slice(&(offset as u16).to_le_bytes());
+                                op += 3;
+                                for literal_row in 0..cell_shape {
+                                    if literal_row < row || literal_row >= row + 2 {
+                                        let start = literal_row * cell_shape;
+                                        dest[op..op + cell_shape]
+                                            .copy_from_slice(&cell[start..start + cell_shape]);
+                                        op += cell_shape;
+                                    }
+                                }
+                                continue 'cell_cols;
+                            }
+                        }
+                    }
+                } else {
+                    for rows in [[0usize, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]] {
+                        let key = ndlz_rows_key(&cell, cell_shape, rows);
+                        if let Some(&ref_start) = row_triple_matches.get(&key) {
+                            let Some(offset) = token_pos.checked_sub(ref_start) else {
+                                return -1;
+                            };
+                            if offset > 0 && offset < u16::MAX as usize {
+                                if op + 3 + cell_shape > dest.len() {
+                                    return 0;
+                                }
+                                dest[op] = match rows {
+                                    [1, 2, 3] => 7 << 5,
+                                    [0, 1, 2] => (7 << 5) | (1 << 3),
+                                    [0, 1, 3] => (7 << 5) | (2 << 3),
+                                    [0, 2, 3] => (7 << 5) | (3 << 3),
+                                    _ => unreachable!(),
+                                };
+                                dest[op + 1..op + 3]
+                                    .copy_from_slice(&(offset as u16).to_le_bytes());
+                                op += 3;
+                                for literal_row in 0..cell_shape {
+                                    if !rows.contains(&literal_row) {
+                                        let start = literal_row * cell_shape;
+                                        dest[op..op + cell_shape]
+                                            .copy_from_slice(&cell[start..start + cell_shape]);
+                                        op += cell_shape;
+                                        break;
+                                    }
+                                }
+                                continue 'cell_cols;
+                            }
+                        }
+                    }
+
+                    for rows in [[0usize, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]] {
+                        let key = ndlz_rows_key(&cell, cell_shape, rows);
+                        if let Some(&ref_start) = row_pair_matches.get(&key) {
+                            let Some(offset) = token_pos.checked_sub(ref_start) else {
+                                return -1;
+                            };
+                            if offset > 0 && offset < u16::MAX as usize {
+                                if op + 3 + 2 * cell_shape > dest.len() {
+                                    return 0;
+                                }
+                                dest[op] = if rows == [2, 3] {
+                                    1 << 7
+                                } else {
+                                    (1 << 7) | ((rows[0] as u8) << 5) | ((rows[1] as u8) << 3)
+                                };
+                                dest[op + 1..op + 3]
+                                    .copy_from_slice(&(offset as u16).to_le_bytes());
+                                op += 3;
+                                for literal_row in 0..cell_shape {
+                                    if !rows.contains(&literal_row) {
+                                        let start = literal_row * cell_shape;
+                                        dest[op..op + cell_shape]
+                                            .copy_from_slice(&cell[start..start + cell_shape]);
+                                        op += cell_shape;
+                                    }
+                                }
+                                continue 'cell_cols;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let literal_len = pad_rows * pad_cols;
+            if op + 1 + literal_len > dest.len() {
+                return 0;
+            }
+            dest[op] = 0;
+            op += 1;
+            let literal_start = op;
+            for row in 0..pad_rows {
+                let start = orig + row * cols;
+                dest[op..op + pad_cols].copy_from_slice(&src[start..start + pad_cols]);
+                op += pad_cols;
+            }
+            if full_cell {
+                ndlz_register_literal_rows(
+                    &cell,
+                    cell_shape,
+                    literal_start,
+                    &mut row_pair_matches,
+                    &mut row_triple_matches,
+                );
+                full_cell_matches.insert(cell, literal_start);
+            }
+        }
+    }
+
+    op as i32
+}
+
+fn ndlz_copy_rows_from_stream(
+    cell: &mut [u8],
+    cell_shape: usize,
+    src: &[u8],
+    start: usize,
+    rows: impl IntoIterator<Item = usize>,
+) -> Option<()> {
+    for (row_idx, row) in rows.into_iter().enumerate() {
+        let src_start = start.checked_add(row_idx.checked_mul(cell_shape)?)?;
+        let src_end = src_start.checked_add(cell_shape)?;
+        let dst_start = row.checked_mul(cell_shape)?;
+        let dst_end = dst_start.checked_add(cell_shape)?;
+        cell.get_mut(dst_start..dst_end)?
+            .copy_from_slice(src.get(src_start..src_end)?);
+    }
+    Some(())
+}
+
+fn ndlz_decompress_cell(cell_shape: usize, src: &[u8], dest: &mut [u8]) -> i32 {
+    if src.len() < 9 || src[0] != 2 {
+        return -1;
+    }
+    let Some(rows) = read_i32_le(src, 1) else {
+        return -1;
+    };
+    let Some(cols) = read_i32_le(src, 5) else {
+        return -1;
+    };
+    if rows < 0 || cols < 0 {
+        return -1;
+    }
+    let rows = rows as usize;
+    let cols = cols as usize;
+    let Some(expected_len) = rows.checked_mul(cols) else {
+        return -1;
+    };
+    if expected_len > dest.len() {
+        return 0;
+    }
+    dest[..expected_len].fill(0);
+
+    let cell_size = cell_shape * cell_shape;
+    let stop_rows = rows.div_ceil(cell_shape);
+    let stop_cols = cols.div_ceil(cell_shape);
+    let mut ip = 9usize;
+    let mut last_end = 0usize;
+
+    for cell_row in 0..stop_rows {
+        for cell_col in 0..stop_cols {
+            if ip >= src.len() {
+                return -1;
+            }
+            let pad_rows = if cell_row == stop_rows - 1 && !rows.is_multiple_of(cell_shape) {
+                rows % cell_shape
+            } else {
+                cell_shape
+            };
+            let pad_cols = if cell_col == stop_cols - 1 && !cols.is_multiple_of(cell_shape) {
+                cols % cell_shape
+            } else {
+                cell_shape
+            };
+
+            let token_pos = ip;
+            let token = src[ip];
+            ip += 1;
+            let mut cell = vec![0u8; cell_size];
+
+            if token == 0 {
+                let literal_len = pad_rows * pad_cols;
+                let Some(literal) = src.get(ip..ip + literal_len) else {
+                    return -1;
+                };
+                for row in 0..pad_rows {
+                    let lit_start = row * pad_cols;
+                    let dst_start = row * cell_shape;
+                    cell[dst_start..dst_start + pad_cols]
+                        .copy_from_slice(&literal[lit_start..lit_start + pad_cols]);
+                }
+                ip += literal_len;
+            } else if token == 0xc0 {
+                let Some(offset) = read_u16_le(src, ip).map(usize::from) else {
+                    return -1;
+                };
+                let Some(ref_start) = ip.checked_sub(offset + 1) else {
+                    return -1;
+                };
+                if ndlz_copy_rows_from_stream(&mut cell, cell_shape, src, ref_start, 0..cell_shape)
+                    .is_none()
+                {
+                    return -1;
+                }
+                ip += 2;
+            } else if token == 0x40 {
+                let Some(&value) = src.get(ip) else {
+                    return -1;
+                };
+                cell.fill(value);
+                ip += 1;
+            } else if cell_shape == 4 {
+                if token >= 224 {
+                    let Some(offset) = read_u16_le(src, ip).map(|v| usize::from(v) + 3) else {
+                        return -1;
+                    };
+                    ip += 2;
+                    let (i, j, k) = if token >> 3 == 28 {
+                        (1, 2, 3)
+                    } else {
+                        let i = 0;
+                        if token >> 3 < 30 {
+                            (i, 1, 2)
+                        } else if token >> 3 == 30 {
+                            (i, 1, 3)
+                        } else {
+                            (i, 2, 3)
+                        }
+                    };
+                    let Some(ref_start) = ip.checked_sub(offset) else {
+                        return -1;
+                    };
+                    if ndlz_copy_rows_from_stream(&mut cell, cell_shape, src, ref_start, [i, j, k])
+                        .is_none()
+                    {
+                        return -1;
+                    }
+                    for row in 0..cell_shape {
+                        if row != i && row != j && row != k {
+                            let Some(literal) = src.get(ip..ip + cell_shape) else {
+                                return -1;
+                            };
+                            cell[row * cell_shape..(row + 1) * cell_shape].copy_from_slice(literal);
+                            ip += cell_shape;
+                            break;
+                        }
+                    }
+                } else if (128..=191).contains(&token) {
+                    let Some(offset) = read_u16_le(src, ip).map(|v| usize::from(v) + 3) else {
+                        return -1;
+                    };
+                    ip += 2;
+                    let (i, j) = if token == 128 {
+                        (2, 3)
+                    } else {
+                        let i = ((token - 128) >> 5) as usize;
+                        let j = (((token - 128) >> 3) - ((i as u8) << 2)) as usize;
+                        (i, j)
+                    };
+                    let Some(ref_start) = ip.checked_sub(offset) else {
+                        return -1;
+                    };
+                    if ndlz_copy_rows_from_stream(&mut cell, cell_shape, src, ref_start, [i, j])
+                        .is_none()
+                    {
+                        return -1;
+                    }
+                    for row in 0..cell_shape {
+                        if row != i && row != j {
+                            let Some(literal) = src.get(ip..ip + cell_shape) else {
+                                return -1;
+                            };
+                            cell[row * cell_shape..(row + 1) * cell_shape].copy_from_slice(literal);
+                            ip += cell_shape;
+                        }
+                    }
+                } else if (40..=63).contains(&token) {
+                    let Some(offset_1) = read_u16_le(src, ip).map(|v| usize::from(v) + 5) else {
+                        return -1;
+                    };
+                    ip += 2;
+                    let Some(offset_2) = read_u16_le(src, ip).map(|v| usize::from(v) + 5) else {
+                        return -1;
+                    };
+                    ip += 2;
+                    let i = 0usize;
+                    let j = ((token - 32) >> 3) as usize;
+                    let mut rest = (1..cell_shape).filter(|&row| row != j);
+                    let Some(l) = rest.next() else {
+                        return -1;
+                    };
+                    let Some(m) = rest.next() else {
+                        return -1;
+                    };
+                    let Some(ref_start_1) = ip.checked_sub(offset_1) else {
+                        return -1;
+                    };
+                    let Some(ref_start_2) = ip.checked_sub(offset_2) else {
+                        return -1;
+                    };
+                    if ndlz_copy_rows_from_stream(&mut cell, cell_shape, src, ref_start_1, [i, j])
+                        .is_none()
+                    {
+                        return -1;
+                    }
+                    if ndlz_copy_rows_from_stream(&mut cell, cell_shape, src, ref_start_2, [l, m])
+                        .is_none()
+                    {
+                        return -1;
+                    }
+                } else {
+                    return -1;
+                }
+            } else {
+                let match_type = token >> 3;
+                if match_type == 21 || match_type == 17 {
+                    let row = (token & 7) as usize;
+                    let matched = if match_type == 21 { 3 } else { 2 };
+                    if row + matched > cell_shape {
+                        return -1;
+                    }
+                    let Some(offset) = read_u16_le(src, ip).map(usize::from) else {
+                        return -1;
+                    };
+                    ip += 2;
+                    let Some(ref_start) = ip.checked_sub(3 + offset) else {
+                        return -1;
+                    };
+                    if ndlz_copy_rows_from_stream(
+                        &mut cell,
+                        cell_shape,
+                        src,
+                        ref_start,
+                        row..row + matched,
+                    )
+                    .is_none()
+                    {
+                        return -1;
+                    }
+                    for literal_row in 0..cell_shape {
+                        if literal_row < row || literal_row >= row + matched {
+                            let Some(literal) = src.get(ip..ip + cell_shape) else {
+                                return -1;
+                            };
+                            cell[literal_row * cell_shape..(literal_row + 1) * cell_shape]
+                                .copy_from_slice(literal);
+                            ip += cell_shape;
+                        }
+                    }
+                } else {
+                    return -1;
+                }
+            }
+
+            let orig = cell_row * cell_shape * cols + cell_col * cell_shape;
+            for row in 0..pad_rows {
+                let dst_start = orig + row * cols;
+                let dst_end = dst_start + pad_cols;
+                let src_start = row * cell_shape;
+                dest[dst_start..dst_end].copy_from_slice(&cell[src_start..src_start + pad_cols]);
+                last_end = dst_end;
+            }
+            if ip < token_pos || last_end > dest.len() {
+                return -1;
+            }
+        }
+    }
+
+    if last_end != expected_len {
+        return -1;
+    }
+    expected_len as i32
 }
 
 #[cfg(test)]
@@ -482,6 +1742,279 @@ mod tests {
     }
 
     #[test]
+    fn ndlz_literal_blocks_decompress_for_meta_4_and_8() {
+        let mut src4 = vec![2];
+        src4.extend_from_slice(&3i32.to_le_bytes());
+        src4.extend_from_slice(&4i32.to_le_bytes());
+        src4.push(0);
+        src4.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        let mut out4 = vec![0; 12];
+        assert_eq!(
+            decompress_block_with_meta(BLOSC_CODEC_NDLZ, 4, &src4, &mut out4),
+            12
+        );
+        assert_eq!(out4, (1..=12).collect::<Vec<_>>());
+
+        let mut src8 = vec![2];
+        src8.extend_from_slice(&2i32.to_le_bytes());
+        src8.extend_from_slice(&3i32.to_le_bytes());
+        src8.push(0);
+        src8.extend_from_slice(&[20, 21, 22, 23, 24, 25]);
+        let mut out8 = vec![0; 6];
+        assert_eq!(
+            decompress_block_with_meta(BLOSC_CODEC_NDLZ, 8, &src8, &mut out8),
+            6
+        );
+        assert_eq!(out8, vec![20, 21, 22, 23, 24, 25]);
+    }
+
+    #[test]
+    fn ndlz_repeat_cells_and_invalid_meta_are_handled() {
+        let mut src = vec![2];
+        src.extend_from_slice(&4i32.to_le_bytes());
+        src.extend_from_slice(&4i32.to_le_bytes());
+        src.push(0x40);
+        src.push(7);
+        let mut out = vec![0; 16];
+        assert_eq!(
+            decompress_block_with_meta(BLOSC_CODEC_NDLZ, 4, &src, &mut out),
+            16
+        );
+        assert_eq!(out, vec![7; 16]);
+
+        assert_eq!(
+            decompress_block_with_meta(BLOSC_CODEC_NDLZ, 5, &src, &mut out),
+            -1
+        );
+    }
+
+    #[test]
+    fn ndlz_literal_encoder_roundtrips_meta_4_and_8_blocks() {
+        for (meta, blockshape, input) in [
+            (4, [3, 4], (1..=12).collect::<Vec<_>>()),
+            (8, [2, 3], vec![20, 21, 22, 23, 24, 25]),
+        ] {
+            let mut encoded = vec![0; input.len() + 32];
+            let cbytes = ndlz_compress_block_2d(meta, blockshape, &input, &mut encoded);
+            assert!(cbytes > 0);
+            encoded.truncate(cbytes as usize);
+
+            let mut decoded = vec![0; input.len()];
+            assert_eq!(
+                decompress_block_with_meta(BLOSC_CODEC_NDLZ, meta, &encoded, &mut decoded),
+                input.len() as i32
+            );
+            assert_eq!(decoded, input);
+        }
+    }
+
+    #[test]
+    fn ndlz_encoder_uses_repeat_cell_token_for_full_constant_cells() {
+        let input = vec![9; 16];
+        let mut encoded = vec![0; 64];
+        let cbytes = ndlz_compress_block_2d(4, [4, 4], &input, &mut encoded);
+        assert_eq!(cbytes, 11);
+        assert_eq!(&encoded[..11], &[2, 4, 0, 0, 0, 4, 0, 0, 0, 0x40, 9]);
+
+        let mut decoded = vec![0; input.len()];
+        assert_eq!(
+            decompress_block_with_meta(
+                BLOSC_CODEC_NDLZ,
+                4,
+                &encoded[..cbytes as usize],
+                &mut decoded,
+            ),
+            input.len() as i32
+        );
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn ndlz_encoder_uses_full_cell_match_tokens_for_repeated_cells() {
+        let first_cell: Vec<u8> = (1..=16).collect();
+        let mut input = Vec::with_capacity(32);
+        for row in 0..4 {
+            input.extend_from_slice(&first_cell[row * 4..row * 4 + 4]);
+            input.extend_from_slice(&first_cell[row * 4..row * 4 + 4]);
+        }
+
+        let mut encoded = vec![0; 96];
+        let cbytes = ndlz_compress_block_2d(4, [4, 8], &input, &mut encoded);
+        assert_eq!(cbytes, 29);
+        assert_eq!(encoded[9], 0);
+        assert_eq!(encoded[26], 0xc0);
+        assert_eq!(u16::from_le_bytes([encoded[27], encoded[28]]), 16);
+
+        let mut decoded = vec![0; input.len()];
+        assert_eq!(
+            decompress_block_with_meta(
+                BLOSC_CODEC_NDLZ,
+                4,
+                &encoded[..cbytes as usize],
+                &mut decoded,
+            ),
+            input.len() as i32
+        );
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn ndlz_encoder_uses_full_cell_match_tokens_for_repeated_8x8_cells() {
+        let first_cell: Vec<u8> = (0..64).map(|i| ((i * 3 + 1) % 251) as u8).collect();
+        let mut input = Vec::with_capacity(128);
+        for row in 0..8 {
+            input.extend_from_slice(&first_cell[row * 8..row * 8 + 8]);
+            input.extend_from_slice(&first_cell[row * 8..row * 8 + 8]);
+        }
+
+        let mut encoded = vec![0; 192];
+        let cbytes = ndlz_compress_block_2d(8, [8, 16], &input, &mut encoded);
+        assert_eq!(cbytes, 77);
+        assert_eq!(encoded[9], 0);
+        assert_eq!(encoded[74], 0xc0);
+        assert_eq!(u16::from_le_bytes([encoded[75], encoded[76]]), 64);
+
+        let mut decoded = vec![0; input.len()];
+        assert_eq!(
+            decompress_block_with_meta(
+                BLOSC_CODEC_NDLZ,
+                8,
+                &encoded[..cbytes as usize],
+                &mut decoded,
+            ),
+            input.len() as i32
+        );
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn ndlz_encoder_uses_row_match_tokens_for_4x4_cells() {
+        let first_cell: Vec<u8> = (0..16).map(|i| (i + 1) as u8).collect();
+
+        let mut triple_input = Vec::with_capacity(32);
+        for row in 0..4 {
+            triple_input.extend_from_slice(&first_cell[row * 4..row * 4 + 4]);
+            let second_row = match row {
+                0 => &first_cell[4..8],
+                1 => &first_cell[8..12],
+                2 => &[90, 91, 92, 93],
+                _ => &first_cell[12..16],
+            };
+            triple_input.extend_from_slice(second_row);
+        }
+
+        let mut encoded = vec![0; 96];
+        let cbytes = ndlz_compress_block_2d(4, [4, 8], &triple_input, &mut encoded);
+        assert_eq!(cbytes, 33);
+        assert_eq!(encoded[26], (7 << 5) | (2 << 3));
+        assert_eq!(u16::from_le_bytes([encoded[27], encoded[28]]), 12);
+
+        let mut decoded = vec![0; triple_input.len()];
+        assert_eq!(
+            decompress_block_with_meta(
+                BLOSC_CODEC_NDLZ,
+                4,
+                &encoded[..cbytes as usize],
+                &mut decoded,
+            ),
+            triple_input.len() as i32
+        );
+        assert_eq!(decoded, triple_input);
+
+        let mut pair_input = Vec::with_capacity(32);
+        for row in 0..4 {
+            pair_input.extend_from_slice(&first_cell[row * 4..row * 4 + 4]);
+            let second_row = match row {
+                0 => &first_cell[0..4],
+                1 => &[50, 51, 52, 53],
+                2 => &first_cell[4..8],
+                _ => &[60, 61, 62, 63],
+            };
+            pair_input.extend_from_slice(second_row);
+        }
+
+        let cbytes = ndlz_compress_block_2d(4, [4, 8], &pair_input, &mut encoded);
+        assert_eq!(cbytes, 37);
+        assert_eq!(encoded[26], (1 << 7) | (2 << 3));
+        assert_eq!(u16::from_le_bytes([encoded[27], encoded[28]]), 16);
+
+        let mut decoded = vec![0; pair_input.len()];
+        assert_eq!(
+            decompress_block_with_meta(
+                BLOSC_CODEC_NDLZ,
+                4,
+                &encoded[..cbytes as usize],
+                &mut decoded,
+            ),
+            pair_input.len() as i32
+        );
+        assert_eq!(decoded, pair_input);
+    }
+
+    #[test]
+    fn ndlz_encoder_uses_row_match_tokens_for_8x8_cells() {
+        let first_cell: Vec<u8> = (0..64).map(|i| ((i * 7 + 11) % 251) as u8).collect();
+
+        let mut triple_input = Vec::with_capacity(128);
+        for row in 0..8 {
+            triple_input.extend_from_slice(&first_cell[row * 8..row * 8 + 8]);
+            let second_row: Vec<u8> = match row {
+                2 => first_cell[0..8].to_vec(),
+                3 => first_cell[8..16].to_vec(),
+                4 => first_cell[16..24].to_vec(),
+                _ => (0..8).map(|col| (180 + row * 8 + col) as u8).collect(),
+            };
+            triple_input.extend_from_slice(&second_row);
+        }
+
+        let mut encoded = vec![0; 192];
+        let cbytes = ndlz_compress_block_2d(8, [8, 16], &triple_input, &mut encoded);
+        assert_eq!(cbytes, 117);
+        assert_eq!(encoded[74], (21 << 3) | 2);
+        assert_eq!(u16::from_le_bytes([encoded[75], encoded[76]]), 64);
+
+        let mut decoded = vec![0; triple_input.len()];
+        assert_eq!(
+            decompress_block_with_meta(
+                BLOSC_CODEC_NDLZ,
+                8,
+                &encoded[..cbytes as usize],
+                &mut decoded,
+            ),
+            triple_input.len() as i32
+        );
+        assert_eq!(decoded, triple_input);
+
+        let mut pair_input = Vec::with_capacity(128);
+        for row in 0..8 {
+            pair_input.extend_from_slice(&first_cell[row * 8..row * 8 + 8]);
+            let second_row: Vec<u8> = match row {
+                3 => first_cell[0..8].to_vec(),
+                4 => first_cell[8..16].to_vec(),
+                _ => (0..8).map(|col| (90 + row * 8 + col) as u8).collect(),
+            };
+            pair_input.extend_from_slice(&second_row);
+        }
+
+        let cbytes = ndlz_compress_block_2d(8, [8, 16], &pair_input, &mut encoded);
+        assert_eq!(cbytes, 125);
+        assert_eq!(encoded[74], (17 << 3) | 3);
+        assert_eq!(u16::from_le_bytes([encoded[75], encoded[76]]), 64);
+
+        let mut decoded = vec![0; pair_input.len()];
+        assert_eq!(
+            decompress_block_with_meta(
+                BLOSC_CODEC_NDLZ,
+                8,
+                &encoded[..cbytes as usize],
+                &mut decoded,
+            ),
+            pair_input.len() as i32
+        );
+        assert_eq!(decoded, pair_input);
+    }
+
+    #[test]
     fn zstd_at_higher_blosc_level_compresses_better() {
         // A quick sanity check: after the mapping fix, blosc level 9 should
         // produce a significantly smaller or equal output than level 1 on
@@ -502,6 +2035,55 @@ mod tests {
     }
 
     #[test]
+    fn zlib_zstd_direct_decompress_failures_return_c_zero_sentinel() {
+        let mut dest = vec![0u8; 128];
+        assert_eq!(
+            decompress_block(BLOSC_ZLIB, b"not-a-zlib-block", &mut dest),
+            0
+        );
+        assert_eq!(
+            decompress_block(BLOSC_ZSTD, b"not-a-zstd-block", &mut dest),
+            0
+        );
+        assert_eq!(
+            decompress_block_with_dict(BLOSC_ZSTD, b"not-a-zstd-block", &mut dest, b"dict"),
+            0
+        );
+    }
+
+    #[test]
+    fn zstd_dictionary_matches_c_fixed_cdict_level() {
+        let dict: Vec<u8> = (0..8192u32)
+            .flat_map(|i| format!("record-{i:04}-COMMON-PREFIX-COMMON-SUFFIX;").into_bytes())
+            .collect();
+        let data: Vec<u8> = (0..16384u32)
+            .flat_map(|i| {
+                format!("record-{:04}-COMMON-PREFIX-COMMON-SUFFIX;", i % 8192).into_bytes()
+            })
+            .collect();
+        let mut buf1 = vec![0u8; data.len() + 1024];
+        let mut buf9 = vec![0u8; data.len() + 1024];
+
+        let csize1 = zstd_compress_with_dict(&data, &mut buf1, 1, &dict);
+        let csize9 = zstd_compress_with_dict(&data, &mut buf9, 9, &dict);
+
+        assert!(
+            csize1 > 0 && csize9 > 0,
+            "dictionary compression must not fail"
+        );
+        assert_eq!(
+            csize9, csize1,
+            "C-Blosc2 creates Zstd CDicts at level 1 regardless of Blosc clevel"
+        );
+        assert_eq!(&buf9[..csize9 as usize], &buf1[..csize1 as usize]);
+
+        let mut restored = vec![0; data.len()];
+        let dsize = zstd_decompress_with_dict(&buf9[..csize9 as usize], &mut restored, &dict);
+        assert_eq!(dsize as usize, data.len());
+        assert_eq!(restored, data);
+    }
+
+    #[test]
     fn lz4hc_roundtrips_via_lz4_decoder() {
         let data: Vec<u8> = (0..8192u32).flat_map(|i| (i % 64).to_le_bytes()).collect();
         let mut compressed = vec![0; data.len() + 1024];
@@ -518,6 +2100,16 @@ mod tests {
 
         assert_eq!(dsize as usize, data.len());
         assert_eq!(decompressed, data);
+
+        let mut oversized = vec![0; data.len() + 1];
+        assert_eq!(
+            decompress_block(BLOSC_LZ4HC, &compressed[..csize as usize], &mut oversized),
+            0
+        );
+        assert_eq!(
+            decompress_block(BLOSC_LZ4HC, b"bad-lz4-block", &mut decompressed),
+            0
+        );
     }
 
     #[test]
@@ -534,6 +2126,16 @@ mod tests {
             lz4_decompress_with_dict(&compressed[..csize as usize], &mut decompressed, dict);
         assert_eq!(dsize as usize, data.len());
         assert_eq!(decompressed, data);
+
+        let mut oversized = vec![0; data.len() + 1];
+        assert_eq!(
+            lz4_decompress_with_dict(&compressed[..csize as usize], &mut oversized, dict),
+            0
+        );
+        assert_eq!(
+            lz4_decompress_with_dict(b"bad-lz4-block", &mut decompressed, dict),
+            0
+        );
     }
 
     #[test]

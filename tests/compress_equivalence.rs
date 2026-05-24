@@ -2,7 +2,7 @@
 use blosc2_pure_rs::b2nd::{B2ndArray, B2ndMeta};
 use blosc2_pure_rs::compress::{
     cbuffer_metainfo, cbuffer_sizes, cbuffer_validate, compress, decompress, vlchunk_get_nblocks,
-    vlcompress, vldecompress, vldecompress_block, CParams,
+    vlcompress, vldecompress, vldecompress_block, CParams, DParams,
 };
 use blosc2_pure_rs::constants::*;
 use blosc2_pure_rs::header::ChunkHeader;
@@ -20,6 +20,223 @@ unsafe extern "C" {
 
 fn init_blosc2() -> common::Blosc2 {
     common::Blosc2::new()
+}
+
+struct CArray {
+    ctx: *mut ffi::b2nd_context_t,
+    array: *mut ffi::b2nd_array_t,
+}
+
+impl CArray {
+    fn from_u8_cbuffer(shape: &[i64], chunkshape: &[i32], blockshape: &[i32], data: &[u8]) -> Self {
+        let dtype = CString::new("|u1").unwrap();
+        unsafe {
+            let cparams: &mut ffi::blosc2_cparams = Box::leak(Box::new(std::mem::zeroed()));
+            cparams.compcode = BLOSC_LZ4;
+            cparams.clevel = 5;
+            cparams.typesize = 1;
+            cparams.nthreads = 1;
+            cparams.splitmode = BLOSC_NEVER_SPLIT;
+            cparams.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_SHUFFLE;
+            let dparams: &mut ffi::blosc2_dparams = Box::leak(Box::new(std::mem::zeroed()));
+            dparams.nthreads = 1;
+            dparams.typesize = 1;
+            let storage: &mut ffi::blosc2_storage = Box::leak(Box::new(ffi::blosc2_storage {
+                contiguous: true,
+                urlpath: std::ptr::null_mut(),
+                cparams,
+                dparams,
+                io: std::ptr::null_mut(),
+            }));
+
+            let ctx = ffi::b2nd_create_ctx(
+                storage,
+                shape.len() as i8,
+                shape.as_ptr(),
+                chunkshape.as_ptr(),
+                blockshape.as_ptr(),
+                dtype.as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+            );
+            assert!(!ctx.is_null());
+
+            let mut array: *mut ffi::b2nd_array_t = std::ptr::null_mut();
+            let rc =
+                ffi::b2nd_from_cbuffer(ctx, &mut array, data.as_ptr().cast(), data.len() as i64);
+            assert_eq!(rc, 0);
+            assert!(!array.is_null());
+
+            Self { ctx, array }
+        }
+    }
+
+    fn to_cbuffer(&self, len: usize) -> Vec<u8> {
+        let mut out = vec![0; len];
+        unsafe {
+            let rc = ffi::b2nd_to_cbuffer(self.array, out.as_mut_ptr().cast(), out.len() as i64);
+            assert_eq!(rc, 0);
+        }
+        out
+    }
+}
+
+impl Drop for CArray {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.array.is_null() {
+                assert_eq!(ffi::b2nd_free(self.array), 0);
+            }
+            if !self.ctx.is_null() {
+                assert_eq!(ffi::b2nd_free_ctx(self.ctx), 0);
+            }
+        }
+    }
+}
+
+fn b2nd_u8_meta(shape: &[i64], chunkshape: &[i32], blockshape: &[i32]) -> B2ndMeta {
+    B2ndMeta::new(
+        shape.to_vec(),
+        chunkshape.to_vec(),
+        blockshape.to_vec(),
+        "|u1",
+        0,
+    )
+    .unwrap()
+}
+
+fn b2nd_u8_cparams() -> CParams {
+    CParams {
+        compcode: BLOSC_LZ4,
+        clevel: 5,
+        typesize: 1,
+        splitmode: BLOSC_NEVER_SPLIT,
+        filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+        ..Default::default()
+    }
+}
+
+fn b2nd_u8_array(shape: &[i64], chunkshape: &[i32], blockshape: &[i32], data: &[u8]) -> B2ndArray {
+    B2ndArray::from_cbuffer(
+        b2nd_u8_meta(shape, chunkshape, blockshape),
+        data,
+        b2nd_u8_cparams(),
+        DParams::default(),
+    )
+    .unwrap()
+}
+
+fn ndlz_f32_fixture_data(shape: [i64; 2]) -> Vec<u8> {
+    let nelem = (shape[0] * shape[1]) as usize;
+    let mut data = Vec::with_capacity(nelem * 4);
+    for i in 0..nelem {
+        let value = ((i * 37 + (i / 7) * 11) % 220) as f32;
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+    data
+}
+
+fn ndlz_f64_some_matches_fixture_data(shape: [i64; 2]) -> Vec<u8> {
+    let nelem = (shape[0] * shape[1]) as usize;
+    let mut data = Vec::with_capacity(nelem * 8);
+    for i in 0..nelem {
+        let value = if i < nelem / 2 { i as f64 } else { 1.0 };
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+    data
+}
+
+fn ndlz_f64_same_cells_fixture_data(shape: [i64; 2]) -> Vec<u8> {
+    let nelem = (shape[0] * shape[1]) as usize;
+    let mut values = vec![0.0f64; nelem];
+    for i in 0..nelem / 4 {
+        values[i * 4] = 11111111.0;
+        values[i * 4 + 1] = 99999999.0;
+    }
+    let mut data = Vec::with_capacity(nelem * 8);
+    for value in values {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+    data
+}
+
+fn row_major_strides(shape: &[usize]) -> Vec<usize> {
+    let mut stride = 1usize;
+    let mut strides = vec![0; shape.len()];
+    for axis in (0..shape.len()).rev() {
+        strides[axis] = stride;
+        stride *= shape[axis];
+    }
+    strides
+}
+
+fn unravel_row_major(mut linear: usize, shape: &[usize]) -> Vec<usize> {
+    let strides = row_major_strides(shape);
+    let mut idx = vec![0; shape.len()];
+    for axis in 0..shape.len() {
+        idx[axis] = linear / strides[axis];
+        linear %= strides[axis];
+    }
+    idx
+}
+
+fn ravel_row_major(idx: &[usize], shape: &[usize]) -> usize {
+    let strides = row_major_strides(shape);
+    idx.iter()
+        .zip(strides)
+        .map(|(&idx, stride)| idx * stride)
+        .sum()
+}
+
+fn b2nd_insert_expected(
+    original: &[u8],
+    shape: &[usize],
+    axis: usize,
+    start: usize,
+    inserted_extent: usize,
+    inserted: &[u8],
+) -> Vec<u8> {
+    let mut new_shape = shape.to_vec();
+    new_shape[axis] += inserted_extent;
+    let mut inserted_shape = shape.to_vec();
+    inserted_shape[axis] = inserted_extent;
+    let mut out = vec![0; new_shape.iter().product()];
+    for (linear, byte) in out.iter_mut().enumerate() {
+        let idx = unravel_row_major(linear, &new_shape);
+        if (start..start + inserted_extent).contains(&idx[axis]) {
+            let mut insert_idx = idx.clone();
+            insert_idx[axis] -= start;
+            *byte = inserted[ravel_row_major(&insert_idx, &inserted_shape)];
+        } else {
+            let mut source_idx = idx;
+            if source_idx[axis] >= start + inserted_extent {
+                source_idx[axis] -= inserted_extent;
+            }
+            *byte = original[ravel_row_major(&source_idx, shape)];
+        }
+    }
+    out
+}
+
+fn b2nd_delete_expected(
+    original: &[u8],
+    shape: &[usize],
+    axis: usize,
+    start: usize,
+    len: usize,
+) -> Vec<u8> {
+    let mut new_shape = shape.to_vec();
+    new_shape[axis] -= len;
+    let mut out = vec![0; new_shape.iter().product()];
+    for (linear, byte) in out.iter_mut().enumerate() {
+        let mut source_idx = unravel_row_major(linear, &new_shape);
+        if source_idx[axis] >= start {
+            source_idx[axis] += len;
+        }
+        *byte = original[ravel_row_major(&source_idx, shape)];
+    }
+    out
 }
 
 const BLOSCLZ_MAX_COPY: usize = 32;
@@ -711,6 +928,54 @@ fn test_b2nd_rust_frame_c_reads() {
 }
 
 #[test]
+fn test_b2nd_rust_special_constructors_c_reads() {
+    let _b = init_blosc2();
+
+    let meta = B2ndMeta::new(vec![3, 5], vec![2, 3], vec![2, 2], "|u1", 0).unwrap();
+    let cparams = CParams {
+        compcode: BLOSC_LZ4,
+        clevel: 5,
+        typesize: 1,
+        splitmode: BLOSC_NEVER_SPLIT,
+        filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+        ..Default::default()
+    };
+
+    let empty = B2ndArray::empty(meta.clone(), cparams.clone(), Default::default()).unwrap();
+    assert_eq!(
+        ChunkHeader::read(empty.schunk.compressed_chunk(0).unwrap())
+            .unwrap()
+            .special_type(),
+        BLOSC2_SPECIAL_ZERO
+    );
+    let full = B2ndArray::full(meta, &[9], cparams, Default::default()).unwrap();
+    assert_eq!(
+        ChunkHeader::read(full.schunk.compressed_chunk(0).unwrap())
+            .unwrap()
+            .special_type(),
+        BLOSC2_SPECIAL_VALUE
+    );
+
+    for (array, expected) in [(empty, vec![0u8; 15]), (full, vec![9u8; 15])] {
+        let mut frame = array.to_frame();
+        unsafe {
+            let mut c_array: *mut ffi::b2nd_array_t = std::ptr::null_mut();
+            let rc =
+                ffi::b2nd_from_cframe(frame.as_mut_ptr(), frame.len() as i64, true, &mut c_array);
+            assert_eq!(rc, 0);
+            assert!(!c_array.is_null());
+
+            let mut c_buffer = vec![0u8; expected.len()];
+            let rc =
+                ffi::b2nd_to_cbuffer(c_array, c_buffer.as_mut_ptr().cast(), c_buffer.len() as i64);
+            assert_eq!(rc, 0);
+            assert_eq!(c_buffer, expected);
+            assert_eq!(ffi::b2nd_free(c_array), 0);
+        }
+    }
+}
+
+#[test]
 fn test_b2nd_c_frame_rust_reads() {
     let _b = init_blosc2();
 
@@ -778,6 +1043,423 @@ fn test_b2nd_c_frame_rust_reads() {
         assert_eq!(ffi::b2nd_free(c_array), 0);
         assert_eq!(ffi::b2nd_free_ctx(ctx), 0);
     }
+}
+
+#[test]
+fn test_ndlz_b2nd_rust_frame_c_reads() {
+    let _b = init_blosc2();
+
+    for (shape, chunkshape, blockshape, dtype, typesize, compcode_meta, data) in [
+        (
+            [32i64, 18],
+            [17i32, 16],
+            [8i32, 9],
+            "<f4",
+            4,
+            4,
+            ndlz_f32_fixture_data([32, 18]),
+        ),
+        (
+            [128i64, 111],
+            [32i32, 11],
+            [16i32, 7],
+            "<f8",
+            8,
+            4,
+            ndlz_f64_same_cells_fixture_data([128, 111]),
+        ),
+        (
+            [128i64, 111],
+            [48i32, 32],
+            [14i32, 18],
+            "<f8",
+            8,
+            8,
+            ndlz_f64_some_matches_fixture_data([128, 111]),
+        ),
+    ] {
+        let meta = B2ndMeta::new(
+            shape.to_vec(),
+            chunkshape.to_vec(),
+            blockshape.to_vec(),
+            dtype,
+            0,
+        )
+        .unwrap();
+        let cparams = CParams {
+            compcode: BLOSC_CODEC_NDLZ,
+            compcode_meta,
+            clevel: 5,
+            typesize,
+            splitmode: BLOSC_ALWAYS_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            nthreads: 1,
+            ..Default::default()
+        };
+        let array = B2ndArray::from_cbuffer(meta, &data, cparams, Default::default()).unwrap();
+        assert_eq!(array.to_cbuffer().unwrap(), data);
+        let mut frame = array.to_frame();
+
+        unsafe {
+            let mut c_array: *mut ffi::b2nd_array_t = std::ptr::null_mut();
+            let rc =
+                ffi::b2nd_from_cframe(frame.as_mut_ptr(), frame.len() as i64, true, &mut c_array);
+            assert_eq!(rc, 0);
+            assert!(!c_array.is_null());
+
+            let mut c_buffer = vec![0u8; data.len()];
+            let rc =
+                ffi::b2nd_to_cbuffer(c_array, c_buffer.as_mut_ptr().cast(), c_buffer.len() as i64);
+            assert_eq!(rc, 0);
+            assert_eq!(c_buffer, data);
+            assert_eq!(ffi::b2nd_free(c_array), 0);
+        }
+    }
+}
+
+#[test]
+fn test_ndlz_b2nd_c_frame_rust_reads() {
+    let _b = init_blosc2();
+
+    for (shape, chunkshape, blockshape, dtype, typesize, compcode_meta, data) in [
+        (
+            [32i64, 18],
+            [17i32, 16],
+            [8i32, 9],
+            "<f4",
+            4,
+            4,
+            ndlz_f32_fixture_data([32, 18]),
+        ),
+        (
+            [128i64, 111],
+            [32i32, 11],
+            [16i32, 7],
+            "<f8",
+            8,
+            4,
+            ndlz_f64_same_cells_fixture_data([128, 111]),
+        ),
+        (
+            [128i64, 111],
+            [48i32, 32],
+            [14i32, 18],
+            "<f8",
+            8,
+            8,
+            ndlz_f64_some_matches_fixture_data([128, 111]),
+        ),
+    ] {
+        let dtype_c = CString::new(dtype).unwrap();
+
+        unsafe {
+            let mut cparams: ffi::blosc2_cparams = std::mem::zeroed();
+            cparams.compcode = BLOSC_CODEC_NDLZ;
+            cparams.compcode_meta = compcode_meta;
+            cparams.clevel = 5;
+            cparams.typesize = typesize;
+            cparams.nthreads = 1;
+            cparams.splitmode = BLOSC_ALWAYS_SPLIT;
+            cparams.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_SHUFFLE;
+            let mut dparams: ffi::blosc2_dparams = std::mem::zeroed();
+            dparams.nthreads = 1;
+            dparams.typesize = typesize;
+            let storage = ffi::blosc2_storage {
+                contiguous: true,
+                urlpath: std::ptr::null_mut(),
+                cparams: &mut cparams,
+                dparams: &mut dparams,
+                io: std::ptr::null_mut(),
+            };
+
+            let ctx = ffi::b2nd_create_ctx(
+                &storage,
+                2,
+                shape.as_ptr(),
+                chunkshape.as_ptr(),
+                blockshape.as_ptr(),
+                dtype_c.as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+            );
+            assert!(!ctx.is_null());
+
+            let mut c_array: *mut ffi::b2nd_array_t = std::ptr::null_mut();
+            let rc =
+                ffi::b2nd_from_cbuffer(ctx, &mut c_array, data.as_ptr().cast(), data.len() as i64);
+            assert_eq!(rc, 0);
+            assert!(!c_array.is_null());
+
+            let mut cframe: *mut u8 = std::ptr::null_mut();
+            let mut cframe_len = 0i64;
+            let mut needs_free = false;
+            let rc = ffi::b2nd_to_cframe(c_array, &mut cframe, &mut cframe_len, &mut needs_free);
+            assert_eq!(rc, 0);
+            assert!(!cframe.is_null());
+            assert!(cframe_len > 0);
+            let frame = std::slice::from_raw_parts(cframe, cframe_len as usize);
+            let rust_array = B2ndArray::from_frame(frame).unwrap();
+            assert_eq!(rust_array.meta.shape, shape);
+            assert_eq!(rust_array.meta.chunkshape, chunkshape);
+            assert_eq!(rust_array.meta.blockshape, blockshape);
+            assert_eq!(rust_array.meta.dtype, dtype);
+            assert_eq!(rust_array.to_cbuffer().unwrap(), data);
+
+            if needs_free {
+                free(cframe.cast());
+            }
+            assert_eq!(ffi::b2nd_free(c_array), 0);
+            assert_eq!(ffi::b2nd_free_ctx(ctx), 0);
+        }
+    }
+}
+
+#[test]
+fn test_b2nd_c_rust_mutation_and_selection_parity() {
+    let _b = init_blosc2();
+
+    let chunkshape = [3, 4];
+    let blockshape = [2, 2];
+    let mut shape = vec![4usize, 5];
+    let data: Vec<u8> = (0..20).collect();
+    let c_array = CArray::from_u8_cbuffer(&[4, 5], &chunkshape, &blockshape, &data);
+    let mut rust_array = b2nd_u8_array(&[4, 5], &chunkshape, &blockshape, &data);
+    assert_eq!(
+        c_array.to_cbuffer(data.len()),
+        rust_array.to_cbuffer().unwrap()
+    );
+
+    let appended: Vec<u8> = (100..110).collect();
+    unsafe {
+        assert_eq!(
+            ffi::b2nd_append(
+                c_array.array,
+                appended.as_ptr().cast(),
+                appended.len() as i64,
+                0,
+            ),
+            0
+        );
+    }
+    rust_array.append(0, &[2, 5], &appended).unwrap();
+    let mut expected = [data.as_slice(), appended.as_slice()].concat();
+    shape[0] += 2;
+    assert_eq!(c_array.to_cbuffer(expected.len()), expected);
+    assert_eq!(rust_array.to_cbuffer().unwrap(), expected);
+
+    let insert_shape = [18i64, 6];
+    let insert_chunkshape = [6i32, 6];
+    let insert_blockshape = [3i32, 3];
+    let insert_data = vec![1; 18 * 6];
+    let c_insert = CArray::from_u8_cbuffer(
+        &insert_shape,
+        &insert_chunkshape,
+        &insert_blockshape,
+        &insert_data,
+    );
+    let mut rust_insert = b2nd_u8_array(
+        &insert_shape,
+        &insert_chunkshape,
+        &insert_blockshape,
+        &insert_data,
+    );
+    let inserted: Vec<u8> = (0..216).map(|i| (150u16 + i as u16) as u8).collect();
+    unsafe {
+        assert_eq!(
+            ffi::b2nd_insert(
+                c_insert.array,
+                inserted.as_ptr().cast(),
+                inserted.len() as i64,
+                1,
+                0,
+            ),
+            0
+        );
+    }
+    rust_insert.insert(1, 0, &[18, 12], &inserted).unwrap();
+    let expected_insert = b2nd_insert_expected(&insert_data, &[18, 6], 1, 0, 12, &inserted);
+    assert_eq!(c_insert.to_cbuffer(expected_insert.len()), expected_insert);
+    assert_eq!(rust_insert.to_cbuffer().unwrap(), expected_insert);
+
+    let delete_shape = [18i64, 12];
+    let delete_chunkshape = [6i32, 6];
+    let delete_blockshape = [3i32, 3];
+    let delete_data: Vec<u8> = (0..216).map(|i| i as u8).collect();
+    let c_delete = CArray::from_u8_cbuffer(
+        &delete_shape,
+        &delete_chunkshape,
+        &delete_blockshape,
+        &delete_data,
+    );
+    let mut rust_delete = b2nd_u8_array(
+        &delete_shape,
+        &delete_chunkshape,
+        &delete_blockshape,
+        &delete_data,
+    );
+    unsafe {
+        assert_eq!(ffi::b2nd_delete(c_delete.array, 1, 0, 6), 0);
+    }
+    rust_delete.delete(1, 0, 6).unwrap();
+    let expected_delete = b2nd_delete_expected(&delete_data, &[18, 12], 1, 0, 6);
+    assert_eq!(c_delete.to_cbuffer(expected_delete.len()), expected_delete);
+    assert_eq!(rust_delete.to_cbuffer().unwrap(), expected_delete);
+
+    let resize_shape = [5i64];
+    let resize_data: Vec<u8> = (0..5).collect();
+    let c_resize = CArray::from_u8_cbuffer(&resize_shape, &[3], &[2], &resize_data);
+    let mut rust_resize = b2nd_u8_array(&resize_shape, &[3], &[2], &resize_data);
+    let new_shape = [10i64];
+    unsafe {
+        assert_eq!(
+            ffi::b2nd_resize(c_resize.array, new_shape.as_ptr(), std::ptr::null()),
+            0
+        );
+    }
+    rust_resize.resize_at(new_shape.to_vec(), None).unwrap();
+    expected = resize_data;
+    expected.resize(10, 0);
+    assert_eq!(c_resize.to_cbuffer(expected.len()), expected);
+    assert_eq!(rust_resize.to_cbuffer().unwrap(), expected);
+
+    shape = vec![5, 6];
+    expected = (0..30).collect();
+    let c_select = CArray::from_u8_cbuffer(&[5, 6], &[3, 4], &[2, 2], &expected);
+    let rust_select = b2nd_u8_array(&[5, 6], &[3, 4], &[2, 2], &expected);
+    assert_eq!(c_select.to_cbuffer(expected.len()), expected);
+    assert_eq!(rust_select.to_cbuffer().unwrap(), expected);
+
+    let slice_start = [1i64, 1];
+    let slice_stop = [4i64, 5];
+    let mut c_slice_buffer = vec![0; 12];
+    unsafe {
+        assert_eq!(
+            ffi::b2nd_get_slice_cbuffer(
+                c_select.array,
+                slice_start.as_ptr(),
+                slice_stop.as_ptr(),
+                c_slice_buffer.as_mut_ptr().cast(),
+                [3i64, 4].as_ptr(),
+                c_slice_buffer.len() as i64,
+            ),
+            0
+        );
+    }
+    let rust_slice_buffer = rust_select
+        .get_slice_cbuffer(&slice_start, &slice_stop, &[3, 4])
+        .unwrap();
+    let mut expected_slice = Vec::new();
+    for row in 1..4 {
+        for col in 1..5 {
+            expected_slice.push(expected[row * shape[1] + col]);
+        }
+    }
+    assert_eq!(c_slice_buffer, expected_slice);
+    assert_eq!(rust_slice_buffer, expected_slice);
+
+    let mut selection_axis0 = [0i64, 2, 4];
+    let mut selection_axis1 = [1i64, 3];
+    let mut selection = [selection_axis0.as_mut_ptr(), selection_axis1.as_mut_ptr()];
+    let mut selection_size = [3i64, 2];
+    let mut selection_buffershape = [3i64, 2];
+    let mut c_selected = vec![0; 6];
+    unsafe {
+        assert_eq!(
+            ffi::b2nd_get_orthogonal_selection(
+                c_select.array,
+                selection.as_mut_ptr(),
+                selection_size.as_mut_ptr(),
+                c_selected.as_mut_ptr().cast(),
+                selection_buffershape.as_mut_ptr(),
+                c_selected.len() as i64,
+            ),
+            0
+        );
+    }
+    let rust_selected = rust_select
+        .get_orthogonal_selection(&[selection_axis0.to_vec(), selection_axis1.to_vec()])
+        .unwrap();
+    let mut expected_selected = Vec::new();
+    for row in selection_axis0 {
+        for col in selection_axis1 {
+            expected_selected.push(expected[row as usize * shape[1] + col as usize]);
+        }
+    }
+    assert_eq!(c_selected, expected_selected);
+    assert_eq!(rust_selected, expected_selected);
+
+    let singleton_shape = [1i64, 6];
+    let singleton_data: Vec<u8> = (200..206).collect();
+    let c_singleton = CArray::from_u8_cbuffer(&singleton_shape, &[1, 3], &[1, 1], &singleton_data);
+    let rust_singleton = b2nd_u8_array(&singleton_shape, &[1, 3], &[1, 1], &singleton_data);
+    let mut c_squeezed: *mut ffi::b2nd_array_t = std::ptr::null_mut();
+    unsafe {
+        assert_eq!(ffi::b2nd_squeeze(c_singleton.array, &mut c_squeezed), 0);
+        assert!(!c_squeezed.is_null());
+        let rc = ffi::b2nd_to_cbuffer(
+            c_squeezed,
+            c_slice_buffer.as_mut_ptr().cast(),
+            singleton_data.len() as i64,
+        );
+        assert_eq!(rc, 0);
+        assert_eq!(
+            &c_slice_buffer[..singleton_data.len()],
+            singleton_data.as_slice()
+        );
+        assert_eq!(ffi::b2nd_free(c_squeezed), 0);
+    }
+    assert_eq!(
+        rust_singleton.squeeze_view().unwrap().to_cbuffer().unwrap(),
+        singleton_data
+    );
+
+    let left_data: Vec<u8> = (30..40).collect();
+    let c_left = CArray::from_u8_cbuffer(&[2, 5], &chunkshape, &blockshape, &left_data);
+    let rust_left = b2nd_u8_array(&[2, 5], &chunkshape, &blockshape, &left_data);
+    let right_data: Vec<u8> = (50..60).collect();
+    let c_right = CArray::from_u8_cbuffer(&[2, 5], &chunkshape, &blockshape, &right_data);
+    let rust_right = b2nd_u8_array(&[2, 5], &chunkshape, &blockshape, &right_data);
+    let concat_shape = [4i64, 5];
+    let concat_ctx_data = vec![0; 20];
+    let c_concat_ctx =
+        CArray::from_u8_cbuffer(&concat_shape, &chunkshape, &blockshape, &concat_ctx_data);
+    let mut c_concat: *mut ffi::b2nd_array_t = std::ptr::null_mut();
+    unsafe {
+        assert_eq!(
+            ffi::b2nd_concatenate(
+                c_concat_ctx.ctx,
+                c_left.array,
+                c_right.array,
+                0,
+                true,
+                &mut c_concat,
+            ),
+            0
+        );
+        assert!(!c_concat.is_null());
+    }
+    let rust_concat = rust_left
+        .concatenate_with_meta(
+            &rust_right,
+            0,
+            b2nd_u8_meta(&concat_shape, &chunkshape, &blockshape),
+            b2nd_u8_cparams(),
+            DParams::default(),
+        )
+        .unwrap();
+    let c_concat_buffer = {
+        let c_concat_array = CArray {
+            ctx: std::ptr::null_mut(),
+            array: c_concat,
+        };
+        c_concat_array.to_cbuffer(20)
+    };
+    assert_eq!(
+        c_concat_buffer,
+        [left_data.as_slice(), right_data.as_slice()].concat()
+    );
+    assert_eq!(rust_concat.to_cbuffer().unwrap(), c_concat_buffer);
 }
 
 #[test]
@@ -871,6 +1553,41 @@ fn test_rust_frame_c_reads() {
             "C failed to decompress Rust frame chunk {idx}"
         );
         assert_eq!(&restored, expected, "Rust frame chunk {idx} mismatch");
+    }
+
+    let rc = unsafe { ffi::blosc2_schunk_free(c_schunk) };
+    assert_eq!(rc, 0);
+}
+
+#[test]
+fn test_rust_vlmetalayer_frame_c_reads() {
+    let _b = init_blosc2();
+
+    let mut schunk = Schunk::new(CParams::default(), Default::default());
+    schunk.append_buffer(b"payload").unwrap();
+    let content = b"variable-length metalayer content that C must decompress";
+    schunk.add_vlmetalayer("vlmeta", content).unwrap();
+
+    let mut frame = schunk.to_frame();
+    let c_schunk =
+        unsafe { ffi::blosc2_schunk_from_buffer(frame.as_mut_ptr(), frame.len() as i64, true) };
+    assert!(
+        !c_schunk.is_null(),
+        "C failed to open Rust-produced VL-metalayer frame"
+    );
+
+    let name = CString::new("vlmeta").unwrap();
+    let mut content_ptr = std::ptr::null_mut::<u8>();
+    let mut content_len = 0i32;
+    let rc = unsafe {
+        ffi::blosc2_vlmeta_get(c_schunk, name.as_ptr(), &mut content_ptr, &mut content_len)
+    };
+    assert!(rc >= 0, "C failed to read Rust VL-metalayer");
+    assert_eq!(content_len as usize, content.len());
+    let restored = unsafe { std::slice::from_raw_parts(content_ptr, content.len()) };
+    assert_eq!(restored, content);
+    unsafe {
+        free(content_ptr as *mut c_void);
     }
 
     let rc = unsafe { ffi::blosc2_schunk_free(c_schunk) };

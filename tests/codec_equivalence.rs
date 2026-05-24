@@ -1,11 +1,145 @@
 #![cfg(feature = "_ffi")]
-use blosc2_pure_rs::codecs;
+use blosc2_pure_rs::compress::CParams;
 use blosc2_pure_rs::constants::*;
+use blosc2_pure_rs::{codecs, compress};
 mod common;
 use common::ffi;
 
 fn init_blosc2() -> common::Blosc2 {
     common::Blosc2::new()
+}
+
+#[test]
+fn test_ndlz_c_plugin_decode_fixtures_for_supported_meta_values() {
+    let _b = init_blosc2();
+
+    for (meta, rows, cols, payload) in [
+        (4, 3i32, 4i32, (1..=12).collect::<Vec<_>>()),
+        (8, 2i32, 3i32, vec![20, 21, 22, 23, 24, 25]),
+    ] {
+        let mut encoded = vec![2];
+        encoded.extend_from_slice(&rows.to_le_bytes());
+        encoded.extend_from_slice(&cols.to_le_bytes());
+        encoded.push(0);
+        encoded.extend_from_slice(&payload);
+
+        let mut decoded = vec![0; payload.len()];
+        assert_eq!(
+            codecs::decompress_block_with_meta(BLOSC_CODEC_NDLZ, meta, &encoded, &mut decoded),
+            payload.len() as i32,
+            "NDLZ meta={meta} literal fixture must decode"
+        );
+        assert_eq!(
+            decoded, payload,
+            "NDLZ meta={meta} literal payload mismatch"
+        );
+    }
+}
+
+#[test]
+fn test_ndlz_c_plugin_repeat_and_reject_status_fixtures() {
+    let _b = init_blosc2();
+
+    let mut repeat_cell = vec![2];
+    repeat_cell.extend_from_slice(&4i32.to_le_bytes());
+    repeat_cell.extend_from_slice(&4i32.to_le_bytes());
+    repeat_cell.push(0x40);
+    repeat_cell.push(7);
+
+    let mut decoded = vec![0; 16];
+    assert_eq!(
+        codecs::decompress_block_with_meta(BLOSC_CODEC_NDLZ, 4, &repeat_cell, &mut decoded),
+        decoded.len() as i32
+    );
+    assert_eq!(decoded, vec![7; 16]);
+
+    assert_eq!(
+        codecs::decompress_block_with_meta(BLOSC_CODEC_NDLZ, 5, &repeat_cell, &mut decoded),
+        -1,
+        "NDLZ only supports C plugin cell metadata 4 and 8"
+    );
+
+    let cparams = CParams {
+        compcode: BLOSC_CODEC_NDLZ,
+        compcode_meta: 4,
+        typesize: 4,
+        filters: [0; BLOSC2_MAX_FILTERS],
+        ..Default::default()
+    };
+    assert!(compress::blosc2_create_cctx(cparams.clone()).is_ok());
+    assert_eq!(
+        compress::compress(&(0..128u8).collect::<Vec<_>>(), &cparams).unwrap_err(),
+        "Codec compression failed"
+    );
+}
+
+#[test]
+fn test_ndlz_rust_encoder_emits_c_wire_full_cell_match_fixtures() {
+    let _b = init_blosc2();
+
+    for (meta, rows, cols, cell_shape, expected_cbytes) in [
+        (4u8, 4i32, 8i32, 4usize, 29i32),
+        (8u8, 8i32, 16i32, 8usize, 77i32),
+    ] {
+        let first_cell: Vec<u8> = (0..cell_shape * cell_shape)
+            .map(|i| ((i * 5 + 3) % 251) as u8)
+            .collect();
+        let mut input = Vec::with_capacity((rows * cols) as usize);
+        for row in 0..cell_shape {
+            input.extend_from_slice(&first_cell[row * cell_shape..row * cell_shape + cell_shape]);
+            input.extend_from_slice(&first_cell[row * cell_shape..row * cell_shape + cell_shape]);
+        }
+
+        let mut encoded = vec![0; input.len() + 64];
+        let cbytes = codecs::ndlz_compress_block_2d(meta, [rows, cols], &input, &mut encoded);
+        assert_eq!(cbytes, expected_cbytes);
+        let match_token_pos = 9 + 1 + cell_shape * cell_shape;
+        assert_eq!(encoded[match_token_pos], 0xc0);
+        assert_eq!(
+            u16::from_le_bytes([encoded[match_token_pos + 1], encoded[match_token_pos + 2]]),
+            (cell_shape * cell_shape) as u16
+        );
+
+        let mut decoded = vec![0; input.len()];
+        assert_eq!(
+            codecs::decompress_block_with_meta(
+                BLOSC_CODEC_NDLZ,
+                meta,
+                &encoded[..cbytes as usize],
+                &mut decoded,
+            ),
+            input.len() as i32,
+            "Rust-emitted NDLZ full-cell match fixture must decode for meta={meta}"
+        );
+        assert_eq!(decoded, input);
+    }
+}
+
+#[test]
+fn test_zfp_c_plugin_modes_are_explicitly_unsupported_until_codec_abi_exists() {
+    let _b = init_blosc2();
+
+    for (compcode, compcode_meta) in [
+        (BLOSC_CODEC_ZFP_FIXED_ACCURACY, (-1i8) as u8),
+        (BLOSC_CODEC_ZFP_FIXED_PRECISION, 25),
+        (BLOSC_CODEC_ZFP_FIXED_RATE, 45),
+    ] {
+        let cparams = CParams {
+            compcode,
+            compcode_meta,
+            typesize: 4,
+            filters: [0; BLOSC2_MAX_FILTERS],
+            splitmode: BLOSC_NEVER_SPLIT,
+            ..Default::default()
+        };
+
+        assert!(compress::blosc2_create_cctx(cparams.clone()).is_ok());
+        assert_eq!(
+            compress::compress(&[0u8; 128], &cparams).unwrap_err(),
+            "ZFP plugin codecs are not supported",
+            "ZFP compcode={compcode} compression must fail before writing data"
+        );
+    }
 }
 
 /// Compress with C BloscLZ, decompress with Rust BloscLZ
@@ -42,7 +176,12 @@ fn test_blosclz_c_compress_rust_decompress() {
     };
     assert!(csize > 0, "C compression failed");
 
-    // Decompress with C for reference
+    // Decompress with Rust for the cross-compatibility assertion.
+    let rust_decompressed =
+        compress::decompress(&compressed[..csize as usize]).expect("Rust decompression failed");
+    assert_eq!(rust_decompressed, data, "Rust decompression mismatch");
+
+    // Decompress with C too, so failures are easier to diagnose.
     let mut c_decompressed = vec![0u8; src_size as usize];
     let c_dsize = unsafe {
         ffi::blosc2_decompress(

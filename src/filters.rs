@@ -17,8 +17,10 @@
 //! - **trunc_prec**: zero out least-significant mantissa bits of IEEE-754
 //!   floats, trading precision for compressibility.
 //!
-//! Users can register custom filters via [`register_filter`]; their IDs must be
-//! at or above [`BLOSC2_USER_DEFINED_FILTERS_START`].
+//! Users can register custom filters via [`register_filter`]; global plugin
+//! filters can be registered separately via [`register_global_filter`].
+
+#![allow(clippy::needless_range_loop)]
 
 use crate::constants::*;
 use std::collections::HashMap;
@@ -30,48 +32,1353 @@ pub type FilterForwardFn =
 /// Backward (decoding-side) callback signature for a user-defined filter.
 pub type FilterBackwardFn =
     fn(meta: u8, typesize: usize, block_offset: usize, src: &[u8], dest: &mut [u8]);
+/// Fallible forward callback signature for a user-defined filter.
+///
+/// Return `0` on success and a non-zero value to fail the filter pipeline,
+/// matching C-Blosc2 plugin callback conventions.
+pub type FallibleFilterForwardFn =
+    fn(meta: u8, typesize: usize, block_offset: usize, src: &[u8], dest: &mut [u8]) -> i32;
+/// Fallible backward callback signature for a user-defined filter.
+///
+/// Return `0` on success and a non-zero value to fail the filter pipeline,
+/// matching C-Blosc2 plugin callback conventions.
+pub type FallibleFilterBackwardFn =
+    fn(meta: u8, typesize: usize, block_offset: usize, src: &[u8], dest: &mut [u8]) -> i32;
+
+/// C-compatible callback return codes used by richer plugin callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum PluginCallbackStatus {
+    Success = 0,
+    Failure = 1,
+}
+
+/// Compression-parameter snapshot exposed to filter plugin callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilterCParamsContext {
+    pub compcode: u8,
+    pub compcode_meta: u8,
+    pub clevel: u8,
+    pub typesize: i32,
+    pub blocksize: i32,
+    pub splitmode: i32,
+    pub filters: [u8; BLOSC2_MAX_FILTERS],
+    pub filters_meta: [u8; BLOSC2_MAX_FILTERS],
+    pub nthreads: i16,
+    pub nchunk: i64,
+    pub user_data: usize,
+}
+
+/// Decompression-parameter snapshot exposed to filter plugin callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilterDParamsContext {
+    pub nthreads: i16,
+    pub typesize: i32,
+    pub nchunk: i64,
+    pub user_data: usize,
+}
+
+/// Per-block context exposed to C-compatible filter plugin callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilterChunkContext {
+    pub schunk: usize,
+    pub nchunk: i64,
+    pub nblock: i32,
+    pub block_offset: usize,
+    pub blocksize: usize,
+    pub bsize: usize,
+}
+
+/// Rich filter callback parameters, modeled after C-Blosc2 plugin callbacks.
+#[derive(Debug, Clone, Copy)]
+pub struct FilterCallbackContext<'a> {
+    pub filter_id: u8,
+    pub filter_slot: usize,
+    pub meta: u8,
+    pub typesize: usize,
+    pub cparams: Option<&'a FilterCParamsContext>,
+    pub dparams: Option<&'a FilterDParamsContext>,
+    pub chunk: FilterChunkContext,
+    pub b2nd_metalayer: Option<&'a [u8]>,
+    pub user_data: usize,
+}
+
+/// Rich forward callback signature for C-compatible filters.
+pub type ContextFilterForwardFn =
+    for<'a> fn(&mut FilterCallbackContext<'a>, src: &[u8], dest: &mut [u8]) -> i32;
+/// Rich backward callback signature for C-compatible filters.
+pub type ContextFilterBackwardFn =
+    for<'a> fn(&mut FilterCallbackContext<'a>, src: &[u8], dest: &mut [u8]) -> i32;
+
+/// C-shaped user filter descriptor for source-level `blosc2_filter` parity.
+#[derive(Clone, Copy)]
+pub struct Blosc2Filter {
+    pub id: u8,
+    pub name: &'static str,
+    pub version: u8,
+    pub forward: FallibleFilterForwardFn,
+    pub backward: FallibleFilterBackwardFn,
+}
+
+#[derive(Clone, Copy)]
+enum UserFilterForward {
+    Infallible(FilterForwardFn),
+    Fallible(FallibleFilterForwardFn),
+    Context(ContextFilterForwardFn),
+}
+
+impl UserFilterForward {
+    fn same_callback(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Infallible(a), Self::Infallible(b)) => a as usize == b as usize,
+            (Self::Fallible(a), Self::Fallible(b)) => a as usize == b as usize,
+            (Self::Context(a), Self::Context(b)) => a as usize == b as usize,
+            _ => false,
+        }
+    }
+
+    fn run(
+        self,
+        ctx: &mut FilterCallbackContext<'_>,
+        meta: u8,
+        typesize: usize,
+        block_offset: usize,
+        src: &[u8],
+        dest: &mut [u8],
+    ) -> i32 {
+        match self {
+            UserFilterForward::Infallible(callback) => {
+                callback(meta, typesize, block_offset, src, dest);
+                0
+            }
+            UserFilterForward::Fallible(callback) => {
+                callback(meta, typesize, block_offset, src, dest)
+            }
+            UserFilterForward::Context(callback) => callback(ctx, src, dest),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum UserFilterBackward {
+    Infallible(FilterBackwardFn),
+    Fallible(FallibleFilterBackwardFn),
+    Context(ContextFilterBackwardFn),
+}
+
+impl UserFilterBackward {
+    fn same_callback(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Infallible(a), Self::Infallible(b)) => a as usize == b as usize,
+            (Self::Fallible(a), Self::Fallible(b)) => a as usize == b as usize,
+            (Self::Context(a), Self::Context(b)) => a as usize == b as usize,
+            _ => false,
+        }
+    }
+
+    fn run(
+        self,
+        ctx: &mut FilterCallbackContext<'_>,
+        meta: u8,
+        typesize: usize,
+        block_offset: usize,
+        src: &[u8],
+        dest: &mut [u8],
+    ) -> i32 {
+        match self {
+            UserFilterBackward::Infallible(callback) => {
+                callback(meta, typesize, block_offset, src, dest);
+                0
+            }
+            UserFilterBackward::Fallible(callback) => {
+                callback(meta, typesize, block_offset, src, dest)
+            }
+            UserFilterBackward::Context(callback) => callback(ctx, src, dest),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct UserFilter {
-    forward: FilterForwardFn,
-    backward: FilterBackwardFn,
+    name: Option<&'static str>,
+    version: Option<u8>,
+    forward: UserFilterForward,
+    backward: UserFilterBackward,
+}
+
+#[derive(Clone, Copy)]
+struct KnownGlobalFilter {
+    filter_id: u8,
+    name: &'static str,
+    version: u8,
+}
+
+const KNOWN_GLOBAL_FILTERS: &[KnownGlobalFilter] = &[
+    KnownGlobalFilter {
+        filter_id: BLOSC_FILTER_NDCELL,
+        name: "ndcell",
+        version: 1,
+    },
+    KnownGlobalFilter {
+        filter_id: BLOSC_FILTER_NDMEAN,
+        name: "ndmean",
+        version: 1,
+    },
+    KnownGlobalFilter {
+        filter_id: BLOSC_FILTER_BYTEDELTA_BUGGY,
+        name: "bytedelta_buggy",
+        version: 1,
+    },
+    KnownGlobalFilter {
+        filter_id: BLOSC_FILTER_BYTEDELTA,
+        name: "bytedelta",
+        version: 1,
+    },
+    KnownGlobalFilter {
+        filter_id: BLOSC_FILTER_INT_TRUNC,
+        name: "int_trunc",
+        version: 1,
+    },
+];
+
+impl UserFilter {
+    fn same_callbacks(self, other: Self) -> bool {
+        self.name == other.name
+            && self.version == other.version
+            && self.forward.same_callback(other.forward)
+            && self.backward.same_callback(other.backward)
+    }
 }
 
 static USER_FILTERS: OnceLock<RwLock<HashMap<u8, UserFilter>>> = OnceLock::new();
+static KNOWN_GLOBAL_FILTERS_REGISTERED: OnceLock<()> = OnceLock::new();
 
 fn user_filters() -> &'static RwLock<HashMap<u8, UserFilter>> {
     USER_FILTERS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+fn unsupported_known_global_filter(
+    _meta: u8,
+    _typesize: usize,
+    _block_offset: usize,
+    _src: &[u8],
+    _dest: &mut [u8],
+) -> i32 {
+    1
+}
+
+#[derive(Debug)]
+struct B2ndFilterMeta {
+    ndim: usize,
+    blockshape: Vec<usize>,
+}
+
+fn read_b2nd_fixint(data: &[u8], pos: &mut usize) -> Option<u8> {
+    let value = *data.get(*pos)?;
+    if value > 0x7f {
+        return None;
+    }
+    *pos += 1;
+    Some(value)
+}
+
+fn read_b2nd_array_header(data: &[u8], pos: &mut usize) -> Option<usize> {
+    let value = *data.get(*pos)?;
+    *pos += 1;
+    match value {
+        0x90..=0x9f => Some((value - 0x90) as usize),
+        0xdc => {
+            let bytes: [u8; 2] = data.get(*pos..*pos + 2)?.try_into().ok()?;
+            *pos += 2;
+            Some(u16::from_be_bytes(bytes) as usize)
+        }
+        0xdd => {
+            let bytes: [u8; 4] = data.get(*pos..*pos + 4)?.try_into().ok()?;
+            *pos += 4;
+            usize::try_from(u32::from_be_bytes(bytes)).ok()
+        }
+        _ => None,
+    }
+}
+
+fn skip_b2nd_i64_array(data: &[u8], pos: &mut usize, len: usize) -> Option<()> {
+    if read_b2nd_array_header(data, pos)? != len {
+        return None;
+    }
+    for _ in 0..len {
+        if *data.get(*pos)? != 0xd3 {
+            return None;
+        }
+        *pos += 1 + std::mem::size_of::<i64>();
+        if *pos > data.len() {
+            return None;
+        }
+    }
+    Some(())
+}
+
+fn read_b2nd_i32_array(data: &[u8], pos: &mut usize, len: usize) -> Option<Vec<usize>> {
+    if read_b2nd_array_header(data, pos)? != len {
+        return None;
+    }
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        if *data.get(*pos)? != 0xd2 {
+            return None;
+        }
+        *pos += 1;
+        let bytes: [u8; 4] = data.get(*pos..*pos + 4)?.try_into().ok()?;
+        *pos += 4;
+        let value = i32::from_be_bytes(bytes);
+        if value <= 0 {
+            return None;
+        }
+        values.push(value as usize);
+    }
+    Some(values)
+}
+
+fn parse_b2nd_filter_meta(data: &[u8]) -> Option<B2ndFilterMeta> {
+    let mut pos = 0usize;
+    let fields = read_b2nd_array_header(data, &mut pos)?;
+    if fields != 7 && fields != 5 {
+        return None;
+    }
+    if read_b2nd_fixint(data, &mut pos)? != 0 {
+        return None;
+    }
+    let ndim = read_b2nd_fixint(data, &mut pos)? as usize;
+    if ndim == 0 || ndim > 8 {
+        return None;
+    }
+    skip_b2nd_i64_array(data, &mut pos, ndim)?;
+    let _chunkshape = read_b2nd_i32_array(data, &mut pos, ndim)?;
+    let blockshape = read_b2nd_i32_array(data, &mut pos, ndim)?;
+    Some(B2ndFilterMeta { ndim, blockshape })
+}
+
+fn product_checked(values: &[usize]) -> Option<usize> {
+    values
+        .iter()
+        .try_fold(1usize, |acc, &value| acc.checked_mul(value))
+}
+
+fn unidim_to_multidim(mut index: usize, shape: &[usize], dest: &mut [usize]) {
+    for dim in (0..shape.len()).rev() {
+        let width = shape[dim];
+        dest[dim] = index % width;
+        index /= width;
+    }
+}
+
+fn ndcell_layout(
+    meta: u8,
+    typesize: usize,
+    bsize: usize,
+    b2nd_metalayer: Option<&[u8]>,
+    clamp_to_blockshape: bool,
+) -> Option<(B2ndFilterMeta, Vec<usize>, Vec<usize>)> {
+    let b2nd = parse_b2nd_filter_meta(b2nd_metalayer?)?;
+    let cell_shape = meta as usize;
+    if cell_shape == 0 || typesize == 0 {
+        return None;
+    }
+    let cellshape: Vec<usize> = b2nd
+        .blockshape
+        .iter()
+        .map(|&block_dim| {
+            if clamp_to_blockshape {
+                cell_shape.min(block_dim)
+            } else {
+                cell_shape
+            }
+        })
+        .collect();
+    let block_items = product_checked(&b2nd.blockshape)?;
+    let blocksize = block_items.checked_mul(typesize)?;
+    let cell_items = product_checked(&cellshape)?;
+    if bsize != blocksize || bsize < cell_items.checked_mul(typesize)? {
+        return None;
+    }
+    let index_shape: Vec<usize> = b2nd
+        .blockshape
+        .iter()
+        .zip(&cellshape)
+        .map(|(&block_dim, &cell_dim)| block_dim.div_ceil(cell_dim))
+        .collect();
+    Some((b2nd, cellshape, index_shape))
+}
+
+fn ndcell_copy_forward(
+    src: &[u8],
+    dest: &mut [u8],
+    typesize: usize,
+    b2nd: &B2ndFilterMeta,
+    cellshape: &[usize],
+    index_shape: &[usize],
+) -> Option<()> {
+    let ncells = product_checked(index_shape)?;
+    let mut op = 0usize;
+    let mut ii = vec![0usize; b2nd.ndim];
+    let mut kk = vec![0usize; b2nd.ndim.saturating_sub(1)];
+    for cell_ind in 0..ncells {
+        unidim_to_multidim(cell_ind, index_shape, &mut ii);
+        let mut orig = 0usize;
+        let mut nd_aux = cellshape[0];
+        for dim in (0..b2nd.ndim).rev() {
+            orig = orig.checked_add(ii[dim].checked_mul(nd_aux)?)?;
+            nd_aux = nd_aux.checked_mul(b2nd.blockshape[dim])?;
+        }
+
+        let mut pad_shape = vec![0usize; b2nd.ndim];
+        for dim in 0..b2nd.ndim {
+            let remainder = b2nd.blockshape[dim] % cellshape[dim];
+            pad_shape[dim] = if remainder != 0 && ii[dim] == index_shape[dim] - 1 {
+                remainder
+            } else {
+                cellshape[dim]
+            };
+        }
+        let ncopies = product_checked(&pad_shape[..b2nd.ndim.saturating_sub(1)])?;
+        for copy_ind in 0..ncopies {
+            unidim_to_multidim(copy_ind, &pad_shape[..b2nd.ndim - 1], &mut kk);
+            let mut ind = orig;
+            nd_aux = b2nd.blockshape[b2nd.ndim - 1];
+            for dim in (0..b2nd.ndim - 1).rev() {
+                ind = ind.checked_add(kk[dim].checked_mul(nd_aux)?)?;
+                nd_aux = nd_aux.checked_mul(b2nd.blockshape[dim])?;
+            }
+            let bytes = pad_shape[b2nd.ndim - 1].checked_mul(typesize)?;
+            let src_start = ind.checked_mul(typesize)?;
+            let src_end = src_start.checked_add(bytes)?;
+            let dest_end = op.checked_add(bytes)?;
+            dest.get_mut(op..dest_end)?
+                .copy_from_slice(src.get(src_start..src_end)?);
+            op = dest_end;
+        }
+    }
+    (op == src.len()).then_some(())
+}
+
+fn ndcell_copy_backward(
+    src: &[u8],
+    dest: &mut [u8],
+    typesize: usize,
+    b2nd: &B2ndFilterMeta,
+    cellshape: &[usize],
+    index_shape: &[usize],
+) -> Option<()> {
+    let ncells = product_checked(index_shape)?;
+    let mut ip = 0usize;
+    let mut final_ind = 0usize;
+    let mut final_last_dim = 0usize;
+    let mut ii = vec![0usize; b2nd.ndim];
+    let mut kk = vec![0usize; b2nd.ndim.saturating_sub(1)];
+    for cell_ind in 0..ncells {
+        unidim_to_multidim(cell_ind, index_shape, &mut ii);
+        let mut orig = 0usize;
+        let mut nd_aux = cellshape[0];
+        for dim in (0..b2nd.ndim).rev() {
+            orig = orig.checked_add(ii[dim].checked_mul(nd_aux)?)?;
+            nd_aux = nd_aux.checked_mul(b2nd.blockshape[dim])?;
+        }
+
+        let mut pad_shape = vec![0usize; b2nd.ndim];
+        for dim in 0..b2nd.ndim {
+            let remainder = b2nd.blockshape[dim] % cellshape[dim];
+            pad_shape[dim] = if remainder != 0 && ii[dim] == index_shape[dim] - 1 {
+                remainder
+            } else {
+                cellshape[dim]
+            };
+        }
+        let ncopies = product_checked(&pad_shape[..b2nd.ndim.saturating_sub(1)])?;
+        for copy_ind in 0..ncopies {
+            unidim_to_multidim(copy_ind, &pad_shape[..b2nd.ndim - 1], &mut kk);
+            let mut ind = orig;
+            nd_aux = b2nd.blockshape[b2nd.ndim - 1];
+            for dim in (0..b2nd.ndim - 1).rev() {
+                ind = ind.checked_add(kk[dim].checked_mul(nd_aux)?)?;
+                nd_aux = nd_aux.checked_mul(b2nd.blockshape[dim])?;
+            }
+            let bytes = pad_shape[b2nd.ndim - 1].checked_mul(typesize)?;
+            let dest_start = ind.checked_mul(typesize)?;
+            let dest_end = dest_start.checked_add(bytes)?;
+            let src_end = ip.checked_add(bytes)?;
+            dest.get_mut(dest_start..dest_end)?
+                .copy_from_slice(src.get(ip..src_end)?);
+            ip = src_end;
+            final_ind = ind;
+            final_last_dim = pad_shape[b2nd.ndim - 1];
+        }
+    }
+    (ip == src.len() && final_ind + final_last_dim == src.len() / typesize).then_some(())
+}
+
+fn ndcell_forward_impl(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
+    let Some((b2nd, cellshape, index_shape)) =
+        ndcell_layout(ctx.meta, ctx.typesize, src.len(), ctx.b2nd_metalayer, false)
+    else {
+        return 1;
+    };
+    ndcell_copy_forward(src, dest, ctx.typesize, &b2nd, &cellshape, &index_shape)
+        .map(|()| 0)
+        .unwrap_or(1)
+}
+
+fn ndcell_backward_impl(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
+    let Some((b2nd, cellshape, index_shape)) =
+        ndcell_layout(ctx.meta, ctx.typesize, src.len(), ctx.b2nd_metalayer, false)
+    else {
+        return 1;
+    };
+    ndcell_copy_backward(src, dest, ctx.typesize, &b2nd, &cellshape, &index_shape)
+        .map(|()| 0)
+        .unwrap_or(1)
+}
+
+fn ndmean_forward_impl(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
+    if !matches!(ctx.typesize, 4 | 8) {
+        return 1;
+    }
+    let Some((b2nd, cellshape, index_shape)) =
+        ndcell_layout(ctx.meta, ctx.typesize, src.len(), ctx.b2nd_metalayer, true)
+    else {
+        return 1;
+    };
+    let Some(ncells) = product_checked(&index_shape) else {
+        return 1;
+    };
+
+    let mut op = 0usize;
+    let mut ii = vec![0usize; b2nd.ndim];
+    let mut kk = vec![0usize; b2nd.ndim.saturating_sub(1)];
+    for cell_ind in 0..ncells {
+        unidim_to_multidim(cell_ind, &index_shape, &mut ii);
+        let mut orig = 0usize;
+        let mut nd_aux = cellshape[0];
+        for dim in (0..b2nd.ndim).rev() {
+            let Some(addend) = ii[dim].checked_mul(nd_aux) else {
+                return 1;
+            };
+            let Some(next_orig) = orig.checked_add(addend) else {
+                return 1;
+            };
+            orig = next_orig;
+            let Some(next_aux) = nd_aux.checked_mul(b2nd.blockshape[dim]) else {
+                return 1;
+            };
+            nd_aux = next_aux;
+        }
+
+        let mut pad_shape = vec![0usize; b2nd.ndim];
+        for dim in 0..b2nd.ndim {
+            let remainder = b2nd.blockshape[dim] % cellshape[dim];
+            pad_shape[dim] = if remainder != 0 && ii[dim] == index_shape[dim] - 1 {
+                remainder
+            } else {
+                cellshape[dim]
+            };
+        }
+        let Some(ncopies) = product_checked(&pad_shape[..b2nd.ndim.saturating_sub(1)]) else {
+            return 1;
+        };
+        let mut f32_sum = 0f32;
+        let mut f64_sum = 0f64;
+        for copy_ind in 0..ncopies {
+            unidim_to_multidim(copy_ind, &pad_shape[..b2nd.ndim - 1], &mut kk);
+            let mut ind = orig;
+            nd_aux = b2nd.blockshape[b2nd.ndim - 1];
+            for dim in (0..b2nd.ndim - 1).rev() {
+                let Some(addend) = kk[dim].checked_mul(nd_aux) else {
+                    return 1;
+                };
+                let Some(next_ind) = ind.checked_add(addend) else {
+                    return 1;
+                };
+                ind = next_ind;
+                let Some(next_aux) = nd_aux.checked_mul(b2nd.blockshape[dim]) else {
+                    return 1;
+                };
+                nd_aux = next_aux;
+            }
+            for i in 0..pad_shape[b2nd.ndim - 1] {
+                let Some(item) = ind.checked_add(i) else {
+                    return 1;
+                };
+                let Some(byte_start) = item.checked_mul(ctx.typesize) else {
+                    return 1;
+                };
+                match ctx.typesize {
+                    4 => {
+                        let Some(bytes) = src.get(byte_start..byte_start + 4) else {
+                            return 1;
+                        };
+                        f32_sum += f32::from_ne_bytes(bytes.try_into().unwrap());
+                    }
+                    8 => {
+                        let Some(bytes) = src.get(byte_start..byte_start + 8) else {
+                            return 1;
+                        };
+                        f64_sum += f64::from_ne_bytes(bytes.try_into().unwrap());
+                    }
+                    _ => unreachable!("typesize checked above"),
+                }
+            }
+        }
+        let Some(cell_len) = ncopies.checked_mul(pad_shape[b2nd.ndim - 1]) else {
+            return 1;
+        };
+        match ctx.typesize {
+            4 => {
+                let mean = (f32_sum / cell_len as f32).to_ne_bytes();
+                for _ in 0..cell_len {
+                    let Some(end) = op.checked_add(4) else {
+                        return 1;
+                    };
+                    let Some(slot) = dest.get_mut(op..end) else {
+                        return 1;
+                    };
+                    slot.copy_from_slice(&mean);
+                    op = end;
+                }
+            }
+            8 => {
+                let mean = (f64_sum / cell_len as f64).to_ne_bytes();
+                for _ in 0..cell_len {
+                    let Some(end) = op.checked_add(8) else {
+                        return 1;
+                    };
+                    let Some(slot) = dest.get_mut(op..end) else {
+                        return 1;
+                    };
+                    slot.copy_from_slice(&mean);
+                    op = end;
+                }
+            }
+            _ => unreachable!("typesize checked above"),
+        }
+    }
+
+    (op == src.len()) as i32 ^ 1
+}
+
+fn ndmean_backward_impl(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
+    let Some((b2nd, cellshape, index_shape)) =
+        ndcell_layout(ctx.meta, ctx.typesize, src.len(), ctx.b2nd_metalayer, true)
+    else {
+        return 1;
+    };
+    ndcell_copy_backward(src, dest, ctx.typesize, &b2nd, &cellshape, &index_shape)
+        .map(|()| 0)
+        .unwrap_or(1)
+}
+
+fn bytedelta_typesize(meta: u8, typesize: usize) -> Option<usize> {
+    let typesize = if meta == 0 { typesize } else { meta as usize };
+    (1..=BLOSC2_MAXTYPESIZE)
+        .contains(&typesize)
+        .then_some(typesize)
+}
+
+fn bytedelta_forward_impl(
+    meta: u8,
+    typesize: usize,
+    _block_offset: usize,
+    src: &[u8],
+    dest: &mut [u8],
+) -> i32 {
+    let Some(typesize) = bytedelta_typesize(meta, typesize) else {
+        return 1;
+    };
+    if dest.len() < src.len() {
+        return 1;
+    }
+
+    let stream_len = src.len() / typesize;
+    let main_len = stream_len * typesize;
+    for channel in 0..typesize {
+        let base = channel * stream_len;
+        let mut previous = 0u8;
+        for i in 0..stream_len {
+            let value = src[base + i];
+            dest[base + i] = value.wrapping_sub(previous);
+            previous = value;
+        }
+    }
+    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
+    0
+}
+
+fn bytedelta_backward_impl(
+    meta: u8,
+    typesize: usize,
+    _block_offset: usize,
+    src: &[u8],
+    dest: &mut [u8],
+) -> i32 {
+    let Some(typesize) = bytedelta_typesize(meta, typesize) else {
+        return 1;
+    };
+    if dest.len() < src.len() {
+        return 1;
+    }
+
+    let stream_len = src.len() / typesize;
+    let main_len = stream_len * typesize;
+    for channel in 0..typesize {
+        let base = channel * stream_len;
+        let mut previous = 0u8;
+        for i in 0..stream_len {
+            let value = src[base + i].wrapping_add(previous);
+            dest[base + i] = value;
+            previous = value;
+        }
+    }
+    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
+    0
+}
+
+fn bytedelta_buggy_forward_impl(
+    meta: u8,
+    typesize: usize,
+    _block_offset: usize,
+    src: &[u8],
+    dest: &mut [u8],
+) -> i32 {
+    let Some(typesize) = bytedelta_typesize(meta, typesize) else {
+        return 1;
+    };
+    if dest.len() < src.len() {
+        return 1;
+    }
+
+    let stream_len = src.len() / typesize;
+    let main_len = stream_len * typesize;
+    for channel in 0..typesize {
+        let base = channel * stream_len;
+        let vectorizable_len = stream_len - (stream_len % 16);
+        let mut previous = 0u8;
+        for i in 0..vectorizable_len {
+            let value = src[base + i];
+            dest[base + i] = value.wrapping_sub(previous);
+            previous = value;
+        }
+
+        previous = 0;
+        for i in vectorizable_len..stream_len {
+            let value = src[base + i];
+            dest[base + i] = value.wrapping_sub(previous);
+            previous = value;
+        }
+    }
+    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
+    0
+}
+
+fn bytedelta_buggy_backward_impl(
+    meta: u8,
+    typesize: usize,
+    _block_offset: usize,
+    src: &[u8],
+    dest: &mut [u8],
+) -> i32 {
+    let Some(typesize) = bytedelta_typesize(meta, typesize) else {
+        return 1;
+    };
+    if dest.len() < src.len() {
+        return 1;
+    }
+
+    let stream_len = src.len() / typesize;
+    let main_len = stream_len * typesize;
+    for channel in 0..typesize {
+        let base = channel * stream_len;
+        let vectorizable_len = stream_len - (stream_len % 16);
+        let mut previous = 0u8;
+        for i in 0..vectorizable_len {
+            let value = src[base + i].wrapping_add(previous);
+            dest[base + i] = value;
+            previous = value;
+        }
+
+        previous = 0;
+        for i in vectorizable_len..stream_len {
+            let value = src[base + i].wrapping_add(previous);
+            dest[base + i] = value;
+            previous = value;
+        }
+    }
+    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
+    0
+}
+
+fn int_trunc_forward_impl(
+    meta: u8,
+    typesize: usize,
+    _block_offset: usize,
+    src: &[u8],
+    dest: &mut [u8],
+) -> i32 {
+    if dest.len() < src.len() || !matches!(typesize, 1 | 2 | 4 | 8) {
+        return 1;
+    }
+
+    let max_prec_bits = (typesize * 8) as i16;
+    let prec_bits = meta as i8 as i16;
+    let zeroed_bits = if prec_bits >= 0 {
+        max_prec_bits - prec_bits
+    } else {
+        -prec_bits
+    };
+    if zeroed_bits < 0 || zeroed_bits >= max_prec_bits {
+        return 1;
+    }
+
+    let mask = !((1u64 << zeroed_bits) - 1);
+    let nelems = src.len() / typesize;
+    let main_len = nelems * typesize;
+    for (src_elem, dest_elem) in src[..main_len]
+        .chunks_exact(typesize)
+        .zip(dest[..main_len].chunks_exact_mut(typesize))
+    {
+        let value = match typesize {
+            1 => u64::from(src_elem[0]),
+            2 => u64::from(u16::from_ne_bytes([src_elem[0], src_elem[1]])),
+            4 => u64::from(u32::from_ne_bytes([
+                src_elem[0],
+                src_elem[1],
+                src_elem[2],
+                src_elem[3],
+            ])),
+            8 => u64::from_ne_bytes([
+                src_elem[0],
+                src_elem[1],
+                src_elem[2],
+                src_elem[3],
+                src_elem[4],
+                src_elem[5],
+                src_elem[6],
+                src_elem[7],
+            ]),
+            _ => unreachable!("typesize was checked above"),
+        } & mask;
+
+        match typesize {
+            1 => dest_elem[0] = value as u8,
+            2 => dest_elem.copy_from_slice(&(value as u16).to_ne_bytes()),
+            4 => dest_elem.copy_from_slice(&(value as u32).to_ne_bytes()),
+            8 => dest_elem.copy_from_slice(&value.to_ne_bytes()),
+            _ => unreachable!("typesize was checked above"),
+        }
+    }
+    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
+    0
+}
+
+fn int_trunc_backward_impl(
+    _meta: u8,
+    _typesize: usize,
+    _block_offset: usize,
+    src: &[u8],
+    dest: &mut [u8],
+) -> i32 {
+    if dest.len() < src.len() {
+        return 1;
+    }
+    dest[..src.len()].copy_from_slice(src);
+    0
+}
+
+fn known_global_filter_by_id(filter_id: u8) -> Option<KnownGlobalFilter> {
+    KNOWN_GLOBAL_FILTERS
+        .iter()
+        .copied()
+        .find(|filter| filter.filter_id == filter_id)
+}
+
+fn ensure_known_global_filters_registered() {
+    KNOWN_GLOBAL_FILTERS_REGISTERED.get_or_init(|| {
+        for filter in KNOWN_GLOBAL_FILTERS {
+            let registered = match filter.filter_id {
+                BLOSC_FILTER_NDCELL => register_global_context_filter_with_metadata(
+                    filter.filter_id,
+                    filter.name,
+                    filter.version,
+                    ndcell_forward_impl,
+                    ndcell_backward_impl,
+                ),
+                BLOSC_FILTER_NDMEAN => register_global_context_filter_with_metadata(
+                    filter.filter_id,
+                    filter.name,
+                    filter.version,
+                    ndmean_forward_impl,
+                    ndmean_backward_impl,
+                ),
+                BLOSC_FILTER_BYTEDELTA_BUGGY => register_global_fallible_filter_with_metadata(
+                    filter.filter_id,
+                    filter.name,
+                    filter.version,
+                    bytedelta_buggy_forward_impl,
+                    bytedelta_buggy_backward_impl,
+                ),
+                BLOSC_FILTER_BYTEDELTA => register_global_fallible_filter_with_metadata(
+                    filter.filter_id,
+                    filter.name,
+                    filter.version,
+                    bytedelta_forward_impl,
+                    bytedelta_backward_impl,
+                ),
+                BLOSC_FILTER_INT_TRUNC => register_global_fallible_filter_with_metadata(
+                    filter.filter_id,
+                    filter.name,
+                    filter.version,
+                    int_trunc_forward_impl,
+                    int_trunc_backward_impl,
+                ),
+                _ => register_global_fallible_filter_with_metadata(
+                    filter.filter_id,
+                    filter.name,
+                    filter.version,
+                    unsupported_known_global_filter,
+                    unsupported_known_global_filter,
+                ),
+            };
+            let _ = registered;
+        }
+    });
+}
+
+/// Returns `true` for C-Blosc2 global plugin filter IDs known by this crate.
+///
+/// These entries provide C-compatible IDs and metadata. They do not imply that
+/// the filter implementation has been ported.
+pub fn is_known_global_filter(filter_id: u8) -> bool {
+    known_global_filter_by_id(filter_id).is_some()
+}
+
+/// Returns `true` for global plugin filters that require live B2ND metadata.
+///
+/// These filters read the owning schunk's `"b2nd"` metalayer in C-Blosc2 to
+/// recover ndim, shape, chunkshape, and blockshape. Rust callbacks receive the
+/// same raw metalayer through [`FilterCallbackContext::b2nd_metalayer`].
+pub fn global_filter_requires_b2nd_metadata(filter_id: u8) -> bool {
+    matches!(filter_id, BLOSC_FILTER_NDCELL | BLOSC_FILTER_NDMEAN)
+}
+
+/// Return the C-shaped name/version descriptor for a known global plugin filter.
+pub fn known_global_filter_info(filter_id: u8) -> Option<(&'static str, u8)> {
+    let filter = known_global_filter_by_id(filter_id)?;
+    Some((filter.name, filter.version))
+}
+
 /// Register a user-defined filter under `filter_id`.
 ///
 /// `filter_id` must be at least [`BLOSC2_USER_DEFINED_FILTERS_START`]; lower IDs
-/// are reserved for built-in filters. Re-registering an existing ID overwrites
-/// the previous callbacks.
+/// are reserved for built-in and globally registered C-Blosc2 filters.
+/// Re-registering an existing ID is rejected so existing chunks do not change
+/// behavior after accidental callback replacement.
 pub fn register_filter(
     filter_id: u8,
     forward: FilterForwardFn,
     backward: FilterBackwardFn,
 ) -> Result<(), &'static str> {
-    if filter_id < BLOSC2_USER_DEFINED_FILTERS_START {
+    register_filter_inner(
+        filter_id,
+        UserFilter {
+            name: None,
+            version: None,
+            forward: UserFilterForward::Infallible(forward),
+            backward: UserFilterBackward::Infallible(backward),
+        },
+        BLOSC2_USER_DEFINED_FILTERS_START..=u8::MAX,
+        "User-defined filter IDs must be >= 160",
+        "User-defined filter ID already registered",
+    )
+}
+
+/// Register a fallible user-defined filter under `filter_id`.
+///
+/// The callbacks return `0` on success and non-zero on failure, mirroring
+/// C-Blosc2's plugin callback convention. Existing infallible callbacks should
+/// keep using [`register_filter`].
+pub fn register_fallible_filter(
+    filter_id: u8,
+    forward: FallibleFilterForwardFn,
+    backward: FallibleFilterBackwardFn,
+) -> Result<(), &'static str> {
+    register_filter_inner(
+        filter_id,
+        UserFilter {
+            name: None,
+            version: None,
+            forward: UserFilterForward::Fallible(forward),
+            backward: UserFilterBackward::Fallible(backward),
+        },
+        BLOSC2_USER_DEFINED_FILTERS_START..=u8::MAX,
+        "User-defined filter IDs must be >= 160",
+        "User-defined filter ID already registered",
+    )
+}
+
+/// Register a user-defined filter with C-compatible contextual callbacks.
+pub fn register_context_filter(
+    filter_id: u8,
+    forward: ContextFilterForwardFn,
+    backward: ContextFilterBackwardFn,
+) -> Result<(), &'static str> {
+    register_filter_inner(
+        filter_id,
+        UserFilter {
+            name: None,
+            version: None,
+            forward: UserFilterForward::Context(forward),
+            backward: UserFilterBackward::Context(backward),
+        },
+        BLOSC2_USER_DEFINED_FILTERS_START..=u8::MAX,
+        "User-defined filter IDs must be >= 160",
+        "User-defined filter ID already registered",
+    )
+}
+
+/// C-name registration wrapper for [`Blosc2Filter`].
+pub fn blosc2_register_filter(filter: &Blosc2Filter) -> i32 {
+    blosc2_register_filter_c(Some(filter))
+}
+
+/// C-style nullable registration wrapper for [`Blosc2Filter`].
+pub fn blosc2_register_filter_c(filter: Option<&Blosc2Filter>) -> i32 {
+    let Some(filter) = filter else {
+        return BLOSC2_ERROR_INVALID_PARAM;
+    };
+    match register_blosc2_filter_impl(filter) {
+        Ok(()) => BLOSC2_ERROR_SUCCESS,
+        Err("User-defined filter IDs must be >= 160") => BLOSC2_ERROR_FAILURE,
+        Err("User-defined filter ID already registered") => BLOSC2_ERROR_FAILURE,
+        Err(_) => BLOSC2_ERROR_FAILURE,
+    }
+}
+
+fn register_blosc2_filter_impl(filter: &Blosc2Filter) -> Result<(), &'static str> {
+    if filter.id < BLOSC2_USER_DEFINED_FILTERS_START {
         return Err("User-defined filter IDs must be >= 160");
     }
-    user_filters()
+    let mut filters = user_filters()
         .write()
-        .map_err(|_| "Filter registry poisoned")?
-        .insert(filter_id, UserFilter { forward, backward });
+        .map_err(|_| "Filter registry poisoned")?;
+    if let Some(existing) = filters.get(&filter.id) {
+        let registered = UserFilter {
+            name: Some(filter.name),
+            version: Some(filter.version),
+            forward: UserFilterForward::Fallible(filter.forward),
+            backward: UserFilterBackward::Fallible(filter.backward),
+        };
+        return if existing.name == registered.name {
+            Ok(())
+        } else {
+            Err("User-defined filter ID already registered")
+        };
+    }
+    filters.insert(
+        filter.id,
+        UserFilter {
+            name: Some(filter.name),
+            version: Some(filter.version),
+            forward: UserFilterForward::Fallible(filter.forward),
+            backward: UserFilterBackward::Fallible(filter.backward),
+        },
+    );
     Ok(())
+}
+
+fn register_filter_inner(
+    filter_id: u8,
+    filter: UserFilter,
+    valid_range: std::ops::RangeInclusive<u8>,
+    range_error: &'static str,
+    duplicate_error: &'static str,
+) -> Result<(), &'static str> {
+    if !valid_range.contains(&filter_id) {
+        return Err(range_error);
+    }
+    let mut filters = user_filters()
+        .write()
+        .map_err(|_| "Filter registry poisoned")?;
+    if let Some(existing) = filters.get(&filter_id) {
+        return if existing.same_callbacks(filter) {
+            Ok(())
+        } else {
+            Err(duplicate_error)
+        };
+    }
+    filters.insert(filter_id, filter);
+    Ok(())
+}
+
+fn register_named_filter_inner(
+    filter_id: u8,
+    filter: UserFilter,
+    valid_range: std::ops::RangeInclusive<u8>,
+    range_error: &'static str,
+    duplicate_error: &'static str,
+) -> Result<(), &'static str> {
+    if !valid_range.contains(&filter_id) {
+        return Err(range_error);
+    }
+    let mut filters = user_filters()
+        .write()
+        .map_err(|_| "Filter registry poisoned")?;
+    if let Some(existing) = filters.get(&filter_id) {
+        return if filter.name.is_some() && existing.name == filter.name {
+            Ok(())
+        } else if filter.name.is_some() && existing.name != filter.name {
+            Err(duplicate_error)
+        } else if existing.same_callbacks(filter) {
+            Ok(())
+        } else {
+            Err(duplicate_error)
+        };
+    }
+    filters.insert(filter_id, filter);
+    Ok(())
+}
+
+/// Register a global plugin filter under `filter_id`.
+///
+/// This mirrors C-Blosc2's internal plugin registration path: IDs 32..=159 are
+/// accepted for globally registered plugins, while user-defined IDs still use
+/// [`register_filter`]. Duplicate IDs are rejected because this Rust registry
+/// has no separate plugin name to distinguish an idempotent re-registration from
+/// an accidental replacement.
+pub fn register_global_filter(
+    filter_id: u8,
+    forward: FilterForwardFn,
+    backward: FilterBackwardFn,
+) -> Result<(), &'static str> {
+    register_filter_inner(
+        filter_id,
+        UserFilter {
+            name: None,
+            version: None,
+            forward: UserFilterForward::Infallible(forward),
+            backward: UserFilterBackward::Infallible(backward),
+        },
+        BLOSC2_GLOBAL_REGISTERED_FILTERS_START..=BLOSC2_GLOBAL_REGISTERED_FILTERS_STOP,
+        "Global plugin filter IDs must be in 32..=159",
+        "Global plugin filter ID already registered",
+    )
+}
+
+/// Register a named global plugin filter under `filter_id`.
+pub fn register_named_global_filter(
+    filter_id: u8,
+    name: &'static str,
+    forward: FilterForwardFn,
+    backward: FilterBackwardFn,
+) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("Global plugin filter name cannot be empty");
+    }
+    register_named_filter_inner(
+        filter_id,
+        UserFilter {
+            name: Some(name),
+            version: None,
+            forward: UserFilterForward::Infallible(forward),
+            backward: UserFilterBackward::Infallible(backward),
+        },
+        BLOSC2_GLOBAL_REGISTERED_FILTERS_START..=BLOSC2_GLOBAL_REGISTERED_FILTERS_STOP,
+        "Global plugin filter IDs must be in 32..=159",
+        "Global plugin filter ID already registered",
+    )
+}
+
+/// Register a named global plugin filter with C-style metadata.
+pub fn register_global_filter_with_metadata(
+    filter_id: u8,
+    name: &'static str,
+    version: u8,
+    forward: FilterForwardFn,
+    backward: FilterBackwardFn,
+) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("Global plugin filter name cannot be empty");
+    }
+    register_named_filter_inner(
+        filter_id,
+        UserFilter {
+            name: Some(name),
+            version: Some(version),
+            forward: UserFilterForward::Infallible(forward),
+            backward: UserFilterBackward::Infallible(backward),
+        },
+        BLOSC2_GLOBAL_REGISTERED_FILTERS_START..=BLOSC2_GLOBAL_REGISTERED_FILTERS_STOP,
+        "Global plugin filter IDs must be in 32..=159",
+        "Global plugin filter ID already registered",
+    )
+}
+
+/// Register a fallible global plugin filter under `filter_id`.
+///
+/// The callbacks return `0` on success and non-zero on failure, mirroring
+/// C-Blosc2's plugin callback convention.
+pub fn register_global_fallible_filter(
+    filter_id: u8,
+    forward: FallibleFilterForwardFn,
+    backward: FallibleFilterBackwardFn,
+) -> Result<(), &'static str> {
+    register_filter_inner(
+        filter_id,
+        UserFilter {
+            name: None,
+            version: None,
+            forward: UserFilterForward::Fallible(forward),
+            backward: UserFilterBackward::Fallible(backward),
+        },
+        BLOSC2_GLOBAL_REGISTERED_FILTERS_START..=BLOSC2_GLOBAL_REGISTERED_FILTERS_STOP,
+        "Global plugin filter IDs must be in 32..=159",
+        "Global plugin filter ID already registered",
+    )
+}
+
+/// Register a global plugin filter with C-compatible contextual callbacks.
+pub fn register_global_context_filter(
+    filter_id: u8,
+    forward: ContextFilterForwardFn,
+    backward: ContextFilterBackwardFn,
+) -> Result<(), &'static str> {
+    register_filter_inner(
+        filter_id,
+        UserFilter {
+            name: None,
+            version: None,
+            forward: UserFilterForward::Context(forward),
+            backward: UserFilterBackward::Context(backward),
+        },
+        BLOSC2_GLOBAL_REGISTERED_FILTERS_START..=BLOSC2_GLOBAL_REGISTERED_FILTERS_STOP,
+        "Global plugin filter IDs must be in 32..=159",
+        "Global plugin filter ID already registered",
+    )
+}
+
+/// Register a named fallible global plugin filter under `filter_id`.
+pub fn register_named_global_fallible_filter(
+    filter_id: u8,
+    name: &'static str,
+    forward: FallibleFilterForwardFn,
+    backward: FallibleFilterBackwardFn,
+) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("Global plugin filter name cannot be empty");
+    }
+    register_named_filter_inner(
+        filter_id,
+        UserFilter {
+            name: Some(name),
+            version: None,
+            forward: UserFilterForward::Fallible(forward),
+            backward: UserFilterBackward::Fallible(backward),
+        },
+        BLOSC2_GLOBAL_REGISTERED_FILTERS_START..=BLOSC2_GLOBAL_REGISTERED_FILTERS_STOP,
+        "Global plugin filter IDs must be in 32..=159",
+        "Global plugin filter ID already registered",
+    )
+}
+
+/// Register a named global plugin filter with C-compatible contextual callbacks.
+pub fn register_named_global_context_filter(
+    filter_id: u8,
+    name: &'static str,
+    forward: ContextFilterForwardFn,
+    backward: ContextFilterBackwardFn,
+) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("Global plugin filter name cannot be empty");
+    }
+    register_named_filter_inner(
+        filter_id,
+        UserFilter {
+            name: Some(name),
+            version: None,
+            forward: UserFilterForward::Context(forward),
+            backward: UserFilterBackward::Context(backward),
+        },
+        BLOSC2_GLOBAL_REGISTERED_FILTERS_START..=BLOSC2_GLOBAL_REGISTERED_FILTERS_STOP,
+        "Global plugin filter IDs must be in 32..=159",
+        "Global plugin filter ID already registered",
+    )
+}
+
+/// Register a named fallible global plugin filter with C-style metadata.
+pub fn register_global_fallible_filter_with_metadata(
+    filter_id: u8,
+    name: &'static str,
+    version: u8,
+    forward: FallibleFilterForwardFn,
+    backward: FallibleFilterBackwardFn,
+) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("Global plugin filter name cannot be empty");
+    }
+    register_named_filter_inner(
+        filter_id,
+        UserFilter {
+            name: Some(name),
+            version: Some(version),
+            forward: UserFilterForward::Fallible(forward),
+            backward: UserFilterBackward::Fallible(backward),
+        },
+        BLOSC2_GLOBAL_REGISTERED_FILTERS_START..=BLOSC2_GLOBAL_REGISTERED_FILTERS_STOP,
+        "Global plugin filter IDs must be in 32..=159",
+        "Global plugin filter ID already registered",
+    )
+}
+
+/// Register a named global plugin filter with C-style metadata and contextual callbacks.
+pub fn register_global_context_filter_with_metadata(
+    filter_id: u8,
+    name: &'static str,
+    version: u8,
+    forward: ContextFilterForwardFn,
+    backward: ContextFilterBackwardFn,
+) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("Global plugin filter name cannot be empty");
+    }
+    register_named_filter_inner(
+        filter_id,
+        UserFilter {
+            name: Some(name),
+            version: Some(version),
+            forward: UserFilterForward::Context(forward),
+            backward: UserFilterBackward::Context(backward),
+        },
+        BLOSC2_GLOBAL_REGISTERED_FILTERS_START..=BLOSC2_GLOBAL_REGISTERED_FILTERS_STOP,
+        "Global plugin filter IDs must be in 32..=159",
+        "Global plugin filter ID already registered",
+    )
 }
 
 /// Return `true` if a user-defined filter has been registered under `filter_id`.
 pub fn is_registered_filter(filter_id: u8) -> bool {
+    ensure_known_global_filters_registered();
     user_filters()
         .read()
         .is_ok_and(|filters| filters.contains_key(&filter_id))
 }
 
+/// Return the name/version descriptor for a C-shaped registered filter.
+pub fn registered_filter_info(filter_id: u8) -> Option<(&'static str, u8)> {
+    ensure_known_global_filters_registered();
+    user_filters().read().ok().and_then(|filters| {
+        let filter = filters.get(&filter_id)?;
+        Some((filter.name?, filter.version?))
+    })
+}
+
 /// Look up a previously [`register_filter`]-ed callback pair by ID.
 fn registered_filter(filter_id: u8) -> Option<UserFilter> {
+    ensure_known_global_filters_registered();
     user_filters()
         .read()
         .ok()
@@ -154,6 +1461,44 @@ pub fn unshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
         let start = blocksize - neblock_rem;
         dest[start..blocksize].copy_from_slice(&src[start..blocksize]);
     }
+}
+
+fn validate_raw_filter_args(
+    typesize: i32,
+    blocksize: i32,
+    src_len: usize,
+    dest_len: usize,
+) -> Result<usize, i32> {
+    if !(1..=256).contains(&typesize) || blocksize < 0 {
+        return Err(BLOSC2_ERROR_INVALID_PARAM);
+    }
+    let blocksize = blocksize as usize;
+    if src_len < blocksize || dest_len < blocksize {
+        return Err(BLOSC2_ERROR_INVALID_PARAM);
+    }
+    Ok(blocksize)
+}
+
+/// C-style raw shuffle wrapper: returns `blocksize` on success or a negative
+/// `BLOSC2_ERROR_*` code on invalid parameters.
+pub fn blosc2_shuffle(typesize: i32, blocksize: i32, src: &[u8], dest: &mut [u8]) -> i32 {
+    let blocksize = match validate_raw_filter_args(typesize, blocksize, src.len(), dest.len()) {
+        Ok(blocksize) => blocksize,
+        Err(code) => return code,
+    };
+    shuffle(typesize as usize, &src[..blocksize], &mut dest[..blocksize]);
+    blocksize as i32
+}
+
+/// C-style raw unshuffle wrapper: returns `blocksize` on success or a negative
+/// `BLOSC2_ERROR_*` code on invalid parameters.
+pub fn blosc2_unshuffle(typesize: i32, blocksize: i32, src: &[u8], dest: &mut [u8]) -> i32 {
+    let blocksize = match validate_raw_filter_args(typesize, blocksize, src.len(), dest.len()) {
+        Ok(blocksize) => blocksize,
+        Err(code) => return code,
+    };
+    unshuffle(typesize as usize, &src[..blocksize], &mut dest[..blocksize]);
+    blocksize as i32
 }
 
 /// Fast path for the common element sizes 2, 4, and 8. Returns `false`
@@ -1333,6 +2678,37 @@ pub fn bitunshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) -> i64 {
     bitunshuffle_with_format_version(typesize, src, dest, BLOSC2_VERSION_FORMAT)
 }
 
+/// C-style raw bitshuffle wrapper: returns `blocksize` on success or a
+/// negative `BLOSC2_ERROR_*` code on invalid parameters.
+pub fn blosc2_bitshuffle(typesize: i32, blocksize: i32, src: &[u8], dest: &mut [u8]) -> i32 {
+    let blocksize = match validate_raw_filter_args(typesize, blocksize, src.len(), dest.len()) {
+        Ok(blocksize) => blocksize,
+        Err(code) => return code,
+    };
+    if bitshuffle(typesize as usize, &src[..blocksize], &mut dest[..blocksize]) == blocksize as i64
+    {
+        blocksize as i32
+    } else {
+        BLOSC2_ERROR_INVALID_PARAM
+    }
+}
+
+/// C-style raw bitunshuffle wrapper: returns `blocksize` on success or a
+/// negative `BLOSC2_ERROR_*` code on invalid parameters.
+pub fn blosc2_bitunshuffle(typesize: i32, blocksize: i32, src: &[u8], dest: &mut [u8]) -> i32 {
+    let blocksize = match validate_raw_filter_args(typesize, blocksize, src.len(), dest.len()) {
+        Ok(blocksize) => blocksize,
+        Err(code) => return code,
+    };
+    if bitunshuffle(typesize as usize, &src[..blocksize], &mut dest[..blocksize])
+        == blocksize as i64
+    {
+        blocksize as i32
+    } else {
+        BLOSC2_ERROR_INVALID_PARAM
+    }
+}
+
 /// Like [`bitunshuffle`], but accepts a caller-provided scratch buffer to
 /// avoid per-call allocation.
 pub fn bitunshuffle_with_scratch(
@@ -1460,9 +2836,6 @@ pub fn delta_encode(
         for i in effective_typesize..main_len {
             dest[i] = src[i] ^ dref[i - effective_typesize];
         }
-        if main_len < nbytes {
-            dest[main_len..nbytes].copy_from_slice(&src[main_len..nbytes]);
-        }
     } else {
         // Non-reference block: delta against dref.
         if dref.len() < main_len {
@@ -1470,9 +2843,6 @@ pub fn delta_encode(
         }
         for i in 0..main_len {
             dest[i] = src[i] ^ dref[i];
-        }
-        if main_len < nbytes {
-            dest[main_len..nbytes].copy_from_slice(&src[main_len..nbytes]);
         }
     }
 }
@@ -1532,6 +2902,15 @@ pub fn delta_decode(
 ///
 /// Returns the index (1 or 2) of the buffer holding the final output, or 1
 /// after a no-op copy when no filters are active.
+#[derive(Debug, Clone, Copy)]
+pub struct FilterPipelineContext<'a> {
+    pub cparams: Option<&'a FilterCParamsContext>,
+    pub dparams: Option<&'a FilterDParamsContext>,
+    pub chunk: FilterChunkContext,
+    pub b2nd_metalayer: Option<&'a [u8]>,
+    pub user_data: usize,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn pipeline_forward(
     src: &[u8],
@@ -1543,10 +2922,50 @@ pub fn pipeline_forward(
     block_offset: usize,
     dref: Option<&[u8]>,
 ) -> usize {
+    pipeline_forward_with_context(
+        src,
+        buf1,
+        buf2,
+        filters,
+        filters_meta,
+        typesize,
+        block_offset,
+        dref,
+        None,
+    )
+}
+
+/// Apply the configured filter pipeline in encode order with plugin context.
+#[allow(clippy::too_many_arguments)]
+pub fn pipeline_forward_with_context(
+    src: &[u8],
+    buf1: &mut [u8],
+    buf2: &mut [u8],
+    filters: &[u8; BLOSC2_MAX_FILTERS],
+    filters_meta: &[u8; BLOSC2_MAX_FILTERS],
+    typesize: usize,
+    block_offset: usize,
+    dref: Option<&[u8]>,
+    context: Option<FilterPipelineContext<'_>>,
+) -> usize {
     let bsize = src.len();
     if buf1.len() < bsize || buf2.len() < bsize {
         return 0;
     }
+    let base_context = context.unwrap_or(FilterPipelineContext {
+        cparams: None,
+        dparams: None,
+        chunk: FilterChunkContext {
+            schunk: 0,
+            nchunk: -1,
+            nblock: -1,
+            block_offset,
+            blocksize: bsize,
+            bsize,
+        },
+        b2nd_metalayer: None,
+        user_data: 0,
+    });
 
     // Track current data location: 0 = src (read-only), 1 = buf1, 2 = buf2
     // Start from src without copying — first filter reads src directly.
@@ -1581,7 +3000,9 @@ pub fn pipeline_forward(
                 shuffle(ts, inp, out);
             }
             BLOSC_BITSHUFFLE => {
-                bitshuffle(typesize, inp, out);
+                if bitshuffle(typesize, inp, out) != bsize as i64 {
+                    return 0;
+                }
             }
             BLOSC_DELTA => {
                 let actual_dref = dref.unwrap_or(src);
@@ -1597,8 +3018,33 @@ pub fn pipeline_forward(
                 }
             }
             _ => {
-                if let Some(filter) = registered_filter(filter) {
-                    (filter.forward)(filters_meta[i], typesize, block_offset, inp, out);
+                if let Some(user_filter) = registered_filter(filter) {
+                    let mut callback_context = FilterCallbackContext {
+                        filter_id: filter,
+                        filter_slot: i,
+                        meta: filters_meta[i],
+                        typesize,
+                        cparams: base_context.cparams,
+                        dparams: base_context.dparams,
+                        chunk: FilterChunkContext {
+                            block_offset,
+                            bsize,
+                            ..base_context.chunk
+                        },
+                        b2nd_metalayer: base_context.b2nd_metalayer,
+                        user_data: base_context.user_data,
+                    };
+                    if user_filter.forward.run(
+                        &mut callback_context,
+                        filters_meta[i],
+                        typesize,
+                        block_offset,
+                        inp,
+                        out,
+                    ) != 0
+                    {
+                        return 0;
+                    }
                 } else {
                     out.copy_from_slice(inp);
                     return 0;
@@ -1640,12 +3086,56 @@ pub fn pipeline_backward(
     dref: Option<&[u8]>,
     current_buf: usize,
 ) -> usize {
+    pipeline_backward_with_context(
+        buf1,
+        buf2,
+        bsize,
+        filters,
+        filters_meta,
+        format_version,
+        typesize,
+        block_offset,
+        dref,
+        current_buf,
+        None,
+    )
+}
+
+/// Apply the configured filter pipeline in decode order with plugin context.
+#[allow(clippy::too_many_arguments)]
+pub fn pipeline_backward_with_context(
+    buf1: &mut [u8],
+    buf2: &mut [u8],
+    bsize: usize,
+    filters: &[u8; BLOSC2_MAX_FILTERS],
+    filters_meta: &[u8; BLOSC2_MAX_FILTERS],
+    format_version: u8,
+    typesize: usize,
+    block_offset: usize,
+    dref: Option<&[u8]>,
+    current_buf: usize,
+    context: Option<FilterPipelineContext<'_>>,
+) -> usize {
     if current_buf != 1 && current_buf != 2 {
         return 0;
     }
     if buf1.len() < bsize || buf2.len() < bsize {
         return 0;
     }
+    let base_context = context.unwrap_or(FilterPipelineContext {
+        cparams: None,
+        dparams: None,
+        chunk: FilterChunkContext {
+            schunk: 0,
+            nchunk: -1,
+            nblock: -1,
+            block_offset,
+            blocksize: bsize,
+            bsize,
+        },
+        b2nd_metalayer: None,
+        user_data: 0,
+    });
     let mut current = current_buf as u8;
 
     // Filters applied in reverse order
@@ -1671,7 +3161,11 @@ pub fn pipeline_backward(
                 unshuffle(ts, inp, out);
             }
             BLOSC_BITSHUFFLE => {
-                bitunshuffle_with_format_version(typesize, inp, out, format_version);
+                if bitunshuffle_with_format_version(typesize, inp, out, format_version)
+                    != bsize as i64
+                {
+                    return 0;
+                }
             }
             BLOSC_DELTA => {
                 // Delta decode: copy data to output, then decode in-place
@@ -1683,8 +3177,33 @@ pub fn pipeline_backward(
                 out.copy_from_slice(inp);
             }
             _ => {
-                if let Some(filter_fn) = registered_filter(filter) {
-                    (filter_fn.backward)(filters_meta[i], typesize, block_offset, inp, out);
+                if let Some(user_filter) = registered_filter(filter) {
+                    let mut callback_context = FilterCallbackContext {
+                        filter_id: filter,
+                        filter_slot: i,
+                        meta: filters_meta[i],
+                        typesize,
+                        cparams: base_context.cparams,
+                        dparams: base_context.dparams,
+                        chunk: FilterChunkContext {
+                            block_offset,
+                            bsize,
+                            ..base_context.chunk
+                        },
+                        b2nd_metalayer: base_context.b2nd_metalayer,
+                        user_data: base_context.user_data,
+                    };
+                    if user_filter.backward.run(
+                        &mut callback_context,
+                        filters_meta[i],
+                        typesize,
+                        block_offset,
+                        inp,
+                        out,
+                    ) != 0
+                    {
+                        return 0;
+                    }
                 } else {
                     out.copy_from_slice(inp);
                     return 0;
@@ -1759,11 +3278,6 @@ fn trunc_prec_forward(src: &[u8], dest: &mut [u8], typesize: usize, prec_bits: i
         _ => unreachable!(),
     }
 
-    // Copy any leftover bytes that don't form a complete element.
-    let tail_start = n_elements * typesize;
-    if tail_start < len {
-        dest[tail_start..len].copy_from_slice(&src[tail_start..]);
-    }
     true
 }
 
@@ -1801,6 +3315,565 @@ mod tests {
             }
         }
         dest[tail_start..blocksize].copy_from_slice(&src[tail_start..blocksize]);
+    }
+
+    fn copy_filter(_meta: u8, _typesize: usize, _block_offset: usize, src: &[u8], dest: &mut [u8]) {
+        dest.copy_from_slice(src);
+    }
+
+    fn reverse_filter(
+        _meta: u8,
+        _typesize: usize,
+        _block_offset: usize,
+        src: &[u8],
+        dest: &mut [u8],
+    ) {
+        for (dst, src) in dest.iter_mut().zip(src.iter().rev()) {
+            *dst = *src;
+        }
+    }
+
+    fn copy_fallible_filter(
+        _meta: u8,
+        _typesize: usize,
+        _block_offset: usize,
+        src: &[u8],
+        dest: &mut [u8],
+    ) -> i32 {
+        dest.copy_from_slice(src);
+        0
+    }
+
+    fn failing_fallible_filter(
+        _meta: u8,
+        _typesize: usize,
+        _block_offset: usize,
+        src: &[u8],
+        dest: &mut [u8],
+    ) -> i32 {
+        dest.copy_from_slice(src);
+        -1
+    }
+
+    fn zero_fallible_filter(
+        _meta: u8,
+        _typesize: usize,
+        _block_offset: usize,
+        _src: &[u8],
+        dest: &mut [u8],
+    ) -> i32 {
+        dest.fill(0);
+        0
+    }
+
+    #[test]
+    fn test_c_style_raw_filter_wrappers() {
+        let data: Vec<u8> = (0..64).collect();
+        let mut tmp = vec![0u8; data.len()];
+        let mut restored = vec![0u8; data.len()];
+
+        assert_eq!(blosc2_shuffle(4, data.len() as i32, &data, &mut tmp), 64);
+        assert_eq!(
+            blosc2_unshuffle(4, data.len() as i32, &tmp, &mut restored),
+            64
+        );
+        assert_eq!(restored, data);
+
+        assert_eq!(blosc2_bitshuffle(4, data.len() as i32, &data, &mut tmp), 64);
+        assert_eq!(
+            blosc2_bitunshuffle(4, data.len() as i32, &tmp, &mut restored),
+            64
+        );
+        assert_eq!(restored, data);
+
+        assert_eq!(blosc2_shuffle(1, data.len() as i32, &data, &mut tmp), 64);
+        assert_eq!(tmp, data);
+        tmp.fill(0);
+        assert_eq!(blosc2_unshuffle(1, data.len() as i32, &data, &mut tmp), 64);
+        assert_eq!(tmp, data);
+        tmp.fill(0);
+        restored.fill(0);
+        assert_eq!(blosc2_bitshuffle(1, data.len() as i32, &data, &mut tmp), 64);
+        assert_eq!(
+            blosc2_bitunshuffle(1, data.len() as i32, &tmp, &mut restored),
+            64
+        );
+        assert_eq!(restored, data);
+
+        let wide_data: Vec<u8> = (0..512).map(|idx| (idx % 251) as u8).collect();
+        let mut wide_tmp = vec![0u8; wide_data.len()];
+        let mut wide_restored = vec![0u8; wide_data.len()];
+        assert_eq!(
+            blosc2_shuffle(256, wide_data.len() as i32, &wide_data, &mut wide_tmp),
+            512
+        );
+        assert_eq!(
+            blosc2_unshuffle(256, wide_data.len() as i32, &wide_tmp, &mut wide_restored),
+            512
+        );
+        assert_eq!(wide_restored, wide_data);
+        assert_eq!(
+            blosc2_bitshuffle(4, -1, &data, &mut tmp),
+            BLOSC2_ERROR_INVALID_PARAM
+        );
+        assert_eq!(
+            blosc2_bitunshuffle(4, data.len() as i32, &data, &mut restored[..4]),
+            BLOSC2_ERROR_INVALID_PARAM
+        );
+    }
+
+    #[test]
+    fn test_register_filter_rejects_c_global_registered_ids() {
+        assert_eq!(BLOSC_FILTER_NDCELL, BLOSC2_GLOBAL_REGISTERED_FILTERS_START);
+        assert_eq!(BLOSC_FILTER_NDMEAN, BLOSC_FILTER_NDCELL + 1);
+        assert_eq!(BLOSC_FILTER_BYTEDELTA_BUGGY, BLOSC_FILTER_NDCELL + 2);
+        assert_eq!(BLOSC_FILTER_BYTEDELTA, BLOSC_FILTER_NDCELL + 3);
+        assert_eq!(BLOSC_FILTER_INT_TRUNC, BLOSC_FILTER_NDCELL + 4);
+        assert_eq!(
+            BLOSC2_USER_REGISTERED_FILTERS_START,
+            BLOSC2_USER_DEFINED_FILTERS_START
+        );
+        assert_eq!(BLOSC2_USER_REGISTERED_FILTERS_STOP, u8::MAX);
+        let c_filter = Blosc2Filter {
+            id: BLOSC2_USER_DEFINED_FILTERS_START + 70,
+            name: "copy",
+            version: 1,
+            forward: copy_fallible_filter,
+            backward: copy_fallible_filter,
+        };
+        assert_eq!(blosc2_register_filter(&c_filter), BLOSC2_ERROR_SUCCESS);
+        assert_eq!(blosc2_register_filter_c(None), BLOSC2_ERROR_INVALID_PARAM);
+        assert_eq!(
+            blosc2_register_filter_c(Some(&c_filter)),
+            BLOSC2_ERROR_SUCCESS
+        );
+        assert!(is_registered_filter(c_filter.id));
+        assert_eq!(registered_filter_info(c_filter.id), Some(("copy", 1)));
+        let same_name_different_callbacks = Blosc2Filter {
+            forward: zero_fallible_filter,
+            backward: zero_fallible_filter,
+            ..c_filter
+        };
+        assert_eq!(
+            blosc2_register_filter(&same_name_different_callbacks),
+            BLOSC2_ERROR_SUCCESS
+        );
+        let same_id_different_name = Blosc2Filter {
+            name: "other-copy",
+            ..same_name_different_callbacks
+        };
+        assert_eq!(
+            blosc2_register_filter(&same_id_different_name),
+            BLOSC2_ERROR_FAILURE
+        );
+        let invalid_c_filter = Blosc2Filter {
+            id: BLOSC2_GLOBAL_REGISTERED_FILTERS_START,
+            ..c_filter
+        };
+        assert_eq!(
+            blosc2_register_filter(&invalid_c_filter),
+            BLOSC2_ERROR_FAILURE
+        );
+        assert_eq!(
+            register_filter(
+                BLOSC2_GLOBAL_REGISTERED_FILTERS_START,
+                copy_filter,
+                copy_filter
+            ),
+            Err("User-defined filter IDs must be >= 160")
+        );
+        assert_eq!(
+            register_filter(159, copy_filter, copy_filter),
+            Err("User-defined filter IDs must be >= 160")
+        );
+        assert!(
+            register_filter(BLOSC2_USER_DEFINED_FILTERS_START, copy_filter, copy_filter).is_ok()
+        );
+        assert!(is_registered_filter(BLOSC2_USER_DEFINED_FILTERS_START));
+        assert!(
+            register_filter(BLOSC2_USER_DEFINED_FILTERS_START, copy_filter, copy_filter).is_ok()
+        );
+        assert_eq!(
+            register_filter(
+                BLOSC2_USER_DEFINED_FILTERS_START,
+                reverse_filter,
+                copy_filter
+            ),
+            Err("User-defined filter ID already registered")
+        );
+        assert_eq!(
+            register_filter(BLOSC_TRUNC_PREC, copy_filter, copy_filter),
+            Err("User-defined filter IDs must be >= 160")
+        );
+    }
+
+    #[test]
+    fn test_known_global_plugin_filters_have_c_metadata() {
+        let expected = [
+            (BLOSC_FILTER_NDCELL, "ndcell"),
+            (BLOSC_FILTER_NDMEAN, "ndmean"),
+            (BLOSC_FILTER_BYTEDELTA_BUGGY, "bytedelta_buggy"),
+            (BLOSC_FILTER_BYTEDELTA, "bytedelta"),
+            (BLOSC_FILTER_INT_TRUNC, "int_trunc"),
+        ];
+
+        for (filter_id, name) in expected {
+            assert!(is_known_global_filter(filter_id));
+            assert_eq!(known_global_filter_info(filter_id), Some((name, 1)));
+            assert!(is_registered_filter(filter_id));
+            assert_eq!(registered_filter_info(filter_id), Some((name, 1)));
+        }
+        assert!(!is_known_global_filter(BLOSC_FILTER_INT_TRUNC + 1));
+        assert_eq!(known_global_filter_info(BLOSC_FILTER_INT_TRUNC + 1), None);
+    }
+
+    #[test]
+    fn test_ndcell_ndmean_are_marked_b2nd_metadata_bound() {
+        for filter in [BLOSC_FILTER_NDCELL, BLOSC_FILTER_NDMEAN] {
+            assert!(is_known_global_filter(filter));
+            assert!(is_registered_filter(filter));
+            assert!(global_filter_requires_b2nd_metadata(filter));
+
+            let mut filters = [0; BLOSC2_MAX_FILTERS];
+            let mut filters_meta = [0; BLOSC2_MAX_FILTERS];
+            filters[BLOSC2_MAX_FILTERS - 2] = filter;
+            filters_meta[BLOSC2_MAX_FILTERS - 2] = 4;
+
+            let src = vec![0u8; 64];
+            let mut buf1 = vec![0u8; src.len()];
+            let mut buf2 = vec![0u8; src.len()];
+            assert_eq!(
+                pipeline_forward(
+                    &src,
+                    &mut buf1,
+                    &mut buf2,
+                    &filters,
+                    &filters_meta,
+                    4,
+                    0,
+                    None
+                ),
+                0
+            );
+        }
+
+        assert!(!global_filter_requires_b2nd_metadata(
+            BLOSC_FILTER_BYTEDELTA
+        ));
+        assert!(!global_filter_requires_b2nd_metadata(
+            BLOSC_FILTER_INT_TRUNC
+        ));
+    }
+
+    #[test]
+    fn test_bytedelta_global_filter_roundtrips_byte_streams() {
+        let src: Vec<u8> = (0..130)
+            .flat_map(|idx| (idx as u32).wrapping_mul(17).to_ne_bytes())
+            .collect();
+        let filters = [0, 0, 0, 0, 0, BLOSC_FILTER_BYTEDELTA];
+        let mut filters_meta = [0; BLOSC2_MAX_FILTERS];
+        filters_meta[BLOSC2_MAX_FILTERS - 1] = 4;
+        let mut encoded = vec![0u8; src.len()];
+        let mut scratch = vec![0u8; src.len()];
+        let current = pipeline_forward(
+            &src,
+            &mut encoded,
+            &mut scratch,
+            &filters,
+            &filters_meta,
+            4,
+            0,
+            None,
+        );
+        assert_ne!(current, 0);
+        let encoded = if current == 1 { encoded } else { scratch };
+        assert_ne!(encoded, src);
+
+        let mut decoded = encoded.clone();
+        let mut scratch = vec![0u8; src.len()];
+        let current = pipeline_backward(
+            &mut decoded,
+            &mut scratch,
+            src.len(),
+            &filters,
+            &filters_meta,
+            BLOSC2_VERSION_FORMAT,
+            4,
+            0,
+            None,
+            1,
+        );
+        assert_ne!(current, 0);
+        let decoded = if current == 1 { decoded } else { scratch };
+        assert_eq!(decoded, src);
+    }
+
+    #[test]
+    fn test_bytedelta_buggy_matches_legacy_simd_tail_split() {
+        let src: Vec<u8> = (0..70).map(|idx| (idx * 7 + 3) as u8).collect();
+        let filters = [0, 0, 0, 0, 0, BLOSC_FILTER_BYTEDELTA_BUGGY];
+        let mut filters_meta = [0; BLOSC2_MAX_FILTERS];
+        filters_meta[BLOSC2_MAX_FILTERS - 1] = 2;
+        let mut encoded = vec![0u8; src.len()];
+        let mut scratch = vec![0u8; src.len()];
+        let current = pipeline_forward(
+            &src,
+            &mut encoded,
+            &mut scratch,
+            &filters,
+            &filters_meta,
+            2,
+            0,
+            None,
+        );
+        assert_ne!(current, 0);
+        let encoded = if current == 1 { encoded } else { scratch };
+
+        let stream_len = src.len() / 2;
+        let tail_start = stream_len - (stream_len % 16);
+        assert_eq!(encoded[tail_start], src[tail_start]);
+        assert_eq!(
+            encoded[stream_len + tail_start],
+            src[stream_len + tail_start]
+        );
+
+        let mut decoded = encoded.clone();
+        let mut scratch = vec![0u8; src.len()];
+        let current = pipeline_backward(
+            &mut decoded,
+            &mut scratch,
+            src.len(),
+            &filters,
+            &filters_meta,
+            BLOSC2_VERSION_FORMAT,
+            2,
+            0,
+            None,
+            1,
+        );
+        assert_ne!(current, 0);
+        let decoded = if current == 1 { decoded } else { scratch };
+        assert_eq!(decoded, src);
+    }
+
+    #[test]
+    fn test_int_trunc_global_filter_truncates_integer_precision() {
+        let values = [0x1234_5678u32, 0xFFFF_FFFF, 0x0000_0001, 0x8765_4321];
+        let src: Vec<u8> = values.into_iter().flat_map(u32::to_ne_bytes).collect();
+        let filters = [0, 0, 0, 0, 0, BLOSC_FILTER_INT_TRUNC];
+        let mut filters_meta = [0; BLOSC2_MAX_FILTERS];
+        filters_meta[BLOSC2_MAX_FILTERS - 1] = 20;
+        let mut encoded = vec![0u8; src.len()];
+        let mut scratch = vec![0u8; src.len()];
+        let current = pipeline_forward(
+            &src,
+            &mut encoded,
+            &mut scratch,
+            &filters,
+            &filters_meta,
+            4,
+            0,
+            None,
+        );
+        assert_ne!(current, 0);
+        let encoded = if current == 1 { encoded } else { scratch };
+
+        let expected: Vec<u8> = [0x1234_5000u32, 0xFFFF_F000, 0, 0x8765_4000]
+            .into_iter()
+            .flat_map(u32::to_ne_bytes)
+            .collect();
+        assert_eq!(encoded, expected);
+
+        let mut decoded = encoded.clone();
+        let mut scratch = vec![0u8; src.len()];
+        let current = pipeline_backward(
+            &mut decoded,
+            &mut scratch,
+            src.len(),
+            &filters,
+            &filters_meta,
+            BLOSC2_VERSION_FORMAT,
+            4,
+            0,
+            None,
+            1,
+        );
+        assert_ne!(current, 0);
+        let decoded = if current == 1 { decoded } else { scratch };
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn test_register_global_filter_accepts_c_global_registered_ids() {
+        const FILTER_ID: u8 = BLOSC2_GLOBAL_REGISTERED_FILTERS_START + 7;
+
+        assert_eq!(
+            register_global_filter(BLOSC_TRUNC_PREC, copy_filter, copy_filter),
+            Err("Global plugin filter IDs must be in 32..=159")
+        );
+        assert!(register_global_filter(FILTER_ID, copy_filter, copy_filter).is_ok());
+        assert!(is_registered_filter(FILTER_ID));
+        assert!(register_global_filter(FILTER_ID, copy_filter, copy_filter).is_ok());
+        assert_eq!(
+            register_global_filter(FILTER_ID, copy_filter, reverse_filter),
+            Err("Global plugin filter ID already registered")
+        );
+        const NAMED_FILTER_ID: u8 = BLOSC2_GLOBAL_REGISTERED_FILTERS_START + 8;
+        assert!(register_named_global_filter(
+            NAMED_FILTER_ID,
+            "named-global-copy",
+            copy_filter,
+            copy_filter
+        )
+        .is_ok());
+        assert!(register_named_global_filter(
+            NAMED_FILTER_ID,
+            "named-global-copy",
+            reverse_filter,
+            reverse_filter
+        )
+        .is_ok());
+        assert_eq!(
+            register_named_global_filter(
+                NAMED_FILTER_ID,
+                "other-named-global-copy",
+                reverse_filter,
+                reverse_filter
+            ),
+            Err("Global plugin filter ID already registered")
+        );
+        assert_eq!(
+            register_named_global_filter(
+                NAMED_FILTER_ID,
+                "third-named-global-copy",
+                copy_filter,
+                copy_filter
+            ),
+            Err("Global plugin filter ID already registered")
+        );
+        const METADATA_FILTER_ID: u8 = BLOSC2_GLOBAL_REGISTERED_FILTERS_START + 70;
+        assert_eq!(
+            register_global_filter_with_metadata(
+                METADATA_FILTER_ID,
+                "global-copy",
+                3,
+                copy_filter,
+                copy_filter,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            registered_filter_info(METADATA_FILTER_ID),
+            Some(("global-copy", 3))
+        );
+        assert_eq!(
+            register_global_fallible_filter_with_metadata(
+                METADATA_FILTER_ID + 1,
+                "global-fallible-copy",
+                4,
+                copy_fallible_filter,
+                copy_fallible_filter,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            registered_filter_info(METADATA_FILTER_ID + 1),
+            Some(("global-fallible-copy", 4))
+        );
+        assert_eq!(
+            register_global_filter(BLOSC2_USER_DEFINED_FILTERS_START, copy_filter, copy_filter),
+            Err("Global plugin filter IDs must be in 32..=159")
+        );
+    }
+
+    #[test]
+    fn test_fallible_filter_callbacks_can_fail_pipeline() {
+        const FORWARD_FAIL_ID: u8 = BLOSC2_USER_DEFINED_FILTERS_START + 30;
+        const BACKWARD_FAIL_ID: u8 = BLOSC2_USER_DEFINED_FILTERS_START + 31;
+        register_fallible_filter(
+            FORWARD_FAIL_ID,
+            failing_fallible_filter,
+            copy_fallible_filter,
+        )
+        .unwrap();
+        assert!(register_fallible_filter(
+            FORWARD_FAIL_ID,
+            failing_fallible_filter,
+            copy_fallible_filter,
+        )
+        .is_ok());
+        assert_eq!(
+            register_fallible_filter(FORWARD_FAIL_ID, copy_fallible_filter, copy_fallible_filter),
+            Err("User-defined filter ID already registered")
+        );
+        register_fallible_filter(
+            BACKWARD_FAIL_ID,
+            copy_fallible_filter,
+            failing_fallible_filter,
+        )
+        .unwrap();
+
+        let src = [1u8, 2, 3, 4];
+        let mut buf1 = [0u8; 4];
+        let mut buf2 = [0u8; 4];
+        let mut filters = [BLOSC_NOFILTER; BLOSC2_MAX_FILTERS];
+        let meta = [0u8; BLOSC2_MAX_FILTERS];
+
+        filters[BLOSC2_MAX_FILTERS - 1] = FORWARD_FAIL_ID;
+        assert_eq!(
+            pipeline_forward(&src, &mut buf1, &mut buf2, &filters, &meta, 1, 0, None),
+            0
+        );
+
+        filters[BLOSC2_MAX_FILTERS - 1] = BACKWARD_FAIL_ID;
+        buf1.copy_from_slice(&src);
+        assert_eq!(
+            pipeline_backward(&mut buf1, &mut buf2, 4, &filters, &meta, 1, 1, 0, None, 1),
+            0
+        );
+    }
+
+    #[test]
+    fn test_register_global_fallible_filter_accepts_c_global_registered_ids() {
+        const FILTER_ID: u8 = BLOSC2_GLOBAL_REGISTERED_FILTERS_START + 11;
+
+        assert_eq!(
+            register_global_fallible_filter(
+                BLOSC_TRUNC_PREC,
+                copy_fallible_filter,
+                copy_fallible_filter
+            ),
+            Err("Global plugin filter IDs must be in 32..=159")
+        );
+        assert!(register_global_fallible_filter(
+            FILTER_ID,
+            copy_fallible_filter,
+            copy_fallible_filter
+        )
+        .is_ok());
+        assert!(is_registered_filter(FILTER_ID));
+        assert!(register_global_fallible_filter(
+            FILTER_ID,
+            copy_fallible_filter,
+            copy_fallible_filter
+        )
+        .is_ok());
+        assert_eq!(
+            register_global_fallible_filter(
+                FILTER_ID,
+                failing_fallible_filter,
+                copy_fallible_filter
+            ),
+            Err("Global plugin filter ID already registered")
+        );
+        assert_eq!(
+            register_global_fallible_filter(
+                BLOSC2_USER_DEFINED_FILTERS_START,
+                copy_fallible_filter,
+                copy_fallible_filter
+            ),
+            Err("Global plugin filter IDs must be in 32..=159")
+        );
     }
 
     #[test]
@@ -2121,7 +4194,7 @@ mod tests {
     }
 
     #[test]
-    fn test_delta_preserves_partial_tail_for_fixed_widths() {
+    fn test_delta_leaves_partial_tail_unwritten_for_fixed_widths() {
         for typesize in [2usize, 4, 8] {
             let nbytes = typesize * 3 + (typesize - 1);
             let src: Vec<u8> = (0..nbytes)
@@ -2132,29 +4205,21 @@ mod tests {
                 .collect();
             let main_len = nbytes - (nbytes % typesize);
 
-            let mut encoded = vec![0u8; nbytes];
+            let mut encoded = vec![0xA5; nbytes];
             delta_encode(&dref, 1, nbytes, typesize, &src, &mut encoded);
             assert_eq!(
                 &encoded[main_len..],
-                &src[main_len..],
-                "delta_encode must leave partial tail bytes unchanged for typesize={typesize}"
+                vec![0xA5; nbytes - main_len].as_slice(),
+                "delta_encode must leave partial tail bytes unwritten for typesize={typesize}"
             );
 
-            let mut decoded = encoded.clone();
-            delta_decode(Some(&dref), 1, nbytes, typesize, &mut decoded);
-            assert_eq!(decoded, src);
-
-            let mut ref_encoded = vec![0u8; nbytes];
+            let mut ref_encoded = vec![0xA5; nbytes];
             delta_encode(&src, 0, nbytes, typesize, &src, &mut ref_encoded);
             assert_eq!(
                 &ref_encoded[main_len..],
-                &src[main_len..],
-                "reference-block delta must leave partial tail bytes unchanged for typesize={typesize}"
+                vec![0xA5; nbytes - main_len].as_slice(),
+                "reference-block delta must leave partial tail bytes unwritten for typesize={typesize}"
             );
-
-            let mut ref_decoded = ref_encoded;
-            delta_decode(None, 0, nbytes, typesize, &mut ref_decoded);
-            assert_eq!(ref_decoded, src);
         }
     }
 
@@ -2245,7 +4310,7 @@ mod tests {
         let src: Vec<u8> = (0..16).collect();
         let mut buf1 = vec![0u8; 16];
         let mut buf2 = vec![0u8; 16];
-        let filters = [BLOSC2_USER_DEFINED_FILTERS_START, 0, 0, 0, 0, 0];
+        let filters = [BLOSC2_USER_DEFINED_FILTERS_START - 1, 0, 0, 0, 0, 0];
         let filters_meta = [0; BLOSC2_MAX_FILTERS];
 
         assert_eq!(
@@ -2319,14 +4384,56 @@ mod tests {
     }
 
     #[test]
-    fn test_trunc_prec_preserves_tail_bytes() {
+    fn test_pipeline_rejects_invalid_bitshuffle_typesize() {
+        let src: Vec<u8> = (0..16).collect();
+        let mut buf1 = vec![0xA5; 16];
+        let mut buf2 = vec![0x5A; 16];
+        let filters = [BLOSC_BITSHUFFLE, 0, 0, 0, 0, 0];
+        let filters_meta = [0; BLOSC2_MAX_FILTERS];
+
+        assert_eq!(
+            pipeline_forward(
+                &src,
+                &mut buf1,
+                &mut buf2,
+                &filters,
+                &filters_meta,
+                0,
+                0,
+                None,
+            ),
+            0
+        );
+        assert_eq!(buf1, vec![0xA5; 16]);
+        assert_eq!(buf2, vec![0x5A; 16]);
+
+        buf1.copy_from_slice(&src);
+        assert_eq!(
+            pipeline_backward(
+                &mut buf1,
+                &mut buf2,
+                16,
+                &filters,
+                &filters_meta,
+                BLOSC2_VERSION_FORMAT,
+                0,
+                0,
+                None,
+                1,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn test_trunc_prec_leaves_tail_bytes_unwritten() {
         let src = [0xFFu8, 0xFF, 0xFF, 0xFF, 0xAA, 0xBB];
-        let mut dest = [0u8; 6];
+        let mut dest = [0xA5u8; 6];
 
         // prec_bits=16 > BITS_MANTISSA_F32(23), valid. Zero low 7 mantissa bits.
         assert!(trunc_prec_forward(&src, &mut dest, 4, 16));
 
-        assert_eq!(&dest[4..], &src[4..]);
+        assert_eq!(&dest[4..], &[0xA5, 0xA5]);
     }
 
     // C's truncate_precision32 (c-blosc2/blosc/trunc-prec.c) only zeros mantissa

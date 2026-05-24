@@ -4,9 +4,10 @@ A pure Rust implementation of the [Blosc2](https://www.blosc.org/) high-performa
 
 Blosc2 is a block-oriented compressor optimized for binary data such as numerical arrays, tensors, and structured formats. It applies a filter pipeline (shuffle, bitshuffle, delta) before compression to exploit data patterns, then compresses with one of several codecs.
 
-The library is feature complete except for one edge case (get in touch if this is a problem). The speed is more or less comparable to the C implementation (benchmarks below).
 
-* 2026-05-20: New audit approach - many smaller(?) issues fixed, but further auditing needed **Be careful in using this crate as it can lead to data loss; more testing needed**
+**Full feature coverage is being added. Unstable state**
+
+* 2026-05-20: New audit approach - many smaller(?) issues fixed, but further auditing needed 
 * 2026-05-19: Another audit pass with fixes
 * 2026-04-27: Speed is now broadly comparable to, or faster than, C-Blosc2 on the default benchmark workload.
 * 2026-04-22: Ready for testing, passing current battery of tests. But be vigilant that errors may still remain; report if possible
@@ -50,8 +51,12 @@ This blurb might be out of date. Go to [this page](https://github.com/henriksson
 
 ## Current Limitations
 
-- B2ND metadata serialization supports up to 15 dimensions. 16-D arrays are extremely uncommon and are out of scope
-  for now.
+- B2ND metadata supports the C-Blosc2 16-D limit, but some B2ND C-parity gaps remain: file-backed storage choices, zero-copy/view semantics, append fast paths, string-shuffle coverage, and broader append/insert/delete/resize/selection parity tests.
+- Attached frame and sparse-frame mutation semantics are incomplete for opened file-backed `Schunk`s; some operations currently update in-memory state without C-equivalent persistence guarantees.
+- Dynamic plugin loading is not a current goal. In-process Rust codec/filter registration is supported, but C global plugin codecs/filters such as NDLZ, ZFP modes, BYTEDELTA, INT_TRUNC, NDCELL, and NDMEAN are not implemented.
+- The `*_c` helpers are Rust-shaped C-name compatibility adapters, not `extern "C"` ABI exports. Full C ABI compatibility would require a separate pointer-ownership and struct-layout layer.
+- B2ND does not currently model C's internal `chunk_cache_s`; this is treated as a performance gap rather than a correctness requirement until profiling shows otherwise.
+- Rust-generated frames target format compatibility with C-Blosc2, not byte-for-byte identical output for every offsets chunk or special-value encoding strategy.
 
 ## Installation
 
@@ -70,6 +75,17 @@ cargo install blosc2-pure-rs --features cli
 ```
 
 ## CLI Usage
+
+The CLI is intentionally a raw file-to-frame tool: `compress` reads an input
+file as bytes and writes a Blosc2 frame, while `decompress` reads a Blosc2 frame
+and writes raw bytes. B2ND arrays, sparse frames, metadata editing, dictionary
+management, VL-block editing, and plugin registration are library API workflows
+rather than CLI subcommands.
+
+Compression accepts ordinary platform paths for input and output and writes the
+destination through a sibling temporary file before replacing it. Decompression
+also writes through a temporary file, but its input frame path must currently be
+valid UTF-8 because the underlying `Schunk::open` API is still string-shaped.
 
 ### Compress
 

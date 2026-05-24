@@ -9,10 +9,13 @@ use blosc2_pure_rs::constants::*;
 use blosc2_pure_rs::schunk::Schunk;
 use blosc2_pure_rs::{Codec, Filter};
 use clap::{Parser, Subcommand};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Parser)]
 #[command(name = "blosc2", about = "Blosc2 compression tool")]
@@ -86,7 +89,8 @@ struct CompressOptions {
 ///
 /// Reads the input file in `chunksize` segments, appends each as a chunk to a [`Schunk`]
 /// configured with `options`, serializes the super-chunk to disk, and prints ratio and
-/// throughput statistics. Any existing file at `output` is removed before writing.
+/// throughput statistics. Output is first written to a sibling temporary file before replacing
+/// `output`, so failed compression or serialization does not leave a partial destination file.
 fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::Result<()> {
     if options.chunksize == 0 {
         return Err(io::Error::new(
@@ -132,14 +136,8 @@ fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::R
             .map_err(|e| io::Error::other(format!("Error compressing: {e}")))?;
     }
 
-    let _ = std::fs::remove_file(output);
-    schunk.to_file(
-        output
-            .to_str()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid output path"))?,
-    )?;
-
     let nbytes = schunk.nbytes;
+    atomic_write_all(output, &schunk.to_frame())?;
     let cbytes = std::fs::metadata(output)?.len() as i64;
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -162,7 +160,8 @@ fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::R
 /// Decompresses a Blosc2 frame at `input` into the raw file at `output`.
 ///
 /// Opens the frame as a [`Schunk`], iterates over its chunks decoding each in turn, and writes
-/// the concatenated result via a buffered writer. Empty frames produce an empty output file.
+/// the concatenated result via a buffered temporary file before replacing `output`. Empty frames
+/// produce an empty output file.
 /// Prints ratio and throughput statistics on completion.
 fn decompress_file(input: &Path, output: &Path, nthreads: i16) -> io::Result<()> {
     let input_str = input
@@ -174,22 +173,35 @@ fn decompress_file(input: &Path, output: &Path, nthreads: i16) -> io::Result<()>
     schunk.dparams.nthreads = nthreads;
 
     if schunk.nchunks() == 0 {
-        let _ = File::create(output)?;
+        atomic_write_all(output, &[])?;
         println!("Decompression ratio: 0.0 MB -> 0.0 MB (0.0x)");
         println!("Decompression time: 0.000 s, 0.0 MB/s");
         return Ok(());
     }
 
     let start = Instant::now();
-    let mut foutput = BufWriter::new(File::create(output)?);
+    let temp_path = temp_output_path(output);
+    let temp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)?;
+    let write_result = (|| {
+        let mut foutput = BufWriter::new(temp_file);
 
-    for i in 0..schunk.nchunks() {
-        let data = schunk
-            .decompress_chunk(i)
-            .map_err(|e| io::Error::other(format!("Decompression error: {e}")))?;
-        foutput.write_all(&data)?;
+        for i in 0..schunk.nchunks() {
+            let data = schunk
+                .decompress_chunk(i)
+                .map_err(|e| io::Error::other(format!("Decompression error: {e}")))?;
+            foutput.write_all(&data)?;
+        }
+        foutput.flush()
+    })();
+
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
     }
-    foutput.flush()?;
+    replace_output(&temp_path, output)?;
 
     let nbytes = schunk.nbytes;
     let cbytes = schunk.cbytes;
@@ -209,6 +221,61 @@ fn decompress_file(input: &Path, output: &Path, nthreads: i16) -> io::Result<()>
     );
 
     Ok(())
+}
+
+/// Writes bytes to `output` through a sibling temporary file, then replaces the destination.
+fn atomic_write_all(output: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temp_path = temp_output_path(output);
+    let write_result = (|| {
+        let temp_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        let mut writer = BufWriter::new(temp_file);
+        writer.write_all(bytes)?;
+        writer.flush()
+    })();
+
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    replace_output(&temp_path, output)
+}
+
+fn temp_output_path(output: &Path) -> PathBuf {
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = output
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| ".blosc2-output".into());
+    let temp_name = format!(".{file_name}.tmp.{}.{}", std::process::id(), counter);
+    output.with_file_name(temp_name)
+}
+
+fn replace_output(temp_path: &Path, output: &Path) -> io::Result<()> {
+    match std::fs::rename(temp_path, output) {
+        Ok(()) => Ok(()),
+        Err(first_err) if output.exists() => {
+            std::fs::remove_file(output).map_err(|remove_err| {
+                let _ = std::fs::remove_file(temp_path);
+                io::Error::new(
+                    remove_err.kind(),
+                    format!(
+                        "failed to remove existing output after rename failed ({first_err}); {remove_err}"
+                    ),
+                )
+            })?;
+            std::fs::rename(temp_path, output).map_err(|rename_err| {
+                let _ = std::fs::remove_file(temp_path);
+                rename_err
+            })
+        }
+        Err(err) => {
+            let _ = std::fs::remove_file(temp_path);
+            Err(err)
+        }
+    }
 }
 
 /// Returns `numerator / denominator` as `f64`, or `0.0` when `denominator` is not positive.

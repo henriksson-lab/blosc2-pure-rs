@@ -1,5 +1,17 @@
 # TODO
 
+## Broad Audit Backlog (2026-05-24)
+
+This is the active open checklist from a broad translation/parity audit. Older
+sections below are mostly completed historical porting plans and may mention
+superseded implementation notes.
+
+### P0 - Correctness and Required C-Parity Gaps
+
+No active P0 gaps.
+
+No active P1 gaps.
+
 ## Test Porting Plan
 
 Port the C test suite to Rust. Tests are grouped by priority. Each test should verify
@@ -187,8 +199,6 @@ These test functionality we already implement but don't test:
 - [x] Return `Err` instead of panicking for truncated compressed stream payloads
 - [x] Wire CLI decompression `--nthreads` into the decompression path
 - [x] Make `cargo clippy --all-targets -- -D warnings` pass for default features
-- [x] Put temporary `lz4-sys` LZ4HC compression shim behind the optional `lz4hc-sys` feature
-- Deferred: replace temporary feature-gated `lz4-sys` LZ4HC compression shim with a drop-in pure Rust port. This is out of scope for now.
 - [x] Remove remaining warnings in test code
 - [x] Replace unsafe filter pipeline aliasing with safe slice borrows
 - [x] Guard public filter helpers against undersized destination, scratch, source, and reference buffers
@@ -321,6 +331,7 @@ These test functionality we already implement but don't test:
   - [x] Add tests for cross-chunk and partial-block updates
 
 ## Scope Notes and Future Work
-- LZ4HC compression is unavailable by default; enable `lz4hc-sys` to use temporary `lz4-sys`. A pure Rust LZ4HC port is out of scope for now
+- LZ4HC compression is implemented in pure Rust.
 - User-defined codec/filter plugins are supported through in-process Rust registration APIs; external dynamic plugin loading is not implemented
 - Fixed-size frame metalayers and VL-metalayers are supported
+- B2ND expand/squeeze views share backing through B2ND methods and `Schunk` chunk mutators; direct mutation of the public `B2ndArray::schunk.chunks` vector is a legacy escape hatch and intentionally bypasses the internal shared store.

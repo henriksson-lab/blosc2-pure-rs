@@ -45,6 +45,8 @@ pub const BLOSC2_MAXTYPESIZE: usize = BLOSC2_MAXBLOCKSIZE;
 pub const BLOSC2_MAXDICTSIZE: usize = 32 * 1024;
 /// Minimum dictionary size considered useful; below this, dictionary compression is bypassed.
 pub const BLOSC2_MINUSEFULDICT: usize = 256;
+/// First codec code outside the Blosc1 built-in compressor set.
+pub const BLOSC_LAST_CODEC: u8 = 6;
 
 /// C API return code: success.
 pub const BLOSC2_ERROR_SUCCESS: i32 = 0;
@@ -133,10 +135,28 @@ pub const BLOSC_BITSHUFFLE: u8 = 2;
 pub const BLOSC_DELTA: u8 = 3;
 /// Filter ID: truncate mantissa precision. Positive `filters_meta` keeps bits; negative zeros bits.
 pub const BLOSC_TRUNC_PREC: u8 = 4;
+/// First filter ID reserved for globally registered Blosc2 filters.
+pub const BLOSC2_GLOBAL_REGISTERED_FILTERS_START: u8 = 32;
+/// Last filter ID reserved for globally registered Blosc2 filters.
+pub const BLOSC2_GLOBAL_REGISTERED_FILTERS_STOP: u8 = 159;
+/// Global plugin filter ID: NDim cell grouping.
+pub const BLOSC_FILTER_NDCELL: u8 = 32;
+/// Global plugin filter ID: NDim mean replacement.
+pub const BLOSC_FILTER_NDMEAN: u8 = 33;
+/// Global plugin filter ID: legacy buggy byte-delta filter.
+pub const BLOSC_FILTER_BYTEDELTA_BUGGY: u8 = 34;
+/// Global plugin filter ID: byte-wise delta.
+pub const BLOSC_FILTER_BYTEDELTA: u8 = 35;
+/// Global plugin filter ID: integer precision truncation.
+pub const BLOSC_FILTER_INT_TRUNC: u8 = 36;
 /// First filter ID reserved for user-registered filters.
 ///
 /// IDs 32..=159 are reserved for globally registered Blosc2 filters.
 pub const BLOSC2_USER_DEFINED_FILTERS_START: u8 = 160;
+/// C-name alias for the first user-registered filter ID.
+pub const BLOSC2_USER_REGISTERED_FILTERS_START: u8 = BLOSC2_USER_DEFINED_FILTERS_START;
+/// Last user-registered filter ID.
+pub const BLOSC2_USER_REGISTERED_FILTERS_STOP: u8 = u8::MAX;
 
 /// Codec ID: BloscLZ.
 pub const BLOSC_BLOSCLZ: u8 = 0;
@@ -148,6 +168,24 @@ pub const BLOSC_LZ4HC: u8 = 2;
 pub const BLOSC_ZLIB: u8 = 4;
 /// Codec ID: Zstd.
 pub const BLOSC_ZSTD: u8 = 5;
+/// First codec ID reserved for globally registered Blosc2 codecs.
+pub const BLOSC2_GLOBAL_REGISTERED_CODECS_START: u8 = 32;
+/// Last codec ID reserved for globally registered Blosc2 codecs.
+pub const BLOSC2_GLOBAL_REGISTERED_CODECS_STOP: u8 = 159;
+/// Global plugin codec ID: NDLZ.
+pub const BLOSC_CODEC_NDLZ: u8 = 32;
+/// Global plugin codec ID: ZFP fixed-accuracy mode.
+pub const BLOSC_CODEC_ZFP_FIXED_ACCURACY: u8 = 33;
+/// Global plugin codec ID: ZFP fixed-precision mode.
+pub const BLOSC_CODEC_ZFP_FIXED_PRECISION: u8 = 34;
+/// Global plugin codec ID: ZFP fixed-rate mode.
+pub const BLOSC_CODEC_ZFP_FIXED_RATE: u8 = 35;
+/// Global plugin codec ID: OpenHTJ2K.
+pub const BLOSC_CODEC_OPENHTJ2K: u8 = 36;
+/// Global plugin codec ID: Grok.
+pub const BLOSC_CODEC_GROK: u8 = 37;
+/// Global plugin codec ID: OpenZL.
+pub const BLOSC_CODEC_OPENZL: u8 = 38;
 /// First codec ID reserved for user-registered codecs.
 ///
 /// IDs 32..=159 are reserved for globally registered Blosc2 codecs.
@@ -222,6 +260,7 @@ pub const BLOSC2_SPECIAL_MASK: u8 = 0x7;
 
 /// Maximum fixed or variable-length metalayers supported by C-Blosc2 frame writers.
 pub const BLOSC2_MAX_METALAYERS: usize = 16;
+pub const BLOSC2_MAX_VLMETALAYERS: usize = 8 * 1024;
 
 /// blosc2_flags2 (byte 30, bit 0): the chunk uses variable-length blocks.
 pub const BLOSC2_VL_BLOCKS: u8 = 0x01;
