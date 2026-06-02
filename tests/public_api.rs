@@ -7,9 +7,18 @@
 //! unsupported/out of scope for now.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io;
+use std::path::PathBuf;
 
-const BLOSC2_H: &str = include_str!("../c-blosc2/include/blosc2.h");
-const B2ND_H: &str = include_str!("../c-blosc2/include/b2nd.h");
+use blosc2_pure_rs::constants::*;
+use blosc2_pure_rs::{
+    blosc2_compress_ctx, blosc2_create_cctx, blosc2_create_dctx, blosc2_decompress_ctx,
+    blosc2_set_maskout, CParams, DParams, B2ND_DEFAULT_DTYPE, B2ND_DEFAULT_DTYPE_FORMAT,
+    B2ND_MAX_DIM, B2ND_MAX_METALAYERS, B2ND_METALAYER_NAME, B2ND_METALAYER_VERSION,
+    DTYPE_NUMPY_FORMAT,
+};
+
 const LIB_RS: &str = include_str!("../src/lib.rs");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -134,8 +143,14 @@ const API_MATRIX: &[ApiRow] = &[
     covered!("blosc2_get_blosc2_cparams_defaults"),
     covered!("blosc2_get_blosc2_dparams_defaults"),
     covered!("blosc2_schunk_from_buffer"),
-    covered!("blosc2_schunk_open"),
-    covered!("blosc2_schunk_open_offset"),
+    partial!(
+        "blosc2_schunk_open",
+        "Rust open eagerly loads into an owned Schunk; C keeps a no-copy file-backed frame, whose closest Rust equivalent is blosc2_schunk_open_lazy(_c)."
+    ),
+    partial!(
+        "blosc2_schunk_open_offset",
+        "Rust open_offset eagerly loads into an owned Schunk; C keeps a no-copy file-backed frame, whose closest Rust equivalent is blosc2_schunk_open_lazy_offset(_c)."
+    ),
     covered!("blosc2_schunk_to_buffer"),
     covered!("blosc2_schunk_to_file"),
     covered!("blosc2_schunk_append_file"),
@@ -163,7 +178,7 @@ const API_MATRIX: &[ApiRow] = &[
     covered!("blosc2_bitunshuffle"),
     covered!("b2nd_free" => "b2nd_free_c"),
     covered!("b2nd_from_schunk"),
-    covered!("b2nd_to_cframe"),
+    partial!("b2nd_to_cframe", "Always serializes to an owned Vec; borrowed-frame needs_free=false ownership is not modeled."),
     covered!("b2nd_open"),
     covered!("b2nd_open_offset"),
     covered!("b2nd_save"),
@@ -174,14 +189,14 @@ const API_MATRIX: &[ApiRow] = &[
     covered!("b2nd_get_slice_cbuffer"),
     covered!("b2nd_set_slice_cbuffer"),
     covered!("b2nd_copy"),
-    covered!("b2nd_concatenate"),
+    partial!("b2nd_concatenate", "copy=false mutates the input and returns no cloned output; exact C pointer aliasing is not modeled."),
     covered!("b2nd_print_meta"),
     covered!("b2nd_resize"),
     covered!("b2nd_insert"),
     covered!("b2nd_append"),
     covered!("b2nd_delete"),
-    covered!("b2nd_get_orthogonal_selection"),
-    covered!("b2nd_set_orthogonal_selection"),
+    covered!("b2nd_get_orthogonal_selection" => "b2nd_get_orthogonal_selection_c"),
+    covered!("b2nd_set_orthogonal_selection" => "b2nd_set_orthogonal_selection_c"),
     covered!("b2nd_serialize_meta"),
     covered!("b2nd_deserialize_meta"),
     covered!("b2nd_copy_buffer"),
@@ -191,20 +206,23 @@ const API_MATRIX: &[ApiRow] = &[
     partial!("blosc2_schunk_new" => "blosc2_schunk_new_c", "Rust helper uses owned storage parameters, not blosc2_storage ABI."),
     partial!("blosc2_schunk_copy", "Rust copies supported data but not all C storage/plugin semantics."),
     partial!("blosc2_schunk_append_chunk", "Implemented, but exact C precompressed chunk validation/storage semantics remain incomplete."),
-    partial!("blosc2_schunk_update_chunk", "Implemented, but attached-frame persistence/precompressed semantics remain incomplete."),
-    partial!("blosc2_schunk_insert_chunk", "Implemented, but attached-frame persistence/precompressed semantics remain incomplete."),
-    partial!("blosc2_schunk_delete_chunk", "Implemented, but attached-frame persistence remains incomplete."),
-    covered!("blosc2_schunk_get_lazychunk"),
-    partial!("blosc2_schunk_reorder_offsets", "In-memory reorder works; attached-frame persistence remains incomplete."),
+    partial!("blosc2_schunk_update_chunk", "Implemented, including attached-frame persistence; exact C precompressed chunk semantics remain incomplete."),
+    partial!("blosc2_schunk_insert_chunk", "Implemented, including attached-frame persistence; exact C precompressed chunk semantics remain incomplete."),
+    covered!("blosc2_schunk_delete_chunk"),
+    partial!(
+        "blosc2_schunk_get_lazychunk" => "blosc2_schunk_get_lazychunk_c",
+        "Uses the C-style adapter that reports needs_free ownership info; the returned chunk is still modeled as an owned Vec rather than a raw C pointer."
+    ),
+    partial!("blosc2_schunk_reorder_offsets", "In-memory reorder works; exact C frame offset ownership/ABI semantics are not modeled."),
     partial!("blosc2_meta_exists", "In-memory/frame metadata lookup is covered; C inline pointer ABI is not modeled."),
-    partial!("blosc2_meta_add", "Metadata is supported; attached-frame flush semantics are incomplete."),
-    partial!("blosc2_meta_update", "Metadata is supported; attached-frame flush semantics are incomplete."),
+    partial!("blosc2_meta_add", "Metadata is supported, including attached-frame persistence; C inline pointer ABI is not modeled."),
+    partial!("blosc2_meta_update", "Metadata is supported, including attached-frame persistence; C inline pointer ABI is not modeled."),
     partial!("blosc2_meta_get", "In-memory/frame metadata lookup is covered; C inline pointer ABI is not modeled."),
-    partial!("blosc2_vlmeta_exists", "VL metadata is supported; attached-frame flush semantics are incomplete."),
-    partial!("blosc2_vlmeta_add", "VL metadata is supported; attached-frame flush semantics are incomplete."),
-    partial!("blosc2_vlmeta_update", "VL metadata is supported; attached-frame flush semantics are incomplete."),
+    partial!("blosc2_vlmeta_exists", "VL metadata lookup is covered; C inline pointer ABI is not modeled."),
+    partial!("blosc2_vlmeta_add", "VL metadata is supported, including attached-frame persistence; C allocation ABI is not modeled."),
+    partial!("blosc2_vlmeta_update", "VL metadata is supported, including attached-frame persistence; C allocation ABI is not modeled."),
     partial!("blosc2_vlmeta_get", "VL metadata lookup is covered; C ownership ABI is not modeled."),
-    partial!("blosc2_vlmeta_delete", "VL metadata is supported; attached-frame flush semantics are incomplete."),
+    partial!("blosc2_vlmeta_delete", "VL metadata is supported, including attached-frame persistence; C allocation ABI is not modeled."),
     partial!("blosc2_vlmeta_get_names", "VL metadata name listing is Rust-shaped, not C allocation ABI."),
     partial!("b2nd_create_ctx", "B2ndContext exists, but blosc2_storage/urlpath behavior is not fully modeled."),
     partial!("b2nd_free_ctx" => "b2nd_free_ctx_c", "Rust owned context teardown has no C allocation ABI."),
@@ -221,13 +239,30 @@ const API_MATRIX: &[ApiRow] = &[
     unsupported!("blosc2_register_io_cb", "User-defined IO callback ABI is not implemented."),
     unsupported!("blosc2_get_io_cb", "User-defined IO callback registry is not implemented."),
     unsupported!("blosc2_register_tuner", "C tuner callback ABI is not implemented."),
-    unsupported!("blosc2_set_maskout", "Context maskout support is not implemented."),
-    unsupported!("blosc2_get_blosc2_storage_defaults", "blosc2_storage is not modeled yet."),
+    covered!("blosc2_set_maskout"),
+    unsupported!(
+        "blosc2_get_blosc2_storage_defaults",
+        "The C blosc2_storage defaults API is not exposed; Rust only has a limited B2ndStorage model, not the full C storage struct/defaults."
+    ),
     unsupported!("blosc2_get_blosc2_io_defaults", "blosc2_io is not modeled yet."),
     unsupported!("blosc2_get_blosc2_stdio_mmap_defaults", "stdio mmap storage is not modeled."),
     unsupported!("blosc2_schunk_avoid_cframe_free", "C frame ownership toggle is not relevant to owned Rust buffers."),
     unsupported!("blosc2_schunk_open_udio", "User-defined IO opening is not implemented."),
     unsupported!("blosc2_schunk_open_offset_udio", "User-defined IO opening is not implemented."),
+    unsupported!("blosc2_stdio_open", "Public stdio IO callback shim is not exposed as a Rust API."),
+    unsupported!("blosc2_stdio_close", "Public stdio IO callback shim is not exposed as a Rust API."),
+    unsupported!("blosc2_stdio_size", "Public stdio IO callback shim is not exposed as a Rust API."),
+    unsupported!("blosc2_stdio_write", "Public stdio IO callback shim is not exposed as a Rust API."),
+    unsupported!("blosc2_stdio_read", "Public stdio IO callback shim is not exposed as a Rust API."),
+    unsupported!("blosc2_stdio_truncate", "Public stdio IO callback shim is not exposed as a Rust API."),
+    unsupported!("blosc2_stdio_destroy", "Public stdio IO callback shim is not exposed as a Rust API."),
+    unsupported!("blosc2_stdio_mmap_open", "Public mmap IO callback shim is not exposed as a Rust API."),
+    unsupported!("blosc2_stdio_mmap_close", "Public mmap IO callback shim is not exposed as a Rust API."),
+    unsupported!("blosc2_stdio_mmap_size", "Public mmap IO callback shim is not exposed as a Rust API."),
+    unsupported!("blosc2_stdio_mmap_write", "Public mmap IO callback shim is not exposed as a Rust API."),
+    unsupported!("blosc2_stdio_mmap_read", "Public mmap IO callback shim is not exposed as a Rust API."),
+    unsupported!("blosc2_stdio_mmap_truncate", "Public mmap IO callback shim is not exposed as a Rust API."),
+    unsupported!("blosc2_stdio_mmap_destroy", "Public mmap IO callback shim is not exposed as a Rust API."),
     out_of_scope!("blosc_set_timestamp", "Benchmark timing helper, not a storage/compression API target."),
     out_of_scope!("blosc_elapsed_nsecs", "Benchmark timing helper, not a storage/compression API target."),
     out_of_scope!("blosc_elapsed_secs", "Benchmark timing helper, not a storage/compression API target."),
@@ -238,9 +273,12 @@ const API_MATRIX: &[ApiRow] = &[
 
 #[test]
 fn public_api_matrix_covers_all_vendored_header_exports() {
-    let header_exports = exported_c_functions(BLOSC2_H)
-        .into_iter()
-        .chain(exported_c_functions(B2ND_H))
+    let Some(headers) = read_vendored_public_headers() else {
+        return;
+    };
+    let header_exports = headers
+        .iter()
+        .flat_map(|(_, header)| exported_c_functions(header))
         .collect::<BTreeSet<_>>();
     let matrix = API_MATRIX
         .iter()
@@ -286,6 +324,104 @@ fn mapped_public_api_rows_are_reexported_from_the_crate_root() {
 }
 
 #[test]
+fn public_api_matrix_locks_known_b2nd_parity_statuses() {
+    let expected = [
+        (
+            "b2nd_to_cframe",
+            ApiStatus::Partial,
+            Some("b2nd_to_cframe"),
+            "borrowed-frame needs_free=false",
+        ),
+        (
+            "b2nd_concatenate",
+            ApiStatus::Partial,
+            Some("b2nd_concatenate"),
+            "exact C pointer aliasing",
+        ),
+        (
+            "b2nd_get_orthogonal_selection",
+            ApiStatus::Covered,
+            Some("b2nd_get_orthogonal_selection_c"),
+            "",
+        ),
+        (
+            "b2nd_set_orthogonal_selection",
+            ApiStatus::Covered,
+            Some("b2nd_set_orthogonal_selection_c"),
+            "",
+        ),
+        (
+            "b2nd_open_offset",
+            ApiStatus::Covered,
+            Some("b2nd_open_offset"),
+            "",
+        ),
+    ];
+
+    for (c_name, status, rust_symbol, note_fragment) in expected {
+        let row = API_MATRIX
+            .iter()
+            .find(|row| row.c_name == c_name)
+            .unwrap_or_else(|| panic!("missing API_MATRIX row for {c_name}"));
+        assert_eq!(row.status, status, "wrong status for {c_name}");
+        assert_eq!(row.rust_symbol, rust_symbol, "wrong symbol for {c_name}");
+        assert!(
+            note_fragment.is_empty() || row.note.contains(note_fragment),
+            "row {c_name} note {:?} should mention {note_fragment:?}",
+            row.note
+        );
+    }
+}
+
+#[test]
+fn blosc2_set_maskout_drives_one_shot_blosc2_decompress_ctx() {
+    let data = (0..512u32).map(|i| (i & 0xff) as u8).collect::<Vec<_>>();
+    let cctx = blosc2_create_cctx(CParams {
+        compcode: BLOSC_LZ4,
+        clevel: 5,
+        typesize: 1,
+        blocksize: 128,
+        splitmode: BLOSC_NEVER_SPLIT,
+        filters: [0; BLOSC2_MAX_FILTERS],
+        ..Default::default()
+    })
+    .unwrap();
+    let dctx = blosc2_create_dctx(DParams::default()).unwrap();
+
+    let mut chunk = vec![0; data.len() + BLOSC2_MAX_OVERHEAD + 32];
+    let chunk_len = blosc2_compress_ctx(
+        &cctx,
+        &data,
+        data.len() as i32,
+        &mut chunk,
+        (data.len() + BLOSC2_MAX_OVERHEAD + 32) as i32,
+    );
+    assert!(chunk_len > 0);
+
+    let maskout = [false, true, false, true];
+    assert_eq!(
+        blosc2_set_maskout(&dctx, &maskout, maskout.len() as i32),
+        BLOSC2_ERROR_SUCCESS
+    );
+
+    let mut dest = vec![0xA5; data.len()];
+    assert_eq!(
+        blosc2_decompress_ctx(&dctx, &chunk, chunk_len, &mut dest, data.len() as i32),
+        data.len() as i32
+    );
+    assert_eq!(&dest[..128], &data[..128]);
+    assert_eq!(&dest[128..256], &[0xA5; 128]);
+    assert_eq!(&dest[256..384], &data[256..384]);
+    assert_eq!(&dest[384..512], &[0xA5; 128]);
+
+    assert_eq!(
+        blosc2_decompress_ctx(&dctx, &chunk, chunk_len, &mut dest, data.len() as i32),
+        data.len() as i32
+    );
+    assert_eq!(dest, data);
+}
+
+#[test]
 fn public_api_matrix_is_not_just_a_smoke_test() {
     let mut counts = BTreeMap::new();
     for row in API_MATRIX {
@@ -310,6 +446,420 @@ fn public_api_matrix_is_not_just_a_smoke_test() {
     );
 }
 
+#[test]
+fn public_constants_match_vendored_c_header_values() {
+    let Some(headers) = read_vendored_public_headers() else {
+        return;
+    };
+    let c_constants = exported_c_integer_constants(&joined_header_contents(&headers));
+    let rust_constant_names = public_constant_matrix()
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<BTreeSet<_>>();
+    let missing_rust_constants = required_public_c_integer_constants()
+        .iter()
+        .filter(|name| c_constants.contains_key(**name))
+        .filter(|name| !rust_constant_names.contains(**name))
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        missing_rust_constants.is_empty(),
+        "stable public C constants missing from public Rust constant matrix: {missing_rust_constants:?}"
+    );
+
+    let missing = public_constant_matrix()
+        .iter()
+        .filter(|(name, _)| !c_constants.contains_key(*name))
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "public Rust constants not found in vendored blosc2.h or b2nd.h: {missing:?}"
+    );
+
+    let mismatches = public_constant_matrix()
+        .iter()
+        .filter_map(|(name, rust_value)| {
+            let c_value = c_constants.get(*name)?;
+            (c_value != rust_value).then_some((*name, *rust_value, *c_value))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        mismatches.is_empty(),
+        "public Rust constants with values differing from vendored blosc2.h or b2nd.h: {mismatches:?}"
+    );
+}
+
+#[test]
+fn public_b2nd_string_constants_match_vendored_header_values() {
+    let Some(headers) = read_vendored_public_headers() else {
+        return;
+    };
+    let c_strings = exported_c_string_constants(&joined_header_contents(&headers));
+
+    assert_eq!(
+        c_strings.get("B2ND_DEFAULT_DTYPE").map(String::as_str),
+        Some(B2ND_DEFAULT_DTYPE)
+    );
+    assert_eq!(
+        c_strings.get("BLOSC2_VERSION_STRING").map(String::as_str),
+        Some(BLOSC2_VERSION_STRING)
+    );
+    assert_eq!(
+        c_strings.get("BLOSC2_VERSION_DATE").map(String::as_str),
+        Some(BLOSC2_VERSION_DATE)
+    );
+    assert_eq!(
+        c_strings.get("BLOSC_BLOSCLZ_COMPNAME").map(String::as_str),
+        Some(BLOSC_BLOSCLZ_COMPNAME)
+    );
+    assert_eq!(
+        c_strings.get("BLOSC_LZ4_COMPNAME").map(String::as_str),
+        Some(BLOSC_LZ4_COMPNAME)
+    );
+    assert_eq!(
+        c_strings.get("BLOSC_LZ4HC_COMPNAME").map(String::as_str),
+        Some(BLOSC_LZ4HC_COMPNAME)
+    );
+    assert_eq!(
+        c_strings.get("BLOSC_ZLIB_COMPNAME").map(String::as_str),
+        Some(BLOSC_ZLIB_COMPNAME)
+    );
+    assert_eq!(
+        c_strings.get("BLOSC_ZSTD_COMPNAME").map(String::as_str),
+        Some(BLOSC_ZSTD_COMPNAME)
+    );
+    assert_eq!(
+        c_strings.get("BLOSC_BLOSCLZ_LIBNAME").map(String::as_str),
+        Some(BLOSC_BLOSCLZ_LIBNAME)
+    );
+    assert_eq!(
+        c_strings.get("BLOSC_LZ4_LIBNAME").map(String::as_str),
+        Some(BLOSC_LZ4_LIBNAME)
+    );
+    assert_eq!(
+        c_strings.get("BLOSC_ZLIB_LIBNAME").map(String::as_str),
+        Some(BLOSC_ZLIB_LIBNAME)
+    );
+    assert_eq!(
+        c_strings.get("BLOSC_ZSTD_LIBNAME").map(String::as_str),
+        Some(BLOSC_ZSTD_LIBNAME)
+    );
+    assert_eq!(B2ND_DEFAULT_DTYPE_FORMAT, DTYPE_NUMPY_FORMAT);
+    assert_eq!(B2ND_METALAYER_NAME, "b2nd");
+}
+
+fn read_vendored_public_headers() -> Option<Vec<(&'static str, String)>> {
+    let mut headers = Vec::new();
+    for relative_path in [
+        "include/blosc2.h",
+        "include/b2nd.h",
+        "include/blosc2/blosc2-common.h",
+        "include/blosc2/blosc2-export.h",
+        "include/blosc2/blosc2-stdio.h",
+        "include/blosc2/codecs-registry.h",
+        "include/blosc2/filters-registry.h",
+        "include/blosc2/tuners-registry.h",
+    ] {
+        headers.push((relative_path, read_optional_vendored_header(relative_path)?));
+    }
+    Some(headers)
+}
+
+fn joined_header_contents(headers: &[(&'static str, String)]) -> String {
+    headers
+        .iter()
+        .map(|(_, header)| header.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn c_blosc2_source_dir() -> PathBuf {
+    std::env::var_os("BLOSC2_C_SOURCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("c-blosc2"))
+}
+
+fn read_optional_vendored_header(relative_path: &str) -> Option<String> {
+    let path = c_blosc2_source_dir().join(relative_path);
+    match fs::read_to_string(&path) {
+        Ok(header) => Some(header),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            eprintln!(
+                "skipping C header parity check because {} is absent",
+                path.display()
+            );
+            None
+        }
+        Err(err) => panic!("failed to read C header {}: {err}", path.display()),
+    }
+}
+
+fn public_constant_matrix() -> &'static [(&'static str, i64)] {
+    &[
+        ("BLOSC2_VERSION_MAJOR", BLOSC2_VERSION_MAJOR as i64),
+        ("BLOSC2_VERSION_MINOR", BLOSC2_VERSION_MINOR as i64),
+        ("BLOSC2_VERSION_RELEASE", BLOSC2_VERSION_RELEASE as i64),
+        (
+            "BLOSC1_VERSION_FORMAT_PRE1",
+            BLOSC1_VERSION_FORMAT_PRE1 as i64,
+        ),
+        ("BLOSC1_VERSION_FORMAT", BLOSC1_VERSION_FORMAT as i64),
+        (
+            "BLOSC2_VERSION_FORMAT_ALPHA",
+            BLOSC2_VERSION_FORMAT_ALPHA as i64,
+        ),
+        (
+            "BLOSC2_VERSION_FORMAT_BETA1",
+            BLOSC2_VERSION_FORMAT_BETA1 as i64,
+        ),
+        (
+            "BLOSC2_VERSION_FORMAT_STABLE",
+            BLOSC2_VERSION_FORMAT_STABLE as i64,
+        ),
+        (
+            "BLOSC2_VERSION_FORMAT_VL_BLOCKS",
+            BLOSC2_VERSION_FORMAT_VL_BLOCKS as i64,
+        ),
+        ("BLOSC2_VERSION_FORMAT", BLOSC2_VERSION_FORMAT as i64),
+        (
+            "BLOSC2_VERSION_FRAME_FORMAT_BETA2",
+            BLOSC2_VERSION_FRAME_FORMAT_BETA2 as i64,
+        ),
+        (
+            "BLOSC2_VERSION_FRAME_FORMAT_RC1",
+            BLOSC2_VERSION_FRAME_FORMAT_RC1 as i64,
+        ),
+        (
+            "BLOSC2_VERSION_FRAME_FORMAT_VL_BLOCKS",
+            BLOSC2_VERSION_FRAME_FORMAT_VL_BLOCKS as i64,
+        ),
+        (
+            "BLOSC2_VERSION_FRAME_FORMAT",
+            BLOSC2_VERSION_FRAME_FORMAT as i64,
+        ),
+        ("BLOSC_MIN_HEADER_LENGTH", BLOSC_MIN_HEADER_LENGTH as i64),
+        (
+            "BLOSC_EXTENDED_HEADER_LENGTH",
+            BLOSC_EXTENDED_HEADER_LENGTH as i64,
+        ),
+        ("BLOSC2_MAX_OVERHEAD", BLOSC2_MAX_OVERHEAD as i64),
+        ("BLOSC2_MAX_BUFFERSIZE", BLOSC2_MAX_BUFFERSIZE as i64),
+        ("BLOSC_MAX_TYPESIZE", BLOSC_MAX_TYPESIZE as i64),
+        ("BLOSC_MIN_BUFFERSIZE", BLOSC_MIN_BUFFERSIZE as i64),
+        (
+            "BLOSC2_DEFINED_TUNER_START",
+            BLOSC2_DEFINED_TUNER_START as i64,
+        ),
+        (
+            "BLOSC2_DEFINED_TUNER_STOP",
+            BLOSC2_DEFINED_TUNER_STOP as i64,
+        ),
+        (
+            "BLOSC2_GLOBAL_REGISTERED_TUNER_START",
+            BLOSC2_GLOBAL_REGISTERED_TUNER_START as i64,
+        ),
+        (
+            "BLOSC2_GLOBAL_REGISTERED_TUNER_STOP",
+            BLOSC2_GLOBAL_REGISTERED_TUNER_STOP as i64,
+        ),
+        (
+            "BLOSC2_GLOBAL_REGISTERED_TUNERS",
+            BLOSC2_GLOBAL_REGISTERED_TUNERS as i64,
+        ),
+        (
+            "BLOSC2_USER_REGISTERED_TUNER_START",
+            BLOSC2_USER_REGISTERED_TUNER_START as i64,
+        ),
+        (
+            "BLOSC2_USER_REGISTERED_TUNER_STOP",
+            BLOSC2_USER_REGISTERED_TUNER_STOP as i64,
+        ),
+        ("BLOSC_STUNE", BLOSC_STUNE as i64),
+        ("BLOSC_BTUNE", BLOSC_BTUNE as i64),
+        ("BLOSC_LAST_TUNER", BLOSC_LAST_TUNER as i64),
+        (
+            "BLOSC_LAST_REGISTERED_TUNE",
+            BLOSC_LAST_REGISTERED_TUNE as i64,
+        ),
+        (
+            "BLOSC2_DEFINED_FILTERS_START",
+            BLOSC2_DEFINED_FILTERS_START as i64,
+        ),
+        (
+            "BLOSC2_DEFINED_FILTERS_STOP",
+            BLOSC2_DEFINED_FILTERS_STOP as i64,
+        ),
+        (
+            "BLOSC2_GLOBAL_REGISTERED_FILTERS_START",
+            BLOSC2_GLOBAL_REGISTERED_FILTERS_START as i64,
+        ),
+        (
+            "BLOSC2_GLOBAL_REGISTERED_FILTERS_STOP",
+            BLOSC2_GLOBAL_REGISTERED_FILTERS_STOP as i64,
+        ),
+        (
+            "BLOSC2_GLOBAL_REGISTERED_FILTERS",
+            BLOSC2_GLOBAL_REGISTERED_FILTERS as i64,
+        ),
+        (
+            "BLOSC2_USER_REGISTERED_FILTERS_START",
+            BLOSC2_USER_REGISTERED_FILTERS_START as i64,
+        ),
+        (
+            "BLOSC2_USER_REGISTERED_FILTERS_STOP",
+            BLOSC2_USER_REGISTERED_FILTERS_STOP as i64,
+        ),
+        ("BLOSC2_MAX_FILTERS", BLOSC2_MAX_FILTERS as i64),
+        ("BLOSC2_MAX_UDFILTERS", BLOSC2_MAX_UDFILTERS as i64),
+        ("BLOSC_NOSHUFFLE", BLOSC_NOSHUFFLE as i64),
+        ("BLOSC_NOFILTER", BLOSC_NOFILTER as i64),
+        ("BLOSC_SHUFFLE", BLOSC_SHUFFLE as i64),
+        ("BLOSC_BITSHUFFLE", BLOSC_BITSHUFFLE as i64),
+        ("BLOSC_DELTA", BLOSC_DELTA as i64),
+        ("BLOSC_TRUNC_PREC", BLOSC_TRUNC_PREC as i64),
+        ("BLOSC_LAST_FILTER", BLOSC_LAST_FILTER as i64),
+        (
+            "BLOSC_LAST_REGISTERED_FILTER",
+            BLOSC_LAST_REGISTERED_FILTER as i64,
+        ),
+        ("BLOSC_DOSHUFFLE", BLOSC_DOSHUFFLE as i64),
+        ("BLOSC_MEMCPYED", BLOSC_MEMCPYED as i64),
+        ("BLOSC_DOBITSHUFFLE", BLOSC_DOBITSHUFFLE as i64),
+        ("BLOSC_DODELTA", BLOSC_DODELTA as i64),
+        ("BLOSC2_USEDICT", BLOSC2_USEDICT as i64),
+        ("BLOSC2_BIGENDIAN", BLOSC2_BIGENDIAN as i64),
+        ("BLOSC2_INSTR_CODEC", BLOSC2_INSTR_CODEC as i64),
+        ("BLOSC2_VL_BLOCKS", BLOSC2_VL_BLOCKS as i64),
+        ("BLOSC2_MAXDICTSIZE", BLOSC2_MAXDICTSIZE as i64),
+        ("BLOSC2_MINUSEFULDICT", BLOSC2_MINUSEFULDICT as i64),
+        ("BLOSC2_MAXBLOCKSIZE", BLOSC2_MAXBLOCKSIZE as i64),
+        ("BLOSC2_MAXTYPESIZE", BLOSC2_MAXTYPESIZE as i64),
+        (
+            "BLOSC2_DEFINED_CODECS_START",
+            BLOSC2_DEFINED_CODECS_START as i64,
+        ),
+        (
+            "BLOSC2_DEFINED_CODECS_STOP",
+            BLOSC2_DEFINED_CODECS_STOP as i64,
+        ),
+        (
+            "BLOSC2_GLOBAL_REGISTERED_CODECS_START",
+            BLOSC2_GLOBAL_REGISTERED_CODECS_START as i64,
+        ),
+        (
+            "BLOSC2_GLOBAL_REGISTERED_CODECS_STOP",
+            BLOSC2_GLOBAL_REGISTERED_CODECS_STOP as i64,
+        ),
+        (
+            "BLOSC2_GLOBAL_REGISTERED_CODECS",
+            BLOSC2_GLOBAL_REGISTERED_CODECS as i64,
+        ),
+        (
+            "BLOSC2_USER_REGISTERED_CODECS_START",
+            BLOSC2_USER_REGISTERED_CODECS_START as i64,
+        ),
+        (
+            "BLOSC2_USER_REGISTERED_CODECS_STOP",
+            BLOSC2_USER_REGISTERED_CODECS_STOP as i64,
+        ),
+        ("BLOSC_BLOSCLZ", BLOSC_BLOSCLZ as i64),
+        ("BLOSC_LZ4", BLOSC_LZ4 as i64),
+        ("BLOSC_LZ4HC", BLOSC_LZ4HC as i64),
+        ("BLOSC_ZLIB", BLOSC_ZLIB as i64),
+        ("BLOSC_ZSTD", BLOSC_ZSTD as i64),
+        ("BLOSC_LAST_CODEC", BLOSC_LAST_CODEC as i64),
+        (
+            "BLOSC_LAST_REGISTERED_CODEC",
+            BLOSC_LAST_REGISTERED_CODEC as i64,
+        ),
+        ("BLOSC_BLOSCLZ_LIB", BLOSC_BLOSCLZ_LIB as i64),
+        ("BLOSC_LZ4_LIB", BLOSC_LZ4_LIB as i64),
+        ("BLOSC_ZLIB_LIB", BLOSC_ZLIB_LIB as i64),
+        ("BLOSC_ZSTD_LIB", BLOSC_ZSTD_LIB as i64),
+        ("BLOSC_UDCODEC_LIB", BLOSC_UDCODEC_LIB as i64),
+        ("BLOSC_SCHUNK_LIB", BLOSC_SCHUNK_LIB as i64),
+        ("BLOSC_BLOSCLZ_FORMAT", BLOSC_BLOSCLZ_FORMAT as i64),
+        ("BLOSC_LZ4_FORMAT", BLOSC_LZ4_FORMAT as i64),
+        ("BLOSC_LZ4HC_FORMAT", BLOSC_LZ4HC_FORMAT as i64),
+        ("BLOSC_ZLIB_FORMAT", BLOSC_ZLIB_FORMAT as i64),
+        ("BLOSC_ZSTD_FORMAT", BLOSC_ZSTD_FORMAT as i64),
+        ("BLOSC_UDCODEC_FORMAT", BLOSC_UDCODEC_FORMAT as i64),
+        (
+            "BLOSC_BLOSCLZ_VERSION_FORMAT",
+            BLOSC_BLOSCLZ_VERSION_FORMAT as i64,
+        ),
+        ("BLOSC_LZ4_VERSION_FORMAT", BLOSC_LZ4_VERSION_FORMAT as i64),
+        (
+            "BLOSC_LZ4HC_VERSION_FORMAT",
+            BLOSC_LZ4HC_VERSION_FORMAT as i64,
+        ),
+        (
+            "BLOSC_ZLIB_VERSION_FORMAT",
+            BLOSC_ZLIB_VERSION_FORMAT as i64,
+        ),
+        (
+            "BLOSC_ZSTD_VERSION_FORMAT",
+            BLOSC_ZSTD_VERSION_FORMAT as i64,
+        ),
+        (
+            "BLOSC_UDCODEC_VERSION_FORMAT",
+            BLOSC_UDCODEC_VERSION_FORMAT as i64,
+        ),
+        ("BLOSC_ALWAYS_SPLIT", BLOSC_ALWAYS_SPLIT as i64),
+        ("BLOSC_NEVER_SPLIT", BLOSC_NEVER_SPLIT as i64),
+        ("BLOSC_AUTO_SPLIT", BLOSC_AUTO_SPLIT as i64),
+        (
+            "BLOSC_FORWARD_COMPAT_SPLIT",
+            BLOSC_FORWARD_COMPAT_SPLIT as i64,
+        ),
+        ("BLOSC2_NO_SPECIAL", BLOSC2_NO_SPECIAL as i64),
+        ("BLOSC2_SPECIAL_ZERO", BLOSC2_SPECIAL_ZERO as i64),
+        ("BLOSC2_SPECIAL_NAN", BLOSC2_SPECIAL_NAN as i64),
+        ("BLOSC2_SPECIAL_VALUE", BLOSC2_SPECIAL_VALUE as i64),
+        ("BLOSC2_SPECIAL_UNINIT", BLOSC2_SPECIAL_UNINIT as i64),
+        ("BLOSC2_SPECIAL_MASK", BLOSC2_SPECIAL_MASK as i64),
+        ("BLOSC2_MAX_METALAYERS", BLOSC2_MAX_METALAYERS as i64),
+        (
+            "BLOSC2_METALAYER_NAME_MAXLEN",
+            BLOSC2_METALAYER_NAME_MAXLEN as i64,
+        ),
+        ("BLOSC2_MAX_VLMETALAYERS", BLOSC2_MAX_VLMETALAYERS as i64),
+        (
+            "BLOSC2_VLMETALAYERS_NAME_MAXLEN",
+            BLOSC2_VLMETALAYERS_NAME_MAXLEN as i64,
+        ),
+        ("BLOSC2_MAX_DIM", BLOSC2_MAX_DIM as i64),
+        ("B2ND_METALAYER_VERSION", B2ND_METALAYER_VERSION as i64),
+        ("B2ND_MAX_DIM", B2ND_MAX_DIM as i64),
+        ("B2ND_MAX_METALAYERS", B2ND_MAX_METALAYERS as i64),
+        ("DTYPE_NUMPY_FORMAT", DTYPE_NUMPY_FORMAT as i64),
+        (
+            "B2ND_DEFAULT_DTYPE_FORMAT",
+            B2ND_DEFAULT_DTYPE_FORMAT as i64,
+        ),
+    ]
+}
+
+fn required_public_c_integer_constants() -> &'static [&'static str] {
+    &[
+        "BLOSC2_VERSION_FORMAT_BETA1",
+        "BLOSC2_VERSION_MAJOR",
+        "BLOSC2_VERSION_MINOR",
+        "BLOSC2_VERSION_RELEASE",
+        "BLOSC2_VERSION_FRAME_FORMAT_BETA2",
+        "BLOSC2_VERSION_FRAME_FORMAT_RC1",
+        "BLOSC2_VERSION_FRAME_FORMAT_VL_BLOCKS",
+        "BLOSC2_VERSION_FRAME_FORMAT",
+        "BLOSC2_METALAYER_NAME_MAXLEN",
+        "BLOSC2_MAX_VLMETALAYERS",
+        "BLOSC2_VLMETALAYERS_NAME_MAXLEN",
+        "BLOSC_SCHUNK_LIB",
+        "BLOSC_BTUNE",
+        "B2ND_DEFAULT_DTYPE_FORMAT",
+    ]
+}
+
 fn exported_c_functions(header: &str) -> Vec<String> {
     let without_comments = strip_c_comments(header);
     let lines = without_comments.lines().collect::<Vec<_>>();
@@ -318,6 +868,10 @@ fn exported_c_functions(header: &str) -> Vec<String> {
 
     while i < lines.len() {
         let line = lines[i].trim();
+        if line.starts_with('#') {
+            i += 1;
+            continue;
+        }
         let export = line.contains("BLOSC_EXPORT");
         let inline = line.starts_with("static inline");
         if export || inline {
@@ -328,7 +882,9 @@ fn exported_c_functions(header: &str) -> Vec<String> {
                 decl.push_str(lines[i].trim());
             }
             if let Some(name) = function_name_before_paren(&decl) {
-                if export || name.starts_with("blosc") || name.starts_with("b2nd") {
+                if !matches!(name, "if" | "__attribute__" | "__declspec")
+                    && (export || name.starts_with("blosc") || name.starts_with("b2nd"))
+                {
                     names.push(name.to_owned());
                 }
             }
@@ -337,6 +893,144 @@ fn exported_c_functions(header: &str) -> Vec<String> {
     }
 
     names
+}
+
+fn exported_c_integer_constants(header: &str) -> BTreeMap<String, i64> {
+    let without_comments = strip_c_comments(header);
+    let mut constants = BTreeMap::from([
+        ("INT_MAX".to_string(), i32::MAX as i64),
+        ("UINT8_MAX".to_string(), u8::MAX as i64),
+    ]);
+    let mut in_enum = false;
+    let mut next_enum_value = 0i64;
+
+    for raw_line in without_comments.lines() {
+        let line = raw_line.trim();
+        if let Some(rest) = line.strip_prefix("#define ") {
+            if let Some((name, expr)) = rest.split_once(char::is_whitespace) {
+                if is_constant_name(name) {
+                    if let Some(value) = eval_c_int_expr(expr.trim(), &constants) {
+                        constants.insert(name.to_string(), value);
+                    }
+                }
+            }
+        }
+
+        if line.starts_with("enum") {
+            in_enum = true;
+            next_enum_value = 0;
+            continue;
+        }
+        if !in_enum {
+            continue;
+        }
+        if line.starts_with("};") {
+            in_enum = false;
+            continue;
+        }
+
+        let item = line.trim_end_matches(',').trim();
+        let Some(name) = item
+            .split(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
+            .next()
+            .filter(|name| is_constant_name(name))
+        else {
+            continue;
+        };
+        let value = if let Some((_, expr)) = item.split_once('=') {
+            eval_c_int_expr(expr, &constants)
+                .unwrap_or_else(|| panic!("could not evaluate C constant expression: {expr}"))
+        } else {
+            next_enum_value
+        };
+        constants.insert(name.to_string(), value);
+        next_enum_value = value + 1;
+    }
+
+    constants
+}
+
+fn exported_c_string_constants(header: &str) -> BTreeMap<String, String> {
+    let without_comments = strip_c_comments(header);
+    let mut constants = BTreeMap::new();
+    for raw_line in without_comments.lines() {
+        let line = raw_line.trim();
+        let Some(rest) = line.strip_prefix("#define ") else {
+            continue;
+        };
+        let Some((name, expr)) = rest.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if !is_constant_name(name) {
+            continue;
+        }
+        let expr = expr.trim();
+        if let Some(value) = expr
+            .strip_prefix('"')
+            .and_then(|rest| rest.split_once('"').map(|(value, _)| value))
+        {
+            constants.insert(name.to_string(), value.to_string());
+        }
+    }
+    constants
+}
+
+fn is_constant_name(name: &str) -> bool {
+    (name.starts_with("BLOSC") || name.starts_with("B2ND") || name.starts_with("DTYPE"))
+        && name
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn eval_c_int_expr(expr: &str, constants: &BTreeMap<String, i64>) -> Option<i64> {
+    let tokens = expr
+        .split(|ch: char| {
+            ch.is_whitespace() || matches!(ch, '(' | ')' | '+' | '-' | '*' | ',' | ';')
+        })
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let operators = expr
+        .chars()
+        .filter(|ch| matches!(ch, '+' | '-' | '*'))
+        .collect::<Vec<_>>();
+    let mut values = tokens
+        .into_iter()
+        .map(|token| {
+            if let Some(hex) = token.strip_prefix("0x") {
+                i64::from_str_radix(hex, 16).ok()
+            } else if token.chars().all(|ch| ch.is_ascii_digit()) {
+                token.parse::<i64>().ok()
+            } else {
+                constants.get(token).copied()
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if values.is_empty() {
+        return None;
+    }
+    if operators.is_empty() {
+        return Some(values[0]);
+    }
+
+    let mut ops = operators;
+    let mut idx = 0;
+    while idx < ops.len() {
+        if ops[idx] == '*' {
+            values[idx] *= values.remove(idx + 1);
+            ops.remove(idx);
+        } else {
+            idx += 1;
+        }
+    }
+    let mut value = values[0];
+    for (op, rhs) in ops.into_iter().zip(values.into_iter().skip(1)) {
+        match op {
+            '+' => value += rhs,
+            '-' => value -= rhs,
+            _ => unreachable!(),
+        }
+    }
+    Some(value)
 }
 
 fn function_name_before_paren(decl: &str) -> Option<&str> {
@@ -378,13 +1072,27 @@ fn strip_c_comments(text: &str) -> String {
     out
 }
 
-fn crate_root_exports() -> BTreeSet<&'static str> {
+fn crate_root_exports() -> BTreeSet<String> {
     let mut exports = BTreeSet::new();
-    for row in API_MATRIX {
-        if let Some(symbol) = row.rust_symbol {
-            if LIB_RS.contains(symbol) {
-                exports.insert(symbol);
+    let mut in_pub_use = false;
+    for line in strip_c_comments(LIB_RS).lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("pub use ") {
+            in_pub_use = true;
+        }
+        if !in_pub_use {
+            continue;
+        }
+        for token in trimmed
+            .split(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
+            .filter(|token| !token.is_empty())
+        {
+            if !matches!(token, "pub" | "use" | "self" | "crate" | "super") {
+                exports.insert(token.to_string());
             }
+        }
+        if trimmed.ends_with(';') {
+            in_pub_use = false;
         }
     }
     exports

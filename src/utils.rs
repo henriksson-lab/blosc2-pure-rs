@@ -33,9 +33,10 @@ pub fn blosc2_destroy() {}
 
 /// Free cached resources.
 ///
-/// Current resource caches are self-managed, so this is a no-op kept for API
-/// parity with C-Blosc2.
-pub fn blosc2_free_resources() {}
+/// Drops process-wide caches that can be rebuilt lazily on the next use.
+pub fn blosc2_free_resources() {
+    crate::compress::free_cached_resources();
+}
 
 // Blosc1 compatibility aliases matching C-Blosc2's `BLOSC1_COMPAT` macro names.
 pub use self::blosc2_destroy as blosc_destroy;
@@ -87,37 +88,86 @@ pub fn blosc2_error_string(error_code: i32) -> &'static str {
 
 /// Convert a row-major linear index to multidimensional coordinates.
 pub fn blosc2_unidim_to_multidim(shape: &[i64], i: i64) -> Vec<i64> {
+    blosc2_unidim_to_multidim_checked(shape, i).unwrap_or_default()
+}
+
+/// Checked conversion from a row-major linear index to multidimensional
+/// coordinates.
+pub fn blosc2_unidim_to_multidim_checked(shape: &[i64], i: i64) -> Result<Vec<i64>, &'static str> {
+    if i < 0 {
+        return Err("Invalid linear index");
+    }
     let ndim = shape.len();
     let mut index = vec![0; ndim];
     if ndim == 0 {
-        return index;
+        return if i == 0 {
+            Ok(index)
+        } else {
+            Err("Invalid linear index")
+        };
+    }
+    if shape.iter().any(|&dim| dim <= 0) {
+        return Err("Invalid shape");
     }
     let mut strides = vec![1i64; ndim];
     for dim in (0..ndim - 1).rev() {
-        strides[dim] = shape[dim + 1] * strides[dim + 1];
+        strides[dim] = shape[dim + 1]
+            .checked_mul(strides[dim + 1])
+            .ok_or("Shape too large")?;
+    }
+    let total = shape[0].checked_mul(strides[0]).ok_or("Shape too large")?;
+    if i >= total {
+        return Err("Invalid linear index");
     }
     index[0] = i / strides[0];
     for dim in 1..ndim {
         index[dim] = (i % strides[dim - 1]) / strides[dim];
     }
-    index
+    Ok(index)
 }
 
 /// Convert multidimensional coordinates to a row-major linear index using
 /// caller-provided strides.
 pub fn blosc2_multidim_to_unidim(index: &[i64], strides: &[i64]) -> i64 {
+    blosc2_multidim_to_unidim_checked(index, strides).unwrap_or(-1)
+}
+
+/// Checked conversion from multidimensional coordinates to a row-major linear
+/// index using caller-provided strides.
+pub fn blosc2_multidim_to_unidim_checked(
+    index: &[i64],
+    strides: &[i64],
+) -> Result<i64, &'static str> {
+    if index.len() != strides.len() {
+        return Err("Index rank does not match strides rank");
+    }
     index
         .iter()
         .zip(strides)
-        .map(|(&idx, &stride)| idx * stride)
-        .sum()
+        .try_fold(0i64, |acc, (&idx, &stride)| {
+            if idx < 0 || stride < 0 {
+                return Err("Invalid index or stride");
+            }
+            idx.checked_mul(stride)
+                .and_then(|value| acc.checked_add(value))
+                .ok_or("Index overflow")
+        })
 }
 
 /// Remove a directory and its direct file entries, returning a C-style status code.
 pub fn blosc2_remove_dir(path: impl AsRef<std::path::Path>) -> i32 {
-    let path = path.as_ref();
-    if !path.exists() {
-        return BLOSC2_ERROR_NOT_FOUND;
+    let normalized = normalized_path(path.as_ref());
+    let path = normalized.as_ref();
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return BLOSC2_ERROR_FAILURE;
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return BLOSC2_ERROR_NOT_FOUND;
+        }
+        Err(_) => return BLOSC2_ERROR_FAILURE,
     }
     let entries = match std::fs::read_dir(path) {
         Ok(entries) => entries,
@@ -129,7 +179,13 @@ pub fn blosc2_remove_dir(path: impl AsRef<std::path::Path>) -> i32 {
             Err(_) => return BLOSC2_ERROR_FAILURE,
         };
         let entry_path = entry.path();
-        if entry_path.is_dir() || std::fs::remove_file(&entry_path).is_err() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => return BLOSC2_ERROR_FAILURE,
+        };
+        if (file_type.is_dir() && !file_type.is_symlink())
+            || std::fs::remove_file(&entry_path).is_err()
+        {
             return BLOSC2_ERROR_FAILURE;
         }
     }
@@ -141,17 +197,21 @@ pub fn blosc2_remove_dir(path: impl AsRef<std::path::Path>) -> i32 {
 
 /// Remove a path, accepting files and directories.
 pub fn blosc2_remove_urlpath(path: impl AsRef<std::path::Path>) -> i32 {
-    let path = path.as_ref();
-    if !path.exists() {
-        return BLOSC2_ERROR_SUCCESS;
-    }
-    if path.is_dir() {
-        blosc2_remove_dir(path)
-    } else {
-        match std::fs::remove_file(path) {
-            Ok(()) => BLOSC2_ERROR_SUCCESS,
-            Err(_) => BLOSC2_ERROR_FILE_REMOVE,
+    let normalized = normalized_path(path.as_ref());
+    let path = normalized.as_ref();
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return BLOSC2_ERROR_SUCCESS;
         }
+        Err(_) => return BLOSC2_ERROR_FAILURE,
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return blosc2_remove_dir(path);
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => BLOSC2_ERROR_SUCCESS,
+        Err(_) => BLOSC2_ERROR_FILE_REMOVE,
     }
 }
 
@@ -160,6 +220,8 @@ pub fn blosc2_rename_urlpath(
     old_urlpath: impl AsRef<std::path::Path>,
     new_urlpath: impl AsRef<std::path::Path>,
 ) -> i32 {
+    let old_urlpath = normalized_path(old_urlpath.as_ref());
+    let new_urlpath = normalized_path(new_urlpath.as_ref());
     match std::fs::rename(old_urlpath.as_ref(), new_urlpath.as_ref()) {
         Ok(()) => BLOSC2_ERROR_SUCCESS,
         Err(_) => BLOSC2_ERROR_FAILURE,
@@ -189,8 +251,22 @@ mod tests {
         let shape = [3, 4, 5];
         let strides = [20, 5, 1];
         assert_eq!(blosc2_unidim_to_multidim(&shape, 47), vec![2, 1, 2]);
+        assert_eq!(
+            blosc2_unidim_to_multidim_checked(&shape, 47).unwrap(),
+            vec![2, 1, 2]
+        );
         assert_eq!(blosc2_multidim_to_unidim(&[2, 1, 2], &strides), 47);
+        assert_eq!(
+            blosc2_multidim_to_unidim_checked(&[2, 1, 2], &strides).unwrap(),
+            47
+        );
         assert_eq!(blosc2_unidim_to_multidim(&[], 0), Vec::<i64>::new());
+        assert!(blosc2_unidim_to_multidim_checked(&[10, 0], 0).is_err());
+        assert!(blosc2_unidim_to_multidim_checked(&[i64::MAX, 2], 0).is_err());
+        assert!(blosc2_unidim_to_multidim_checked(&[3, 4], 12).is_err());
+        assert!(blosc2_multidim_to_unidim_checked(&[1, 2], &[4]).is_err());
+        assert!(blosc2_multidim_to_unidim_checked(&[-1], &[1]).is_err());
+        assert!(blosc2_multidim_to_unidim_checked(&[i64::MAX], &[2]).is_err());
         assert_eq!(normalize_urlpath("file:///frame.b2frame"), "frame.b2frame");
         assert_eq!(
             normalize_urlpath("file:////tmp/frame.b2frame"),
@@ -220,8 +296,7 @@ mod tests {
         std::fs::write(&url_file, b"x").unwrap();
         let prefixed = format!("file:///{}", url_file.display());
         assert_eq!(blosc2_remove_urlpath(prefixed), BLOSC2_ERROR_SUCCESS);
-        assert!(url_file.exists());
-        assert_eq!(blosc2_remove_urlpath(&url_file), BLOSC2_ERROR_SUCCESS);
+        assert!(!url_file.exists());
 
         let old_url_file = dir.path().join("url-old");
         let new_url_file = dir.path().join("url-new");
@@ -230,23 +305,17 @@ mod tests {
         let new_prefixed = format!("file:///{}", new_url_file.display());
         assert_eq!(
             blosc2_rename_urlpath(old_prefixed, new_prefixed),
-            BLOSC2_ERROR_FAILURE
-        );
-        assert!(old_url_file.exists());
-        assert!(!new_url_file.exists());
-        assert_eq!(
-            blosc2_rename_urlpath(&old_url_file, &new_url_file),
             BLOSC2_ERROR_SUCCESS
         );
+        assert!(!old_url_file.exists());
         assert!(new_url_file.exists());
 
         let nested = dir.path().join("nested");
         std::fs::create_dir(&nested).unwrap();
         std::fs::write(nested.join("child"), b"payload").unwrap();
         let nested_prefixed = format!("file:///{}", nested.display());
-        assert_eq!(blosc2_remove_dir(nested_prefixed), BLOSC2_ERROR_NOT_FOUND);
-        assert!(nested.exists());
-        assert_eq!(blosc2_remove_dir(&nested), BLOSC2_ERROR_SUCCESS);
+        assert_eq!(blosc2_remove_dir(nested_prefixed), BLOSC2_ERROR_SUCCESS);
+        assert!(!nested.exists());
 
         let nested_parent = dir.path().join("nested-parent");
         let nested_child = nested_parent.join("child-dir");
@@ -257,5 +326,42 @@ mod tests {
         assert_eq!(blosc2_remove_urlpath(&nested_parent), BLOSC2_ERROR_FAILURE);
         std::fs::remove_dir(&nested_child).unwrap();
         assert_eq!(blosc2_remove_urlpath(&nested_parent), BLOSC2_ERROR_SUCCESS);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_remove_urlpath_unlinks_directory_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("child"), b"payload").unwrap();
+        let link = dir.path().join("link");
+        symlink(&real, &link).unwrap();
+
+        assert_eq!(blosc2_remove_urlpath(&link), BLOSC2_ERROR_SUCCESS);
+        assert!(!link.exists());
+        assert_eq!(std::fs::read(real.join("child")).unwrap(), b"payload");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_remove_urlpath_reports_access_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let restricted = dir.path().join("restricted");
+        std::fs::create_dir(&restricted).unwrap();
+        let child = restricted.join("child");
+        std::fs::write(&child, b"payload").unwrap();
+
+        let original_permissions = std::fs::metadata(&restricted).unwrap().permissions();
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o0)).unwrap();
+        let rc = blosc2_remove_urlpath(&child);
+        std::fs::set_permissions(&restricted, original_permissions).unwrap();
+
+        assert_eq!(rc, BLOSC2_ERROR_FAILURE);
+        assert_eq!(std::fs::read(&child).unwrap(), b"payload");
     }
 }

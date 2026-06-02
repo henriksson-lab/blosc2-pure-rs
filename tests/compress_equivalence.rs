@@ -12,7 +12,7 @@ use common::ffi;
 use std::ffi::CString;
 use std::fs;
 use std::os::raw::c_void;
-use std::path::Path;
+use std::path::PathBuf;
 
 unsafe extern "C" {
     fn free(ptr: *mut c_void);
@@ -20,6 +20,13 @@ unsafe extern "C" {
 
 fn init_blosc2() -> common::Blosc2 {
     common::Blosc2::new()
+}
+
+fn c_blosc2_source_dir() -> PathBuf {
+    option_env!("BLOSC2_C_SOURCE_DIR_RESOLVED")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("BLOSC2_C_SOURCE_DIR").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("c-blosc2"))
 }
 
 struct CArray {
@@ -429,18 +436,24 @@ fn test_blosclz_optimization_fixtures_c_decompress() {
 #[test]
 fn test_blosclz_cdata_fixtures_match_c_decompress() {
     let _b = init_blosc2();
-    let fixtures = ["c-blosc2/compat/blosc-blosclz-3.0.0.cdata"];
+    let fixture_names = ["blosc-blosclz-3.0.0.cdata"];
+    let compat_dir = c_blosc2_source_dir().join("compat");
 
-    for fixture in fixtures {
-        if !Path::new(fixture).exists() {
-            eprintln!("skipping missing BloscLZ C fixture: {fixture}");
+    for fixture_name in fixture_names {
+        let fixture = compat_dir.join(fixture_name);
+        if !fixture.exists() {
+            eprintln!("skipping missing BloscLZ C fixture: {}", fixture.display());
             continue;
         }
 
-        let chunk = fs::read(fixture)
-            .unwrap_or_else(|e| panic!("failed to read BloscLZ C fixture {fixture}: {e}"));
+        let chunk = fs::read(&fixture).unwrap_or_else(|e| {
+            panic!(
+                "failed to read BloscLZ C fixture {}: {e}",
+                fixture.display()
+            )
+        });
         let rust_decompressed = decompress(&chunk)
-            .unwrap_or_else(|e| panic!("Rust failed to decompress {fixture}: {e}"));
+            .unwrap_or_else(|e| panic!("Rust failed to decompress {}: {e}", fixture.display()));
 
         let mut c_decompressed = vec![0u8; rust_decompressed.len()];
         let c_dsize = unsafe {
@@ -454,11 +467,14 @@ fn test_blosclz_cdata_fixtures_match_c_decompress() {
         assert_eq!(
             c_dsize,
             rust_decompressed.len() as i32,
-            "C decompression size mismatch for {fixture}"
+            "C decompression size mismatch for {}",
+            fixture.display()
         );
         assert_eq!(
-            rust_decompressed, c_decompressed,
-            "Rust and C fixture decompression differ for {fixture}"
+            rust_decompressed,
+            c_decompressed,
+            "Rust and C fixture decompression differ for {}",
+            fixture.display()
         );
     }
 }
@@ -466,14 +482,23 @@ fn test_blosclz_cdata_fixtures_match_c_decompress() {
 #[test]
 fn test_legacy_blosc1_bitshuffle_fixture_matches_c_decompress() {
     let _b = init_blosc2();
-    let fixture = "c-blosc2/compat/blosc-1.17.1-lz4-bitshuffle8-nomemcpy.cdata";
-    if !Path::new(fixture).exists() {
-        eprintln!("skipping missing legacy Blosc1 fixture: {fixture}");
+    let fixture = c_blosc2_source_dir()
+        .join("compat")
+        .join("blosc-1.17.1-lz4-bitshuffle8-nomemcpy.cdata");
+    if !fixture.exists() {
+        eprintln!(
+            "skipping missing legacy Blosc1 fixture: {}",
+            fixture.display()
+        );
         return;
     }
 
-    let chunk = fs::read(fixture)
-        .unwrap_or_else(|e| panic!("failed to read legacy Blosc1 fixture {fixture}: {e}"));
+    let chunk = fs::read(&fixture).unwrap_or_else(|e| {
+        panic!(
+            "failed to read legacy Blosc1 fixture {}: {e}",
+            fixture.display()
+        )
+    });
     assert_eq!(chunk[BLOSC2_CHUNK_VERSION], BLOSC1_VERSION_FORMAT);
     assert_eq!(
         chunk[BLOSC2_CHUNK_FLAGS],
@@ -495,8 +520,12 @@ fn test_legacy_blosc1_bitshuffle_fixture_matches_c_decompress() {
     assert_eq!(filters[BLOSC2_MAX_FILTERS - 1], BLOSC_BITSHUFFLE);
     assert!(cbuffer_validate(&chunk).is_ok());
 
-    let rust_decompressed = decompress(&chunk)
-        .unwrap_or_else(|e| panic!("Rust failed to decompress legacy fixture {fixture}: {e}"));
+    let rust_decompressed = decompress(&chunk).unwrap_or_else(|e| {
+        panic!(
+            "Rust failed to decompress legacy fixture {}: {e}",
+            fixture.display()
+        )
+    });
     assert_eq!(rust_decompressed.len(), 641_092);
 
     let mut c_decompressed = vec![0u8; rust_decompressed.len()];

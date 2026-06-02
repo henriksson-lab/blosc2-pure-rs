@@ -768,6 +768,7 @@ pub fn compress_block_with_context(
                 callback_context.complib = codec.complib;
                 callback_context.meta = meta;
                 callback_context.clevel = clevel;
+                dest.fill(0);
                 codec
                     .compress
                     .run(&mut callback_context, clevel, meta, src, dest)
@@ -850,6 +851,7 @@ pub fn decompress_block_with_context(
                 callback_context.compcode = compcode;
                 callback_context.complib = codec.complib;
                 callback_context.meta = meta;
+                dest.fill(0);
                 codec.decompress.run(&mut callback_context, meta, src, dest)
             }),
     }
@@ -871,12 +873,16 @@ fn lz4_compress(clevel: u8, src: &[u8], dest: &mut [u8]) -> i32 {
     use lz4_pure::block::CompressionMode;
 
     let _ = clevel;
-    let accel = 1;
+    let accel = lz4_acceleration();
     match lz4_pure::block::compress_to_buffer(src, Some(CompressionMode::FAST(accel)), false, dest)
     {
         Ok(n) => n as i32,
         Err(_) => 0,
     }
+}
+
+fn lz4_acceleration() -> i32 {
+    1
 }
 
 /// LZ4HC high-compression-mode compression of a single block, parameterized
@@ -925,7 +931,7 @@ fn lz4_compress_with_dict(clevel: u8, src: &[u8], dest: &mut [u8], dict: &[u8]) 
         return 0;
     };
     let _ = clevel;
-    let accel = 1;
+    let accel = lz4_acceleration();
 
     unsafe {
         let stream = LZ4_createStream();
@@ -1042,7 +1048,10 @@ fn zlib_decompress(src: &[u8], dest: &mut [u8]) -> i32 {
 
     let mut decompress = Decompress::new(true);
     match decompress.decompress(src, dest, FlushDecompress::Finish) {
-        Ok(flate2::Status::StreamEnd) if decompress.total_out() as usize == dest.len() => {
+        Ok(flate2::Status::StreamEnd)
+            if decompress.total_out() as usize == dest.len()
+                && decompress.total_in() as usize == src.len() =>
+        {
             decompress.total_out() as i32
         }
         Ok(flate2::Status::StreamEnd) => 0,
@@ -1229,8 +1238,15 @@ pub fn ndlz_compress_block_2d(meta: u8, blockshape: [i32; 2], src: &[u8], dest: 
     let Some(expected_len) = rows.checked_mul(cols) else {
         return -1;
     };
-    if src.len() != expected_len || dest.len() < 9 {
+    if src.len() != expected_len {
         return -1;
+    }
+    if expected_len < cell_shape * cell_shape {
+        return 0;
+    }
+    let min_output_len = 17 + expected_len / (cell_shape * cell_shape) * 2 - 2;
+    if dest.len() < min_output_len {
+        return 0;
     }
 
     let stop_rows = rows.div_ceil(cell_shape);
@@ -1742,6 +1758,33 @@ mod tests {
     }
 
     #[test]
+    fn lz4_acceleration_matches_current_c_blosc2_fast_mode() {
+        assert_eq!(lz4_acceleration(), 1);
+    }
+
+    #[test]
+    fn lz4_fast_paths_ignore_clevel_for_acceleration() {
+        let data = b"abcdefghijklmnopabcdefghZZZZabcdefghijklmnopabcdefghijklmnop";
+        let dict = b"abcdefghijklmnop0123456789abcdefghijklmnop0123456789";
+
+        let mut low = vec![0; 256];
+        let mut high = vec![0; 256];
+        let low_size = lz4_compress(1, data, &mut low);
+        let high_size = lz4_compress(9, data, &mut high);
+        assert!(low_size > 0);
+        assert_eq!(low_size, high_size);
+        assert_eq!(&low[..low_size as usize], &high[..high_size as usize]);
+
+        low.fill(0);
+        high.fill(0);
+        let low_size = lz4_compress_with_dict(1, data, &mut low, dict);
+        let high_size = lz4_compress_with_dict(9, data, &mut high, dict);
+        assert!(low_size > 0);
+        assert_eq!(low_size, high_size);
+        assert_eq!(&low[..low_size as usize], &high[..high_size as usize]);
+    }
+
+    #[test]
     fn ndlz_literal_blocks_decompress_for_meta_4_and_8() {
         let mut src4 = vec![2];
         src4.extend_from_slice(&3i32.to_le_bytes());
@@ -1791,8 +1834,8 @@ mod tests {
     #[test]
     fn ndlz_literal_encoder_roundtrips_meta_4_and_8_blocks() {
         for (meta, blockshape, input) in [
-            (4, [3, 4], (1..=12).collect::<Vec<_>>()),
-            (8, [2, 3], vec![20, 21, 22, 23, 24, 25]),
+            (4, [4, 4], (1..=16).collect::<Vec<_>>()),
+            (8, [8, 8], (20..84).collect::<Vec<_>>()),
         ] {
             let mut encoded = vec![0; input.len() + 32];
             let cbytes = ndlz_compress_block_2d(meta, blockshape, &input, &mut encoded);
@@ -1805,7 +1848,39 @@ mod tests {
                 input.len() as i32
             );
             assert_eq!(decoded, input);
+
+            encoded.push(0xff);
+            assert_eq!(
+                decompress_block_with_meta(BLOSC_CODEC_NDLZ, meta, &encoded, &mut decoded),
+                input.len() as i32
+            );
+            assert_eq!(decoded, input);
         }
+    }
+
+    #[test]
+    fn ndlz_encoder_returns_zero_for_valid_fallback_cases() {
+        let small_input = vec![1; 12];
+        let mut encoded = vec![0; 64];
+        assert_eq!(
+            ndlz_compress_block_2d(4, [3, 4], &small_input, &mut encoded),
+            0
+        );
+
+        let input: Vec<u8> = (1..=16).collect();
+        let mut too_small_output = vec![0; 16];
+        assert_eq!(
+            ndlz_compress_block_2d(4, [4, 4], &input, &mut too_small_output),
+            0
+        );
+
+        let mut encoded = vec![0; 64];
+        assert_eq!(ndlz_compress_block_2d(5, [4, 4], &input, &mut encoded), -1);
+        assert_eq!(
+            ndlz_compress_block_2d(4, [4, 4], &input[..15], &mut encoded),
+            -1
+        );
+        assert_eq!(ndlz_compress_block_2d(4, [-1, 4], &input, &mut encoded), -1);
     }
 
     #[test]
@@ -2041,6 +2116,18 @@ mod tests {
             decompress_block(BLOSC_ZLIB, b"not-a-zlib-block", &mut dest),
             0
         );
+        let src = b"zlib payload";
+        let mut compressed = vec![0u8; 128];
+        let cbytes = zlib_compress(src, &mut compressed, 5);
+        assert!(cbytes > 0);
+        compressed.truncate(cbytes as usize);
+        let mut zlib_out = vec![0u8; src.len()];
+        assert_eq!(
+            zlib_decompress(&compressed, &mut zlib_out),
+            src.len() as i32
+        );
+        compressed.extend_from_slice(b"trailing");
+        assert_eq!(zlib_decompress(&compressed, &mut zlib_out), 0);
         assert_eq!(
             decompress_block(BLOSC_ZSTD, b"not-a-zstd-block", &mut dest),
             0

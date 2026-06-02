@@ -22,6 +22,65 @@ fn sequential_u64(n: usize) -> Vec<u8> {
     (0..n as u64).flat_map(|i| i.to_le_bytes()).collect()
 }
 
+fn mixed_f32(n: usize) -> Vec<u8> {
+    (0..n as u32)
+        .flat_map(|i| {
+            let value = ((i.wrapping_mul(37) % 1009) as f32 * 0.125) - 31.75;
+            value.to_le_bytes()
+        })
+        .collect()
+}
+
+fn c_compress_with_filters(
+    data: &[u8],
+    compcode: u8,
+    clevel: u8,
+    typesize: i32,
+    blocksize: i32,
+    filters: [u8; BLOSC2_MAX_FILTERS],
+    filters_meta: [u8; BLOSC2_MAX_FILTERS],
+) -> Vec<u8> {
+    let mut c_chunk = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD];
+    let csize = unsafe {
+        let mut cp: ffi::blosc2_cparams = std::mem::zeroed();
+        cp.compcode = compcode;
+        cp.clevel = clevel;
+        cp.typesize = typesize;
+        cp.blocksize = blocksize;
+        cp.nthreads = 1;
+        cp.splitmode = BLOSC_NEVER_SPLIT;
+        cp.filters = filters;
+        cp.filters_meta = filters_meta;
+        let cctx = ffi::blosc2_create_cctx(cp);
+        let r = ffi::blosc2_compress_ctx(
+            cctx,
+            data.as_ptr() as *const _,
+            data.len() as i32,
+            c_chunk.as_mut_ptr() as *mut _,
+            c_chunk.len() as i32,
+        );
+        ffi::blosc2_free_ctx(cctx);
+        r
+    };
+    assert!(csize > 0, "C compression failed: {csize}");
+    c_chunk.truncate(csize as usize);
+    c_chunk
+}
+
+fn c_decompress_to_vec(chunk: &[u8], nbytes: usize) -> Vec<u8> {
+    let mut restored = vec![0u8; nbytes];
+    let dsize = unsafe {
+        ffi::blosc2_decompress(
+            chunk.as_ptr() as *const _,
+            chunk.len() as i32,
+            restored.as_mut_ptr() as *mut _,
+            restored.len() as i32,
+        )
+    };
+    assert_eq!(dsize, nbytes as i32, "C decompression failed: {dsize}");
+    restored
+}
+
 // ─── Pipeline forward/backward roundtrip ─────────────────────────
 
 #[test]
@@ -311,6 +370,159 @@ fn test_rust_delta_shuffle_c_decompress() {
     assert_eq!(
         data, c_restored,
         "Rust DELTA+SHUFFLE → C decompress mismatch"
+    );
+}
+
+#[test]
+fn test_c_delta_bitshuffle_rust_decompress() {
+    let _b = init();
+    let data = sequential_u64(4096);
+    let filters = [0, 0, 0, 0, BLOSC_DELTA, BLOSC_BITSHUFFLE];
+    let meta = [0u8; BLOSC2_MAX_FILTERS];
+
+    let c_chunk = c_compress_with_filters(&data, BLOSC_ZSTD, 5, 8, 512, filters, meta);
+    let restored = decompress(&c_chunk).unwrap();
+    assert_eq!(
+        data, restored,
+        "C DELTA+BITSHUFFLE -> Rust decompress mismatch"
+    );
+}
+
+#[test]
+fn test_rust_delta_bitshuffle_c_decompress() {
+    let _b = init();
+    let data = sequential_u64(4096);
+
+    let cparams = CParams {
+        compcode: BLOSC_ZSTD,
+        clevel: 5,
+        typesize: 8,
+        blocksize: 512,
+        splitmode: BLOSC_NEVER_SPLIT,
+        filters: [0, 0, 0, 0, BLOSC_DELTA, BLOSC_BITSHUFFLE],
+        ..Default::default()
+    };
+    let chunk = compress(&data, &cparams).unwrap();
+
+    let c_restored = c_decompress_to_vec(&chunk, data.len());
+    assert_eq!(
+        data, c_restored,
+        "Rust DELTA+BITSHUFFLE -> C decompress mismatch"
+    );
+}
+
+#[test]
+fn test_c_shuffle_delta_rust_decompress() {
+    let _b = init();
+    let data: Vec<u8> = (0..4096u32)
+        .flat_map(|i| i.wrapping_mul(31).rotate_left(7).to_le_bytes())
+        .collect();
+    let src_size = data.len() as i32;
+
+    let mut c_chunk = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD];
+    let csize = unsafe {
+        let mut cp: ffi::blosc2_cparams = std::mem::zeroed();
+        cp.compcode = BLOSC_LZ4;
+        cp.clevel = 5;
+        cp.typesize = 4;
+        cp.blocksize = 256;
+        cp.nthreads = 1;
+        cp.splitmode = BLOSC_NEVER_SPLIT;
+        cp.filters[4] = BLOSC_SHUFFLE;
+        cp.filters[5] = BLOSC_DELTA;
+        let cctx = ffi::blosc2_create_cctx(cp);
+        let r = ffi::blosc2_compress_ctx(
+            cctx,
+            data.as_ptr() as *const _,
+            src_size,
+            c_chunk.as_mut_ptr() as *mut _,
+            c_chunk.len() as i32,
+        );
+        ffi::blosc2_free_ctx(cctx);
+        r
+    };
+    assert!(csize > 0, "C SHUFFLE+DELTA compression failed");
+
+    let restored = decompress(&c_chunk[..csize as usize]).unwrap();
+    assert_eq!(
+        data, restored,
+        "C SHUFFLE+DELTA -> Rust decompress mismatch"
+    );
+}
+
+#[test]
+fn test_trunc_prec_shuffle_c_rust_output_parity() {
+    let _b = init();
+    let data = mixed_f32(4096);
+    let filters = [0, 0, 0, 0, BLOSC_TRUNC_PREC, BLOSC_SHUFFLE];
+    let filters_meta = [0, 0, 0, 0, 16, 0];
+    let cparams = CParams {
+        compcode: BLOSC_LZ4,
+        clevel: 5,
+        typesize: 4,
+        blocksize: 1024,
+        splitmode: BLOSC_NEVER_SPLIT,
+        filters,
+        filters_meta,
+        ..Default::default()
+    };
+
+    let rust_chunk = compress(&data, &cparams).unwrap();
+    let rust_output = decompress(&rust_chunk).unwrap();
+    let c_chunk = c_compress_with_filters(&data, BLOSC_LZ4, 5, 4, 1024, filters, filters_meta);
+    let c_output = c_decompress_to_vec(&c_chunk, data.len());
+
+    assert_eq!(
+        rust_output, c_output,
+        "Rust and C TRUNC_PREC+SHUFFLE outputs differ"
+    );
+    assert_eq!(
+        decompress(&c_chunk).unwrap(),
+        c_output,
+        "Rust decode of C TRUNC_PREC+SHUFFLE differs from C output"
+    );
+    assert_eq!(
+        c_decompress_to_vec(&rust_chunk, data.len()),
+        c_output,
+        "C decode of Rust TRUNC_PREC+SHUFFLE differs from C output"
+    );
+}
+
+#[test]
+fn test_rust_shuffle_delta_c_decompress() {
+    let _b = init();
+    let data: Vec<u8> = (0..4096u32)
+        .flat_map(|i| i.wrapping_mul(31).rotate_left(7).to_le_bytes())
+        .collect();
+
+    let cparams = CParams {
+        compcode: BLOSC_LZ4,
+        clevel: 5,
+        typesize: 4,
+        blocksize: 256,
+        splitmode: BLOSC_NEVER_SPLIT,
+        filters: [0, 0, 0, 0, BLOSC_SHUFFLE, BLOSC_DELTA],
+        ..Default::default()
+    };
+    let chunk = compress(&data, &cparams).unwrap();
+
+    let mut c_restored = vec![0u8; data.len()];
+    let dsize = unsafe {
+        ffi::blosc2_decompress(
+            chunk.as_ptr() as *const _,
+            chunk.len() as i32,
+            c_restored.as_mut_ptr() as *mut _,
+            c_restored.len() as i32,
+        )
+    };
+    assert_eq!(
+        dsize,
+        data.len() as i32,
+        "C decompress of Rust SHUFFLE+DELTA failed"
+    );
+    assert_eq!(
+        data, c_restored,
+        "Rust SHUFFLE+DELTA -> C decompress mismatch"
     );
 }
 

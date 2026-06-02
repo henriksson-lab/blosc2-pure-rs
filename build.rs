@@ -6,16 +6,37 @@ fn main() {
 #[cfg(feature = "_ffi")]
 fn build_ffi() {
     use std::env;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
-    if !Path::new("c-blosc2").exists() {
-        println!(
-            "cargo:warning=_ffi feature enabled, but c-blosc2/ is not present; skipping C-Blosc2 FFI build"
+    println!("cargo:rerun-if-env-changed=BLOSC2_C_SOURCE_DIR");
+    let c_blosc2_dir = env::var_os("BLOSC2_C_SOURCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("c-blosc2"));
+    if !c_blosc2_dir.exists() {
+        panic!(
+            "_ffi feature requires the C-Blosc2 source tree. Set \
+             BLOSC2_C_SOURCE_DIR=/path/to/c-blosc2, fetch c-blosc2/ in this \
+             checkout, or build without _ffi."
         );
-        return;
     }
+    let c_blosc2_dir = c_blosc2_dir
+        .canonicalize()
+        .unwrap_or_else(|err| panic!("failed to canonicalize C-Blosc2 source directory: {err}"));
+    for header in ["include/blosc2.h", "include/b2nd.h"] {
+        let header_path = c_blosc2_dir.join(header);
+        if !header_path.exists() {
+            panic!(
+                "_ffi feature requires missing C-Blosc2 header: {}",
+                header_path.display()
+            );
+        }
+    }
+    println!(
+        "cargo:rustc-env=BLOSC2_C_SOURCE_DIR_RESOLVED={}",
+        c_blosc2_dir.display()
+    );
 
-    let dst = cmake::Config::new("c-blosc2")
+    let dst = cmake::Config::new(&c_blosc2_dir)
         .define("BUILD_TESTS", "OFF")
         .define("BUILD_FUZZERS", "OFF")
         .define("BUILD_BENCHMARKS", "OFF")
@@ -32,11 +53,12 @@ fn build_ffi() {
     println!("cargo:rustc-link-lib=m");
 
     let include_path = format!("{}/include", dst.display());
+    let source_include_path = c_blosc2_dir.join("include");
     let bindings = bindgen::Builder::default()
-        .header("c-blosc2/include/blosc2.h")
-        .header("c-blosc2/include/b2nd.h")
+        .header(c_blosc2_dir.join("include/blosc2.h").display().to_string())
+        .header(c_blosc2_dir.join("include/b2nd.h").display().to_string())
         .clang_arg(format!("-I{}", include_path))
-        .clang_arg("-Ic-blosc2/include")
+        .clang_arg(format!("-I{}", source_include_path.display()))
         .allowlist_function("blosc.*")
         .allowlist_function("b2nd.*")
         .allowlist_type("blosc.*")

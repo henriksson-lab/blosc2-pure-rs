@@ -7,6 +7,7 @@ Blosc2 is a block-oriented compressor optimized for binary data such as numerica
 
 **Full feature coverage is being added. Unstable state**
 
+* 2026-06-02: Further audit
 * 2026-05-20: New audit approach - many smaller(?) issues fixed, but further auditing needed 
 * 2026-05-19: Another audit pass with fixes
 * 2026-04-27: Speed is now broadly comparable to, or faster than, C-Blosc2 on the default benchmark workload.
@@ -39,8 +40,9 @@ This blurb might be out of date. Go to [this page](https://github.com/henriksson
 
 ## Features
 
-- **5 codecs**: BloscLZ (ported from C), LZ4, LZ4HC, Zlib, Zstd — all pure Rust
-- **4 filters**: Shuffle, Bitshuffle, Delta, Truncated Precision
+- **5 high-level codecs**: BloscLZ (ported from C), LZ4, LZ4HC, Zlib, Zstd — all pure Rust
+- **4 high-level filters**: Shuffle, Bitshuffle, Delta, Truncated Precision
+- **Plugin codec/filter IDs**: Lower-level constants and registration APIs support NDLZ, BYTEDELTA, INT_TRUNC, NDCELL, and NDMEAN paths.
 - **Frame format**: Compatible with C-Blosc2 `.b2frame` files (read and write)
 - **Lazy frame reads**: File-backed `LazySchunk` loads compressed chunks on demand
 - **VL-block chunks**: Pure-Rust variable-length block chunks with split/block decompression
@@ -53,7 +55,7 @@ This blurb might be out of date. Go to [this page](https://github.com/henriksson
 
 - B2ND metadata supports the C-Blosc2 16-D limit, but some B2ND C-parity gaps remain: file-backed storage choices, zero-copy/view semantics, append fast paths, string-shuffle coverage, and broader append/insert/delete/resize/selection parity tests.
 - Attached frame and sparse-frame mutation semantics are incomplete for opened file-backed `Schunk`s; some operations currently update in-memory state without C-equivalent persistence guarantees.
-- Dynamic plugin loading is not a current goal. In-process Rust codec/filter registration is supported, but C global plugin codecs/filters such as NDLZ, ZFP modes, BYTEDELTA, INT_TRUNC, NDCELL, and NDMEAN are not implemented.
+- Dynamic plugin loading is not a current goal. In-process Rust codec/filter registration is supported, and the built-in global plugin paths for NDLZ, BYTEDELTA, INT_TRUNC, NDCELL, and NDMEAN are implemented via lower-level APIs/constants rather than the high-level `Codec`/`Filter` CLI enum. Other C global plugins, including ZFP modes, are not implemented.
 - The `*_c` helpers are Rust-shaped C-name compatibility adapters, not `extern "C"` ABI exports. Full C ABI compatibility would require a separate pointer-ownership and struct-layout layer.
 - B2ND does not currently model C's internal `chunk_cache_s`; this is treated as a performance gap rather than a correctness requirement until profiling shows otherwise.
 - Rust-generated frames target format compatibility with C-Blosc2, not byte-for-byte identical output for every offsets chunk or special-value encoding strategy.
@@ -82,10 +84,14 @@ and writes raw bytes. B2ND arrays, sparse frames, metadata editing, dictionary
 management, VL-block editing, and plugin registration are library API workflows
 rather than CLI subcommands.
 
-Compression accepts ordinary platform paths for input and output and writes the
-destination through a sibling temporary file before replacing it. Decompression
-also writes through a temporary file, but its input frame path must currently be
-valid UTF-8 because the underlying `Schunk::open` API is still string-shaped.
+The CLI's `--codec` and `--filter` flags use the high-level `Codec` and
+`Filter` parser enums, so they accept only the built-in names listed below.
+NDLZ and plugin filter IDs require lower-level library APIs such as explicit
+`CParams` constants or registration.
+
+Compression and decompression accept ordinary platform paths for input and
+output, including non-UTF-8 paths on Unix. Both write destinations through a
+sibling temporary file before replacing it.
 
 ### Compress
 
@@ -114,7 +120,11 @@ Chunk-size guidance: keep the default for general file compression unless you ha
 
 ```bash
 blosc2 decompress output.b2frame restored.bin
+blosc2 decompress output.b2frame restored.bin --nthreads 2
 ```
+
+Options:
+- `-n, --nthreads`: Number of threads. Default: `4`
 
 ### Verify roundtrip
 
@@ -393,9 +403,13 @@ required, prefer LZ4 for speed or Zstd for stronger compression.
 
 ## Testing
 
-The full test suite cross-checks against C-Blosc2 via FFI and requires the `c-blosc2` source directory, cmake, and libclang:
+The full test suite cross-checks against C-Blosc2 via FFI and requires cmake,
+libclang, and C-Blosc2 sources. The `_ffi` feature uses `BLOSC2_C_SOURCE_DIR`
+when set, or the repo-local `c-blosc2/` directory otherwise. Packaged crates do
+not vendor that C source tree.
 
 ```bash
+BLOSC2_C_SOURCE_DIR=/path/to/c-blosc2 cargo test --all-features
 cargo test --all-features
 cargo test --lib --all-features
 cargo clippy --all-targets --all-features -- -D warnings

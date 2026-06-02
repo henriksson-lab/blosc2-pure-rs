@@ -6,9 +6,10 @@
 
 use blosc2_pure_rs::compress::{CParams, DParams};
 use blosc2_pure_rs::constants::*;
-use blosc2_pure_rs::schunk::Schunk;
+use blosc2_pure_rs::schunk::{frame, Schunk};
 use blosc2_pure_rs::{Codec, Filter};
 use clap::{Parser, Subcommand};
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MAX_TEMP_CREATE_ATTEMPTS: usize = 128;
 
 #[derive(Parser)]
 #[command(name = "blosc2", about = "Blosc2 compression tool")]
@@ -45,7 +47,7 @@ enum Commands {
         #[arg(short = 'b', long, default_value_t = 0, value_parser = clap::value_parser!(i32).range(0..))]
         blocksize: i32,
         /// Input bytes per frame chunk
-        #[arg(long, default_value_t = DEFAULT_CHUNKSIZE)]
+        #[arg(long, default_value_t = DEFAULT_CHUNKSIZE, value_parser = parse_chunksize)]
         chunksize: usize,
         /// Split mode (always, never, auto, forward)
         #[arg(short = 's', long, default_value = "forward")]
@@ -85,10 +87,23 @@ struct CompressOptions {
     filter_meta: u8,
 }
 
+fn parse_chunksize(value: &str) -> Result<usize, String> {
+    let chunksize = value
+        .parse::<usize>()
+        .map_err(|err| format!("invalid chunksize: {err}"))?;
+    if chunksize == 0 || chunksize > BLOSC2_MAX_BUFFERSIZE as usize {
+        return Err(format!(
+            "chunksize must be in 1..={}",
+            BLOSC2_MAX_BUFFERSIZE
+        ));
+    }
+    Ok(chunksize)
+}
+
 /// Compresses `input` into a Blosc2 frame written to `output`.
 ///
 /// Reads the input file in `chunksize` segments, appends each as a chunk to a [`Schunk`]
-/// configured with `options`, serializes the super-chunk to disk, and prints ratio and
+/// configured with `options`, streams the super-chunk frame to disk, and prints ratio and
 /// throughput statistics. Output is first written to a sibling temporary file before replacing
 /// `output`, so failed compression or serialization does not leave a partial destination file.
 fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::Result<()> {
@@ -137,7 +152,9 @@ fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::R
     }
 
     let nbytes = schunk.nbytes;
-    atomic_write_all(output, &schunk.to_frame())?;
+    atomic_write_with(output, |writer| {
+        frame::write_frame_to_writer(&schunk, writer)
+    })?;
     let cbytes = std::fs::metadata(output)?.len() as i64;
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -164,11 +181,7 @@ fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::R
 /// produce an empty output file.
 /// Prints ratio and throughput statistics on completion.
 fn decompress_file(input: &Path, output: &Path, nthreads: i16) -> io::Result<()> {
-    let input_str = input
-        .to_str()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid input path"))?;
-
-    let mut schunk = Schunk::open(input_str)
+    let mut schunk = Schunk::open_offset(input, 0)
         .map_err(|e| io::Error::other(format!("Failed to open frame: {e}")))?;
     schunk.dparams.nthreads = nthreads;
 
@@ -180,28 +193,15 @@ fn decompress_file(input: &Path, output: &Path, nthreads: i16) -> io::Result<()>
     }
 
     let start = Instant::now();
-    let temp_path = temp_output_path(output);
-    let temp_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)?;
-    let write_result = (|| {
-        let mut foutput = BufWriter::new(temp_file);
-
+    atomic_write_with(output, |foutput| {
         for i in 0..schunk.nchunks() {
             let data = schunk
                 .decompress_chunk(i)
                 .map_err(|e| io::Error::other(format!("Decompression error: {e}")))?;
             foutput.write_all(&data)?;
         }
-        foutput.flush()
-    })();
-
-    if let Err(err) = write_result {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(err);
-    }
-    replace_output(&temp_path, output)?;
+        Ok(())
+    })?;
 
     let nbytes = schunk.nbytes;
     let cbytes = schunk.cbytes;
@@ -225,14 +225,17 @@ fn decompress_file(input: &Path, output: &Path, nthreads: i16) -> io::Result<()>
 
 /// Writes bytes to `output` through a sibling temporary file, then replaces the destination.
 fn atomic_write_all(output: &Path, bytes: &[u8]) -> io::Result<()> {
-    let temp_path = temp_output_path(output);
+    atomic_write_with(output, |writer| writer.write_all(bytes))
+}
+
+fn atomic_write_with<F>(output: &Path, write: F) -> io::Result<()>
+where
+    F: FnOnce(&mut BufWriter<File>) -> io::Result<()>,
+{
+    let (temp_path, temp_file) = create_temp_output_file(output)?;
     let write_result = (|| {
-        let temp_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)?;
         let mut writer = BufWriter::new(temp_file);
-        writer.write_all(bytes)?;
+        write(&mut writer)?;
         writer.flush()
     })();
 
@@ -243,39 +246,70 @@ fn atomic_write_all(output: &Path, bytes: &[u8]) -> io::Result<()> {
     replace_output(&temp_path, output)
 }
 
+fn create_temp_output_file(output: &Path) -> io::Result<(PathBuf, File)> {
+    let mut last_exists = None;
+    for _ in 0..MAX_TEMP_CREATE_ATTEMPTS {
+        let temp_path = temp_output_path(output);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                last_exists = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "failed to create a unique temporary output after {MAX_TEMP_CREATE_ATTEMPTS} attempts: {}",
+            last_exists
+                .map(|err| err.to_string())
+                .unwrap_or_else(|| "temporary output already exists".to_string())
+        ),
+    ))
+}
+
 fn temp_output_path(output: &Path) -> PathBuf {
     let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    temp_output_path_for(output, counter)
+}
+
+fn temp_output_path_for(output: &Path, counter: u64) -> PathBuf {
     let file_name = output
         .file_name()
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_else(|| ".blosc2-output".into());
-    let temp_name = format!(".{file_name}.tmp.{}.{}", std::process::id(), counter);
+        .unwrap_or_else(|| ".blosc2-output".as_ref());
+    let mut temp_name = OsString::from(".");
+    temp_name.push(file_name);
+    temp_name.push(format!(".tmp.{}.{}", std::process::id(), counter));
     output.with_file_name(temp_name)
 }
 
 fn replace_output(temp_path: &Path, output: &Path) -> io::Result<()> {
-    match std::fs::rename(temp_path, output) {
-        Ok(()) => Ok(()),
-        Err(first_err) if output.exists() => {
-            std::fs::remove_file(output).map_err(|remove_err| {
-                let _ = std::fs::remove_file(temp_path);
-                io::Error::new(
-                    remove_err.kind(),
-                    format!(
-                        "failed to remove existing output after rename failed ({first_err}); {remove_err}"
-                    ),
-                )
-            })?;
-            std::fs::rename(temp_path, output).map_err(|rename_err| {
-                let _ = std::fs::remove_file(temp_path);
-                rename_err
-            })
-        }
-        Err(err) => {
+    replace_output_impl(temp_path, output).inspect_err(|_err| {
+        if temp_path.exists() {
             let _ = std::fs::remove_file(temp_path);
-            Err(err)
         }
+    })
+}
+
+#[cfg(windows)]
+fn replace_output_impl(temp_path: &Path, output: &Path) -> io::Result<()> {
+    match std::fs::remove_file(output) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
     }
+    std::fs::rename(temp_path, output)
+}
+
+#[cfg(not(windows))]
+fn replace_output_impl(temp_path: &Path, output: &Path) -> io::Result<()> {
+    std::fs::rename(temp_path, output)
 }
 
 /// Returns `numerator / denominator` as `f64`, or `0.0` when `denominator` is not positive.
@@ -295,6 +329,41 @@ fn throughput_mib(nbytes: i64, elapsed_secs: f64) -> f64 {
         nbytes as f64 / (elapsed_secs * 1024.0 * 1024.0)
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temp_output_creation_skips_stale_sibling_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.b2frame");
+        let stale = temp_output_path_for(&output, 0);
+        std::fs::write(&stale, b"stale").unwrap();
+
+        TEMP_FILE_COUNTER.store(0, Ordering::Relaxed);
+        let (created, file) = create_temp_output_file(&output).unwrap();
+        drop(file);
+
+        assert_ne!(created, stale);
+        assert_eq!(std::fs::read(&stale).unwrap(), b"stale");
+        assert!(created.exists());
+    }
+
+    #[test]
+    fn replace_output_overwrites_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.b2frame");
+        let temp = dir.path().join(".out.b2frame.tmp");
+        std::fs::write(&output, b"old").unwrap();
+        std::fs::write(&temp, b"new").unwrap();
+
+        replace_output(&temp, &output).unwrap();
+
+        assert_eq!(std::fs::read(&output).unwrap(), b"new");
+        assert!(!temp.exists());
     }
 }
 

@@ -1,26 +1,30 @@
 # TODO
 
-## Broad Audit Backlog (2026-05-24)
+## Active Broad-Audit Findings
 
-This is the active open checklist from a broad translation/parity audit. Older
-sections below are mostly completed historical porting plans and may mention
+No active broad-audit findings remain. Add newly discovered correctness gaps
+above the historical sections below.
+
+- Done: audited precompressed `Schunk` mutation APIs after the active TODO list
+  was empty. `append_chunk`, `insert_chunk`, and `update_compressed_chunk` now
+  run full `cbuffer_validate` checks before accepting caller-provided chunks, so
+  internally invalid headers are rejected at mutation time instead of being
+  stored and failing later during decompression.
+
+## Current Status (2026-05-24)
+
+Older sections below are completed historical porting plans and may mention
 superseded implementation notes.
 
-### P0 - Correctness and Required C-Parity Gaps
+## Completed Test Porting Plan
 
-No active P0 gaps.
-
-No active P1 gaps.
-
-## Test Porting Plan
-
-Port the C test suite to Rust. Tests are grouped by priority. Each test should verify
-that Rust output matches C output (via FFI comparison) where applicable, and should also
-work as standalone pure-Rust tests.
+Historical record of the C test-suite port. Tests were grouped by priority and
+verify Rust output against C output (via FFI comparison) where applicable, while
+also working as standalone pure-Rust tests.
 
 ### Tier 1 — Critical correctness (existing code, zero test coverage)
 
-These test functionality we already implement but don't test:
+These covered functionality that was already implemented but previously untested:
 
 - [x] **Special value chunks** (port `test_fill_special.c`, `test_zero_runlen.c`)
   - Compress all-zero data → verify SPECIAL_ZERO flag in chunk header
@@ -105,7 +109,7 @@ These test functionality we already implement but don't test:
   - Data smaller than minimum header size
   - Data smaller than blocksize (single block)
 
-### Tier 3 — Schunk operations (requires implementing new methods)
+### Tier 3 — Schunk operations (implemented methods)
 
 - [x] **Insert chunk** (port `test_insert_chunk.c`)
   - Insert at beginning, middle, end
@@ -136,7 +140,7 @@ These test functionality we already implement but don't test:
   - Reorder chunks in a schunk
   - Verify all chunks still decompress correctly
 
-### Tier 4 — Advanced features (requires new implementations)
+### Tier 4 — Advanced features (implemented features)
 
 - [x] **Variable-length chunks** (port `test_variable_chunks.c`)
   - [x] Chunks with different uncompressed sizes
@@ -213,7 +217,7 @@ These test functionality we already implement but don't test:
 - [x] Remove unused FFI code from library (keep for tests only)
 
 ## Phase 7: Performance Optimization
-- [x] Reintroduce SIMD only behind audited safe wrappers (SSE2 shuffle/unshuffle wrappers with scalar fallback; future bitshuffle/AVX2 work should follow the same wrapper pattern)
+- [x] Reintroduce SIMD only behind audited safe wrappers (SSE2 shuffle/unshuffle, bitshuffle/bitunshuffle, and AVX2 wrappers with scalar fallback)
 - [x] Add multi-threading using rayon for block-parallel compression/decompression
 - [x] Re-benchmark after optimizations
 
@@ -236,7 +240,7 @@ These test functionality we already implement but don't test:
   - [x] Skip filter scratch allocation for no-op filter pipelines in the shared block compression helper
   - [x] Avoid zero-filling the serial output buffer's full worst-case compressed capacity
   - [x] Avoid copying filtered data when source/destination buffers can be reused safely
-  - Deferred: direct compression into uninitialized frame output would require unsafe initialized-slice handling; keep current safe scratch-buffer boundary
+  - Design note: direct compression into uninitialized frame output would require unsafe initialized-slice handling, so the safe scratch-buffer boundary is intentional
 - [x] Revisit pure-Rust zlib backend performance
   - [x] Benchmark current `flate2`/miniz path against available pure-Rust alternatives
   - [x] Add opt-in `zlib-rs` feature for local comparison
@@ -259,7 +263,7 @@ These test functionality we already implement but don't test:
   - [x] Share per-call scratch buffers across blocks in `update_chunk`, `filtered_vl_blocks`, `filtered_blocks_for_dict`, and the dict compression loop
   - [x] Audit remaining filtered-data copies — filter output is written directly into codec input buffers on the hot path; remaining `copy_from_slice` calls are either small metadata (length prefixes) or unavoidable final-output assembly
   - [x] Keep initialized-buffer safety — all new scratch reuse uses `.resize(n, 0)`; no unsafe introduced
-  - Note: parallel block assembly is deferred because compressed block sizes are variable
+  - Design note: parallel block assembly is intentionally not used because compressed block sizes are variable
 - [x] Improve unshuffle performance for decompression-heavy workloads
   - [x] Profile `typesize=4` LZ4 and BloscLZ decompression with `perf`
   - [x] Tune common-width unshuffle loops for `typesize` 2, 4, and 8
@@ -330,8 +334,8 @@ These test functionality we already implement but don't test:
   - [x] Preserve chunk boundaries and existing frame compatibility
   - [x] Add tests for cross-chunk and partial-block updates
 
-## Scope Notes and Future Work
+## Scope Notes and Non-Goals
 - LZ4HC compression is implemented in pure Rust.
-- User-defined codec/filter plugins are supported through in-process Rust registration APIs; external dynamic plugin loading is not implemented
+- User-defined codec/filter plugins are supported through in-process Rust registration APIs; external dynamic plugin loading is out of scope.
 - Fixed-size frame metalayers and VL-metalayers are supported
-- B2ND expand/squeeze views share backing through B2ND methods and `Schunk` chunk mutators; direct mutation of the public `B2ndArray::schunk.chunks` vector is a legacy escape hatch and intentionally bypasses the internal shared store.
+- B2ND expand/squeeze views share backing through B2ND methods and `Schunk` chunk mutators; direct mutation of the public `B2ndArray::schunk.chunks` vector is a legacy escape hatch, but the same handle publishes direct edits when it next enters the Schunk/B2ND API.

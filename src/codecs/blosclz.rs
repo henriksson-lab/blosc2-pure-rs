@@ -227,6 +227,14 @@ fn get_run_or_match(
     }
 }
 
+#[inline]
+fn output_has_space(op: usize, len: usize, op_limit: usize) -> bool {
+    match op.checked_add(len) {
+        Some(end) => end <= op_limit,
+        None => false,
+    }
+}
+
 /// Estimate the compression ratio of `data` cheaply, used for entropy
 /// probing before launching a full encode. Mirrors a streamlined version
 /// of [`compress`]: it walks the hash table and accumulates the number of
@@ -955,17 +963,24 @@ pub fn decompress(input: &[u8], output: &mut [u8]) -> i32 {
     loop {
         if ctrl >= 32 {
             // Match
-            let mut len = (ctrl >> 5) as i32 - 1;
-            let mut ofs = ((ctrl & 31) << 8) as i32;
+            let mut len = (ctrl >> 5) as usize - 1;
+            let ofs = ((ctrl & 31) << 8) as usize;
 
             if len == 6 {
                 loop {
                     if ip + 1 >= ip_limit {
                         return 0;
                     }
-                    let code = read(ip);
+                    let code = read(ip) as usize;
                     ip += 1;
-                    len += code as i32;
+                    len = match len.checked_add(code) {
+                        Some(len) => len,
+                        None => return 0,
+                    };
+                    match len.checked_add(3) {
+                        Some(len_with_base) if output_has_space(op, len_with_base, op_limit) => {}
+                        _ => return 0,
+                    }
                     if code != 255 {
                         break;
                     }
@@ -974,44 +989,58 @@ pub fn decompress(input: &[u8], output: &mut [u8]) -> i32 {
                 return 0;
             }
 
-            let code = read(ip);
+            let code = read(ip) as usize;
             ip += 1;
-            len += 3;
-            let mut ref_offset = op as i32 - ofs - code as i32;
+            len = match len.checked_add(3) {
+                Some(len) => len,
+                None => return 0,
+            };
+            let mut distance = match ofs
+                .checked_add(code)
+                .and_then(|distance| distance.checked_add(1))
+            {
+                Some(distance) => distance,
+                None => return 0,
+            };
 
             // 16-bit distance
             if code == 255 && ofs == (31 << 8) {
                 if ip + 1 >= ip_limit {
                     return 0;
                 }
-                ofs = (read(ip) as i32) << 8;
+                let mut long_ofs = (read(ip) as usize) << 8;
                 ip += 1;
-                ofs += read(ip) as i32;
+                long_ofs += read(ip) as usize;
                 ip += 1;
-                ref_offset = op as i32 - ofs - MAX_DISTANCE as i32;
+                distance = match long_ofs
+                    .checked_add(MAX_DISTANCE as usize)
+                    .and_then(|distance| distance.checked_add(1))
+                {
+                    Some(distance) => distance,
+                    None => return 0,
+                };
             }
 
-            if op + len as usize > op_limit {
+            if !output_has_space(op, len, op_limit) {
                 return 0;
             }
-            ref_offset -= 1;
-            if ref_offset < 0 {
+            if distance > op {
                 return 0;
             }
+
+            let ref_pos = op - distance;
+            let match_len = len;
+
+            for i in 0..match_len {
+                output[op + i] = output[ref_pos + i];
+            }
+            op += match_len;
 
             if ip >= ip_limit {
                 break;
             }
             ctrl = read(ip) as u32;
             ip += 1;
-
-            let ref_pos = ref_offset as usize;
-            let match_len = len as usize;
-
-            for i in 0..match_len {
-                output[op + i] = output[ref_pos + i];
-            }
-            op += match_len;
         } else {
             // Literal
             ctrl += 1;
@@ -1152,6 +1181,7 @@ mod tests {
         let cases: &[&[u8]] = &[
             &[0x00],
             &[0x00, b'a', 0x20, 0x10],
+            &[2, b'a', b'b', b'c', 32, 2],
             &[0x00, b'a', 0xe0, 0x00],
             &[0x00, b'a', 0xff, 0xff, 0xff],
             &[0x00, b'a', 0xff, 0x00, 0xff, 0x00],
@@ -1165,6 +1195,26 @@ mod tests {
                 "malformed BloscLZ block should be rejected: {case:02x?}"
             );
         }
+    }
+
+    #[test]
+    fn decompress_rejects_long_match_length_extension_overflow() {
+        let extension_count = ((i32::MAX as usize - 6) / 255) + 1;
+        let mut input = Vec::with_capacity(1 + extension_count + 2);
+        input.push(0xe0);
+        input.resize(1 + extension_count, 255);
+        input.extend_from_slice(&[0x00, 0x00]);
+
+        let mut output = [0u8; 64];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decompress(&input, &mut output)
+        }));
+
+        assert!(
+            result.is_ok(),
+            "malformed long-match length extension must not panic"
+        );
+        assert_eq!(result.unwrap(), 0);
     }
 
     #[test]

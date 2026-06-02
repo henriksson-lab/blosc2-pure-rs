@@ -1,5 +1,11 @@
 use blosc2_pure_rs::{B2ndArray, B2ndMeta, CParams, DParams, DTYPE_NUMPY_FORMAT};
+use std::ffi::OsString;
+use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+const MAX_TEMP_DIR_ATTEMPTS: usize = 128;
 
 fn f64_bytes(values: impl IntoIterator<Item = f64>) -> Vec<u8> {
     values
@@ -43,14 +49,14 @@ fn f64_array() -> Result<B2ndArray, &'static str> {
 
 fn print_meta_and_open() -> Result<(), Box<dyn std::error::Error>> {
     let array = f64_array()?;
-    let path = unique_temp_path("blosc2-rs-b2nd-example.b2frame");
+    let temp_dir = unique_temp_dir("blosc2-rs-b2nd-example")?;
+    let path = temp_dir.path().join("array.b2frame");
     array.save(&path)?;
 
     let opened = B2ndArray::open(&path)?;
     println!("metadata:\n{}", opened.format_meta());
     assert_eq!(opened.shape(), &[10, 10]);
     assert_eq!(opened.to_cbuffer()?, array.to_cbuffer()?);
-    std::fs::remove_dir_all(path)?;
     Ok(())
 }
 
@@ -148,8 +154,51 @@ fn orthogonal_indexing() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn unique_temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn unique_temp_dir(prefix: &str) -> io::Result<TempDir> {
+    let mut last_exists = None;
+    for _ in 0..MAX_TEMP_DIR_ATTEMPTS {
+        let path = unique_temp_dir_path(prefix);
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(TempDir { path }),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                last_exists = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "failed to create a unique temporary directory after {MAX_TEMP_DIR_ATTEMPTS} attempts: {}",
+            last_exists
+                .map(|err| err.to_string())
+                .unwrap_or_else(|| "temporary directory already exists".to_string())
+        ),
+    ))
+}
+
+fn unique_temp_dir_path(prefix: &str) -> PathBuf {
+    let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut name = OsString::from(prefix);
+    name.push(format!("-{}-{counter}", std::process::id()));
+    std::env::temp_dir().join(name)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

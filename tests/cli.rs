@@ -28,6 +28,33 @@ where
         .expect("failed to run blosc2 CLI")
 }
 
+#[cfg(unix)]
+fn run_with_stale_first_temp<I, S>(args: I, output_path: &Path) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    Command::new("bash")
+        .arg("-c")
+        .arg(
+            r#"
+set -eu
+out=$1
+shift
+dir=$(dirname -- "$out")
+base=$(basename -- "$out")
+printf stale > "$dir/.$base.tmp.$$.0"
+exec "$@"
+"#,
+        )
+        .arg("blosc2-stale-temp")
+        .arg(output_path)
+        .arg(RUST_BIN)
+        .args(args)
+        .output()
+        .expect("failed to run blosc2 CLI through stale-temp harness")
+}
+
 fn assert_success(output: Output) {
     assert!(
         output.status.success(),
@@ -48,6 +75,20 @@ fn assert_failure_contains(output: Output, expected: &str) {
     assert!(
         stderr.contains(expected),
         "stderr did not contain {expected:?}\nstderr:\n{stderr}"
+    );
+}
+
+fn assert_stdout_contains(output: Output, expected: &str) {
+    assert!(
+        output.status.success(),
+        "command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(expected),
+        "stdout did not contain {expected:?}\nstdout:\n{stdout}"
     );
 }
 
@@ -74,6 +115,14 @@ fn roundtrip(args: &[&str], data: &[u8]) {
         OsStr::new("2"),
     ]));
     assert_eq!(fs::read(restored).unwrap(), data);
+}
+
+#[test]
+fn decompress_help_documents_nthreads_default() {
+    let help = run(["decompress", "--help"]);
+    assert_stdout_contains(help, "-n, --nthreads <NTHREADS>");
+    let help = run(["decompress", "--help"]);
+    assert_stdout_contains(help, "[default: 4]");
 }
 
 #[test]
@@ -263,6 +312,36 @@ fn successful_commands_overwrite_existing_outputs() {
 
 #[cfg(unix)]
 #[test]
+fn commands_skip_stale_first_temp_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("input.bin");
+    let compressed = dir.path().join("output.b2frame");
+    let restored = dir.path().join("restored.bin");
+    let data = compressible_data(4096);
+    fs::write(&input, &data).unwrap();
+
+    assert_success(run_with_stale_first_temp(
+        [
+            OsStr::new("compress"),
+            input.as_os_str(),
+            compressed.as_os_str(),
+        ],
+        &compressed,
+    ));
+
+    assert_success(run_with_stale_first_temp(
+        [
+            OsStr::new("decompress"),
+            compressed.as_os_str(),
+            restored.as_os_str(),
+        ],
+        &restored,
+    ));
+    assert_eq!(fs::read(restored).unwrap(), data);
+}
+
+#[cfg(unix)]
+#[test]
 fn compression_accepts_non_utf8_output_paths() {
     use std::os::unix::ffi::OsStringExt;
 
@@ -279,4 +358,30 @@ fn compression_accepts_non_utf8_output_paths() {
         output.as_os_str(),
     ]));
     assert!(output.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn decompression_accepts_non_utf8_input_paths() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("input.bin");
+    fs::write(&input, b"payload").unwrap();
+
+    let compressed_name = std::ffi::OsString::from_vec(b"in-\xff.b2frame".to_vec());
+    let compressed = dir.path().join(Path::new(&compressed_name));
+    let restored = dir.path().join("restored.bin");
+
+    assert_success(run([
+        OsStr::new("compress"),
+        input.as_os_str(),
+        compressed.as_os_str(),
+    ]));
+    assert_success(run([
+        OsStr::new("decompress"),
+        compressed.as_os_str(),
+        restored.as_os_str(),
+    ]));
+    assert_eq!(fs::read(restored).unwrap(), b"payload");
 }

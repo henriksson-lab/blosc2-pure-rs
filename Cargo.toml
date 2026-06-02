@@ -15,6 +15,7 @@ include = [
     "/benches/**/*.rs",
     "/docs/**/*.md",
     "/examples/**/*.rs",
+    "/tests/**/*.rs",
     "/build.rs",
     "/Cargo.toml",
     "/README.md",
@@ -34,14 +35,14 @@ required-features = ["cli"]
 default = ["zlib-rs"]
 cli = ["dep:clap"]
 compare-blosc2-rs = ["dep:blosc2"]
-# Use flate2's zlib-rs backend. This is the default because it benchmarked
-# faster than the miniz_oxide-backed rust_backend in this crate.
+# Enable flate2's zlib-rs backend. The dependency always keeps rust_backend
+# available so cargo check --no-default-features still has a valid backend.
 zlib-rs = ["flate2/zlib-rs"]
-# Fallback pure-Rust backend using miniz_oxide via flate2's rust_backend.
+# Compatibility feature for explicitly selecting the miniz_oxide-backed path.
 zlib-miniz = ["flate2/rust_backend"]
 # (lz4hc-sys feature removed in v0.3.0 — pure-Rust LZ4HC is always available via lz4-pure-rs.)
-# Internal feature for development testing against C-Blosc2.
-# Not part of the public API. Requires c-blosc2 source in c-blosc2/.
+# Internal feature for development testing against C-Blosc2. Not part of the
+# public API. Uses BLOSC2_C_SOURCE_DIR or repo-local c-blosc2/ as the C source.
 _ffi = ["dep:cmake", "dep:bindgen"]
 
 [dependencies]
@@ -49,7 +50,7 @@ blosc2 = { package = "blosc2-rs", version = "0.4.0", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 rayon = "1"
 lz4-pure = { package = "lz4-pure-rs", version = "0.1.0" }
-flate2 = { version = "1", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 zstd-pure-rs = "0.1"
 
 [dev-dependencies]
@@ -59,6 +60,46 @@ tempfile = "3"
 [[bench]]
 name = "perf"
 harness = false
+
+[[test]]
+name = "cli"
+required-features = ["cli"]
+
+[[test]]
+name = "equivalence"
+required-features = ["_ffi", "cli"]
+
+[[test]]
+name = "codec_equivalence"
+required-features = ["_ffi"]
+
+[[test]]
+name = "compress_equivalence"
+required-features = ["_ffi"]
+
+[[test]]
+name = "filter_equivalence"
+required-features = ["_ffi"]
+
+[[test]]
+name = "tier1_edge_cases"
+required-features = ["_ffi"]
+
+[[test]]
+name = "tier1_multi_filter"
+required-features = ["_ffi"]
+
+[[test]]
+name = "tier1_special_values"
+required-features = ["_ffi"]
+
+[[test]]
+name = "tier2_stress"
+required-features = ["_ffi"]
+
+[[test]]
+name = "unit_ffi"
+required-features = ["_ffi"]
 
 [profile.release]
 lto = true

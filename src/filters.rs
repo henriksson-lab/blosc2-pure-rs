@@ -674,29 +674,27 @@ fn ndmean_backward_impl(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &
         .unwrap_or(1)
 }
 
-fn bytedelta_typesize(meta: u8, typesize: usize) -> Option<usize> {
-    let typesize = if meta == 0 { typesize } else { meta as usize };
+fn bytedelta_typesize(meta: u8) -> Option<usize> {
+    let typesize = usize::from(meta);
     (1..=BLOSC2_MAXTYPESIZE)
         .contains(&typesize)
         .then_some(typesize)
 }
 
-fn bytedelta_forward_impl(
-    meta: u8,
-    typesize: usize,
-    _block_offset: usize,
-    src: &[u8],
-    dest: &mut [u8],
-) -> i32 {
-    let Some(typesize) = bytedelta_typesize(meta, typesize) else {
-        return 1;
-    };
+fn bytedelta_context_typesize(ctx: &FilterCallbackContext<'_>) -> Option<usize> {
+    if ctx.meta == 0 {
+        (ctx.chunk.schunk != 0).then_some(ctx.typesize)
+    } else {
+        bytedelta_typesize(ctx.meta)
+    }
+}
+
+fn bytedelta_forward_core(typesize: usize, src: &[u8], dest: &mut [u8]) -> i32 {
     if dest.len() < src.len() {
         return 1;
     }
 
     let stream_len = src.len() / typesize;
-    let main_len = stream_len * typesize;
     for channel in 0..typesize {
         let base = channel * stream_len;
         let mut previous = 0u8;
@@ -706,20 +704,46 @@ fn bytedelta_forward_impl(
             previous = value;
         }
     }
-    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
     0
 }
 
+fn bytedelta_backward_core(typesize: usize, src: &[u8], dest: &mut [u8]) -> i32 {
+    if dest.len() < src.len() {
+        return 1;
+    }
+
+    let stream_len = src.len() / typesize;
+    for channel in 0..typesize {
+        let base = channel * stream_len;
+        let mut previous = 0u8;
+        for i in 0..stream_len {
+            let value = src[base + i].wrapping_add(previous);
+            dest[base + i] = value;
+            previous = value;
+        }
+    }
+    0
+}
+
+fn bytedelta_forward_impl(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
+    let Some(typesize) = bytedelta_context_typesize(ctx) else {
+        return 1;
+    };
+    bytedelta_forward_core(typesize, src, dest)
+}
+
 fn bytedelta_backward_impl(
-    meta: u8,
-    typesize: usize,
-    _block_offset: usize,
+    ctx: &mut FilterCallbackContext<'_>,
     src: &[u8],
     dest: &mut [u8],
 ) -> i32 {
-    let Some(typesize) = bytedelta_typesize(meta, typesize) else {
+    let Some(typesize) = bytedelta_context_typesize(ctx) else {
         return 1;
     };
+    bytedelta_backward_core(typesize, src, dest)
+}
+
+fn bytedelta_buggy_forward_core(typesize: usize, src: &[u8], dest: &mut [u8]) -> i32 {
     if dest.len() < src.len() {
         return 1;
     }
@@ -728,8 +752,44 @@ fn bytedelta_backward_impl(
     let main_len = stream_len * typesize;
     for channel in 0..typesize {
         let base = channel * stream_len;
+        let vectorizable_len = stream_len - (stream_len % 16);
         let mut previous = 0u8;
-        for i in 0..stream_len {
+        for i in 0..vectorizable_len {
+            let value = src[base + i];
+            dest[base + i] = value.wrapping_sub(previous);
+            previous = value;
+        }
+
+        previous = 0;
+        for i in vectorizable_len..stream_len {
+            let value = src[base + i];
+            dest[base + i] = value.wrapping_sub(previous);
+            previous = value;
+        }
+    }
+    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
+    0
+}
+
+fn bytedelta_buggy_backward_core(typesize: usize, src: &[u8], dest: &mut [u8]) -> i32 {
+    if dest.len() < src.len() {
+        return 1;
+    }
+
+    let stream_len = src.len() / typesize;
+    let main_len = stream_len * typesize;
+    for channel in 0..typesize {
+        let base = channel * stream_len;
+        let vectorizable_len = stream_len - (stream_len % 16);
+        let mut previous = 0u8;
+        for i in 0..vectorizable_len {
+            let value = src[base + i].wrapping_add(previous);
+            dest[base + i] = value;
+            previous = value;
+        }
+
+        previous = 0;
+        for i in vectorizable_len..stream_len {
             let value = src[base + i].wrapping_add(previous);
             dest[base + i] = value;
             previous = value;
@@ -740,77 +800,25 @@ fn bytedelta_backward_impl(
 }
 
 fn bytedelta_buggy_forward_impl(
-    meta: u8,
-    typesize: usize,
-    _block_offset: usize,
+    ctx: &mut FilterCallbackContext<'_>,
     src: &[u8],
     dest: &mut [u8],
 ) -> i32 {
-    let Some(typesize) = bytedelta_typesize(meta, typesize) else {
+    let Some(typesize) = bytedelta_context_typesize(ctx) else {
         return 1;
     };
-    if dest.len() < src.len() {
-        return 1;
-    }
-
-    let stream_len = src.len() / typesize;
-    let main_len = stream_len * typesize;
-    for channel in 0..typesize {
-        let base = channel * stream_len;
-        let vectorizable_len = stream_len - (stream_len % 16);
-        let mut previous = 0u8;
-        for i in 0..vectorizable_len {
-            let value = src[base + i];
-            dest[base + i] = value.wrapping_sub(previous);
-            previous = value;
-        }
-
-        previous = 0;
-        for i in vectorizable_len..stream_len {
-            let value = src[base + i];
-            dest[base + i] = value.wrapping_sub(previous);
-            previous = value;
-        }
-    }
-    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
-    0
+    bytedelta_buggy_forward_core(typesize, src, dest)
 }
 
 fn bytedelta_buggy_backward_impl(
-    meta: u8,
-    typesize: usize,
-    _block_offset: usize,
+    ctx: &mut FilterCallbackContext<'_>,
     src: &[u8],
     dest: &mut [u8],
 ) -> i32 {
-    let Some(typesize) = bytedelta_typesize(meta, typesize) else {
+    let Some(typesize) = bytedelta_context_typesize(ctx) else {
         return 1;
     };
-    if dest.len() < src.len() {
-        return 1;
-    }
-
-    let stream_len = src.len() / typesize;
-    let main_len = stream_len * typesize;
-    for channel in 0..typesize {
-        let base = channel * stream_len;
-        let vectorizable_len = stream_len - (stream_len % 16);
-        let mut previous = 0u8;
-        for i in 0..vectorizable_len {
-            let value = src[base + i].wrapping_add(previous);
-            dest[base + i] = value;
-            previous = value;
-        }
-
-        previous = 0;
-        for i in vectorizable_len..stream_len {
-            let value = src[base + i].wrapping_add(previous);
-            dest[base + i] = value;
-            previous = value;
-        }
-    }
-    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
-    0
+    bytedelta_buggy_backward_core(typesize, src, dest)
 }
 
 fn int_trunc_forward_impl(
@@ -872,7 +880,6 @@ fn int_trunc_forward_impl(
             _ => unreachable!("typesize was checked above"),
         }
     }
-    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
     0
 }
 
@@ -915,14 +922,14 @@ fn ensure_known_global_filters_registered() {
                     ndmean_forward_impl,
                     ndmean_backward_impl,
                 ),
-                BLOSC_FILTER_BYTEDELTA_BUGGY => register_global_fallible_filter_with_metadata(
+                BLOSC_FILTER_BYTEDELTA_BUGGY => register_global_context_filter_with_metadata(
                     filter.filter_id,
                     filter.name,
                     filter.version,
                     bytedelta_buggy_forward_impl,
                     bytedelta_buggy_backward_impl,
                 ),
-                BLOSC_FILTER_BYTEDELTA => register_global_fallible_filter_with_metadata(
+                BLOSC_FILTER_BYTEDELTA => register_global_context_filter_with_metadata(
                     filter.filter_id,
                     filter.name,
                     filter.version,
@@ -1073,7 +1080,7 @@ fn register_blosc2_filter_impl(filter: &Blosc2Filter) -> Result<(), &'static str
             forward: UserFilterForward::Fallible(filter.forward),
             backward: UserFilterBackward::Fallible(filter.backward),
         };
-        return if existing.name == registered.name {
+        return if existing.same_callbacks(registered) {
             Ok(())
         } else {
             Err("User-defined filter ID already registered")
@@ -3005,7 +3012,11 @@ pub fn pipeline_forward_with_context(
                 }
             }
             BLOSC_DELTA => {
-                let actual_dref = dref.unwrap_or(src);
+                let actual_dref = if block_offset == 0 {
+                    inp
+                } else {
+                    dref.unwrap_or(src)
+                };
                 delta_encode(actual_dref, block_offset, bsize, typesize, inp, out);
             }
             BLOSC_TRUNC_PREC => {
@@ -3366,6 +3377,16 @@ mod tests {
         0
     }
 
+    fn unwritten_fallible_filter(
+        _meta: u8,
+        _typesize: usize,
+        _block_offset: usize,
+        _src: &[u8],
+        _dest: &mut [u8],
+    ) -> i32 {
+        0
+    }
+
     #[test]
     fn test_c_style_raw_filter_wrappers() {
         let data: Vec<u8> = (0..64).collect();
@@ -3456,7 +3477,7 @@ mod tests {
         };
         assert_eq!(
             blosc2_register_filter(&same_name_different_callbacks),
-            BLOSC2_ERROR_SUCCESS
+            BLOSC2_ERROR_FAILURE
         );
         let same_id_different_name = Blosc2Filter {
             name: "other-copy",
@@ -3609,6 +3630,97 @@ mod tests {
     }
 
     #[test]
+    fn test_bytedelta_rejects_c_incompatible_metadata_and_leaves_partial_tails_unwritten() {
+        let src: Vec<u8> = (0..130)
+            .flat_map(|idx| (idx as u32).wrapping_mul(17).to_ne_bytes())
+            .collect();
+        let filters = [0, 0, 0, 0, 0, BLOSC_FILTER_BYTEDELTA];
+        let mut filters_meta = [0; BLOSC2_MAX_FILTERS];
+        let mut encoded = vec![0u8; src.len()];
+        let mut scratch = vec![0u8; src.len()];
+
+        let current = pipeline_forward(
+            &src,
+            &mut encoded,
+            &mut scratch,
+            &filters,
+            &filters_meta,
+            4,
+            0,
+            None,
+        );
+        assert_eq!(current, 0);
+
+        let mut decoded = src.clone();
+        let mut decode_scratch = vec![0u8; src.len()];
+        let current = pipeline_backward(
+            &mut decoded,
+            &mut decode_scratch,
+            src.len(),
+            &filters,
+            &filters_meta,
+            BLOSC2_VERSION_FORMAT,
+            4,
+            0,
+            None,
+            1,
+        );
+        assert_eq!(current, 0);
+
+        assert_eq!(
+            pipeline_forward(
+                &src,
+                &mut encoded,
+                &mut scratch,
+                &filters,
+                &filters_meta,
+                BLOSC2_MAXTYPESIZE + 1,
+                0,
+                None,
+            ),
+            0
+        );
+
+        filters_meta[BLOSC2_MAX_FILTERS - 1] = 4;
+        let src_with_tail = &src[..src.len() - 1];
+        let current = pipeline_forward(
+            src_with_tail,
+            &mut encoded[..src_with_tail.len()],
+            &mut scratch[..src_with_tail.len()],
+            &filters,
+            &filters_meta,
+            4,
+            0,
+            None,
+        );
+        assert_ne!(current, 0);
+        let encoded = if current == 1 {
+            &encoded[..src_with_tail.len()]
+        } else {
+            &scratch[..src_with_tail.len()]
+        };
+        assert_eq!(encoded[src_with_tail.len() - 1], 0);
+
+        let mut decoded = encoded.to_vec();
+        let mut scratch = vec![0u8; src_with_tail.len()];
+        let current = pipeline_backward(
+            &mut decoded,
+            &mut scratch,
+            src_with_tail.len(),
+            &filters,
+            &filters_meta,
+            BLOSC2_VERSION_FORMAT,
+            4,
+            0,
+            None,
+            1,
+        );
+        assert_ne!(current, 0);
+        let decoded = if current == 1 { decoded } else { scratch };
+        assert_eq!(decoded[src_with_tail.len() - 1], 0);
+    }
+
+    #[test]
     fn test_bytedelta_buggy_matches_legacy_simd_tail_split() {
         let src: Vec<u8> = (0..70).map(|idx| (idx * 7 + 3) as u8).collect();
         let filters = [0, 0, 0, 0, 0, BLOSC_FILTER_BYTEDELTA_BUGGY];
@@ -3701,6 +3813,42 @@ mod tests {
         assert_ne!(current, 0);
         let decoded = if current == 1 { decoded } else { scratch };
         assert_eq!(decoded, expected);
+
+        let src_with_tail = [&src[..], &[0xAA, 0xBB][..]].concat();
+        let mut encoded = vec![0xA5u8; src_with_tail.len()];
+        let mut scratch = vec![0x5Au8; src_with_tail.len()];
+        let current = pipeline_forward(
+            &src_with_tail,
+            &mut encoded,
+            &mut scratch,
+            &filters,
+            &filters_meta,
+            4,
+            0,
+            None,
+        );
+        assert_ne!(current, 0);
+        let encoded = if current == 1 { encoded } else { scratch };
+        assert_eq!(&encoded[src.len()..], &[0x5A, 0x5A]);
+
+        let mut decoded = encoded.clone();
+        let mut scratch = vec![0x5Au8; src_with_tail.len()];
+        let current = pipeline_backward(
+            &mut decoded,
+            &mut scratch,
+            src_with_tail.len(),
+            &filters,
+            &filters_meta,
+            BLOSC2_VERSION_FORMAT,
+            4,
+            0,
+            None,
+            1,
+        );
+        assert_ne!(current, 0);
+        let decoded = if current == 1 { decoded } else { scratch };
+        assert_eq!(&decoded[..src.len()], &expected);
+        assert_eq!(&decoded[src.len()..], &[0x5A, 0x5A]);
     }
 
     #[test]
@@ -3830,6 +3978,71 @@ mod tests {
         assert_eq!(
             pipeline_backward(&mut buf1, &mut buf2, 4, &filters, &meta, 1, 1, 0, None, 1),
             0
+        );
+    }
+
+    #[test]
+    fn test_user_filter_success_without_writes_leaves_output_buffer_unchanged() {
+        const FILTER_ID: u8 = BLOSC2_USER_DEFINED_FILTERS_START + 32;
+        register_fallible_filter(
+            FILTER_ID,
+            unwritten_fallible_filter,
+            unwritten_fallible_filter,
+        )
+        .unwrap();
+
+        let src = [1u8, 2, 3, 4];
+        let mut buf1 = [0xA5u8; 4];
+        let mut buf2 = [0x5Au8; 4];
+        let mut filters = [BLOSC_NOFILTER; BLOSC2_MAX_FILTERS];
+        let meta = [0u8; BLOSC2_MAX_FILTERS];
+
+        filters[BLOSC2_MAX_FILTERS - 1] = FILTER_ID;
+        let current = pipeline_forward(&src, &mut buf1, &mut buf2, &filters, &meta, 1, 0, None);
+        assert_eq!(if current == 1 { buf1 } else { buf2 }, [0x5Au8; 4]);
+
+        buf1 = [0xA5; 4];
+        buf2 = [0x5A; 4];
+        let current = pipeline_backward(&mut buf1, &mut buf2, 4, &filters, &meta, 1, 1, 0, None, 1);
+        assert_eq!(if current == 1 { buf1 } else { buf2 }, [0x5Au8; 4]);
+    }
+
+    #[test]
+    fn test_delta_backward_uses_raw_reference_before_prefix_filters() {
+        const PREFIX_FAIL_ID: u8 = BLOSC2_USER_DEFINED_FILTERS_START + 33;
+        register_fallible_filter(
+            PREFIX_FAIL_ID,
+            failing_fallible_filter,
+            copy_fallible_filter,
+        )
+        .unwrap();
+
+        let src = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let dref = [10u8, 11, 12, 13, 14, 15, 16, 17];
+        let mut buf1 = src;
+        let mut buf2 = [0u8; 8];
+        let mut filters = [BLOSC_NOFILTER; BLOSC2_MAX_FILTERS];
+        let meta = [0u8; BLOSC2_MAX_FILTERS];
+
+        filters[0] = PREFIX_FAIL_ID;
+        filters[1] = BLOSC_DELTA;
+        let current = pipeline_backward(
+            &mut buf1,
+            &mut buf2,
+            8,
+            &filters,
+            &meta,
+            BLOSC2_VERSION_FORMAT,
+            1,
+            8,
+            Some(&dref),
+            1,
+        );
+        assert_ne!(current, 0);
+        let decoded = if current == 1 { buf1 } else { buf2 };
+        assert_eq!(
+            decoded,
+            std::array::from_fn::<_, 8, _>(|idx| src[idx] ^ dref[idx])
         );
     }
 
