@@ -234,6 +234,16 @@ fn known_global_codec_by_name(name: &str) -> Option<KnownGlobalCodec> {
         .find(|codec| codec.name == name)
 }
 
+fn builtin_complib_info(complib: u8) -> Option<(&'static str, &'static str)> {
+    match complib {
+        BLOSC_BLOSCLZ_LIB => Some((BLOSC_BLOSCLZ_LIBNAME, "2.5.3")),
+        BLOSC_LZ4_LIB => Some((BLOSC_LZ4_LIBNAME, "1.10.0")),
+        BLOSC_ZLIB_LIB => Some((BLOSC_ZLIB_LIBNAME, "2.0.7")),
+        BLOSC_ZSTD_LIB => Some((BLOSC_ZSTD_LIBNAME, "1.5.7")),
+        _ => None,
+    }
+}
+
 /// Returns `true` for C-Blosc2 global plugin codec IDs known by this crate.
 ///
 /// These entries provide C-compatible IDs and metadata. They do not imply that
@@ -648,6 +658,9 @@ pub fn registered_codec_complib_info(name: &str) -> Option<(u8, &'static str, &'
             return None;
         }
         let complib = codec.complib?;
+        if let Some((libname, version)) = builtin_complib_info(complib) {
+            return Some((complib, libname, version));
+        }
         let libname = order
             .iter()
             .find_map(|code| {
@@ -661,6 +674,9 @@ pub fn registered_codec_complib_info(name: &str) -> Option<(u8, &'static str, &'
 
 /// Return the registered codec name for a compressor-library code.
 pub fn registered_codec_name_by_complib(complib: u8) -> Option<&'static str> {
+    if let Some((libname, _version)) = builtin_complib_info(complib) {
+        return Some(libname);
+    }
     if let Some(codec) = known_global_codec_by_code(complib) {
         return Some(codec.name);
     }
@@ -770,10 +786,10 @@ pub fn compress_block_with_context(
                 callback_context.complib = codec.complib;
                 callback_context.meta = meta;
                 callback_context.clevel = clevel;
-                dest.fill(0);
-                codec
+                let result = codec
                     .compress
-                    .run(&mut callback_context, clevel, meta, src, dest)
+                    .run(&mut callback_context, clevel, meta, src, dest);
+                normalize_user_compress_result(result, dest.len())
             }
             None => BLOSC2_ERROR_CODEC_SUPPORT,
         },
@@ -856,12 +872,33 @@ pub fn decompress_block_with_context(
                 callback_context.compcode = compcode;
                 callback_context.complib = codec.complib;
                 callback_context.meta = meta;
-                dest.fill(0);
-                codec.decompress.run(&mut callback_context, meta, src, dest)
+                normalize_user_decompress_result(
+                    codec.decompress.run(&mut callback_context, meta, src, dest),
+                    dest.len(),
+                )
             }
             None => BLOSC2_ERROR_CODEC_SUPPORT,
         },
     }
+}
+
+fn normalize_user_compress_result(result: i32, dest_len: usize) -> i32 {
+    if result > i32::try_from(dest_len).unwrap_or(i32::MAX) {
+        BLOSC2_ERROR_WRITE_BUFFER
+    } else if result < 0 {
+        BLOSC2_ERROR_DATA
+    } else {
+        result
+    }
+}
+
+fn normalize_user_decompress_result(result: i32, dest_len: usize) -> i32 {
+    let Ok(dest_len) = i32::try_from(dest_len) else {
+        return BLOSC2_ERROR_DATA;
+    };
+    (result == dest_len)
+        .then_some(result)
+        .unwrap_or(BLOSC2_ERROR_DATA)
 }
 
 /// Decompress a block that was compressed with a preset dictionary.
@@ -898,6 +935,9 @@ fn lz4_acceleration(clevel: u8) -> i32 {
 /// by `clevel` (mapped directly to the LZ4HC compression level).
 fn lz4hc_compress(clevel: u8, src: &[u8], dest: &mut [u8]) -> i32 {
     use lz4_pure::block::CompressionMode;
+    if let Some(error) = lz4hc_2gb_limit_result(src.len()) {
+        return error;
+    }
     match lz4_pure::block::compress_to_buffer(
         src,
         Some(CompressionMode::HIGHCOMPRESSION(i32::from(clevel))),
@@ -907,6 +947,10 @@ fn lz4hc_compress(clevel: u8, src: &[u8], dest: &mut [u8]) -> i32 {
         Ok(n) => n as i32,
         Err(_) => 0,
     }
+}
+
+fn lz4hc_2gb_limit_result(src_len: usize) -> Option<i32> {
+    (src_len > BLOSC2_MAX_BUFFERSIZE as usize).then_some(BLOSC2_ERROR_2GB_LIMIT)
 }
 
 /// Decompress a block produced by either the LZ4 fast or LZ4HC encoder
@@ -967,6 +1011,9 @@ fn lz4hc_compress_with_dict(clevel: u8, src: &[u8], dest: &mut [u8], dict: &[u8]
         LZ4_resetStreamHC_fast,
     };
 
+    if let Some(error) = lz4hc_2gb_limit_result(src.len()) {
+        return error;
+    }
     let Some(src_len) = len_as_c_int(src.len()) else {
         return 0;
     };
@@ -1901,6 +1948,15 @@ mod tests {
     }
 
     #[test]
+    fn lz4hc_size_guard_returns_c_2gb_limit_sentinel() {
+        assert_eq!(lz4hc_2gb_limit_result(BLOSC2_MAX_BUFFERSIZE as usize), None);
+        assert_eq!(
+            lz4hc_2gb_limit_result(BLOSC2_MAX_BUFFERSIZE as usize + 1),
+            Some(BLOSC2_ERROR_2GB_LIMIT)
+        );
+    }
+
+    #[test]
     fn known_global_codec_metadata_matches_c_registry() {
         for (code, name) in [
             (BLOSC_CODEC_NDLZ, "ndlz"),
@@ -1972,6 +2028,148 @@ mod tests {
         src.len() as i32
     }
 
+    fn short_codec_compress(_clevel: u8, _meta: u8, src: &[u8], dest: &mut [u8]) -> i32 {
+        if src.is_empty() || dest.is_empty() {
+            return 0;
+        }
+        dest[0] = src[0];
+        1
+    }
+
+    fn short_codec_decompress(_meta: u8, src: &[u8], dest: &mut [u8]) -> i32 {
+        if src.is_empty() || dest.is_empty() {
+            return 0;
+        }
+        dest[0] = src[0];
+        1
+    }
+
+    fn negative_codec_compress(_clevel: u8, _meta: u8, _src: &[u8], _dest: &mut [u8]) -> i32 {
+        -1
+    }
+
+    fn oversized_codec_compress(_clevel: u8, _meta: u8, _src: &[u8], dest: &mut [u8]) -> i32 {
+        dest.len() as i32 + 1
+    }
+
+    fn exact_codec_decompress(_meta: u8, src: &[u8], dest: &mut [u8]) -> i32 {
+        for (index, byte) in dest.iter_mut().enumerate() {
+            *byte = src.get(index).copied().unwrap_or(0);
+        }
+        dest.len() as i32
+    }
+
+    fn negative_codec_decompress(_meta: u8, _src: &[u8], _dest: &mut [u8]) -> i32 {
+        -1
+    }
+
+    fn oversized_codec_decompress(_meta: u8, _src: &[u8], dest: &mut [u8]) -> i32 {
+        dest.len() as i32 + 1
+    }
+
+    #[test]
+    fn user_codec_callbacks_receive_existing_destination_bytes_like_c() {
+        const COMPRESS_CODE: u8 = 240;
+        const DECOMPRESS_CODE: u8 = 241;
+
+        register_codec(
+            COMPRESS_CODE,
+            short_codec_compress,
+            passthrough_codec_decompress,
+        )
+        .unwrap();
+        let mut compressed = vec![0xaa; 4];
+        assert_eq!(
+            compress_block(COMPRESS_CODE, 5, &[0x11, 0x22], &mut compressed),
+            1
+        );
+        assert_eq!(compressed, vec![0x11, 0xaa, 0xaa, 0xaa]);
+
+        register_codec(
+            DECOMPRESS_CODE,
+            passthrough_codec_compress,
+            short_codec_decompress,
+        )
+        .unwrap();
+        let mut decompressed = vec![0xbb; 4];
+        assert_eq!(
+            decompress_block(DECOMPRESS_CODE, &[0x33, 0x44], &mut decompressed),
+            BLOSC2_ERROR_DATA
+        );
+        assert_eq!(decompressed, vec![0x33, 0xbb, 0xbb, 0xbb]);
+    }
+
+    #[test]
+    fn user_codec_compress_callback_results_match_c() {
+        const NEGATIVE_CODE: u8 = 242;
+        const OVERSIZED_CODE: u8 = 243;
+
+        register_codec(
+            NEGATIVE_CODE,
+            negative_codec_compress,
+            passthrough_codec_decompress,
+        )
+        .unwrap();
+        let mut compressed = vec![0; 4];
+        assert_eq!(
+            compress_block(NEGATIVE_CODE, 5, b"payload", &mut compressed),
+            BLOSC2_ERROR_DATA
+        );
+
+        register_codec(
+            OVERSIZED_CODE,
+            oversized_codec_compress,
+            passthrough_codec_decompress,
+        )
+        .unwrap();
+        assert_eq!(
+            compress_block(OVERSIZED_CODE, 5, b"payload", &mut compressed),
+            BLOSC2_ERROR_WRITE_BUFFER
+        );
+    }
+
+    #[test]
+    fn user_codec_decompress_callback_results_match_c() {
+        const EXACT_CODE: u8 = 244;
+        const NEGATIVE_CODE: u8 = 245;
+        const OVERSIZED_CODE: u8 = 246;
+
+        register_codec(
+            EXACT_CODE,
+            passthrough_codec_compress,
+            exact_codec_decompress,
+        )
+        .unwrap();
+        let mut decompressed = vec![0; 4];
+        assert_eq!(
+            decompress_block(EXACT_CODE, b"ab", &mut decompressed),
+            decompressed.len() as i32
+        );
+        assert_eq!(&decompressed, b"ab\0\0");
+
+        register_codec(
+            NEGATIVE_CODE,
+            passthrough_codec_compress,
+            negative_codec_decompress,
+        )
+        .unwrap();
+        assert_eq!(
+            decompress_block(NEGATIVE_CODE, b"ab", &mut decompressed),
+            BLOSC2_ERROR_DATA
+        );
+
+        register_codec(
+            OVERSIZED_CODE,
+            passthrough_codec_compress,
+            oversized_codec_decompress,
+        )
+        .unwrap();
+        assert_eq!(
+            decompress_block(OVERSIZED_CODE, b"ab", &mut decompressed),
+            BLOSC2_ERROR_DATA
+        );
+    }
+
     #[test]
     fn public_codec_registration_rejects_global_ids_like_c() {
         let codec = Blosc2Codec {
@@ -2014,6 +2212,29 @@ mod tests {
                 passthrough_codec_decompress,
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn registered_codec_complib_lookup_prefers_builtin_libraries_like_c() {
+        const CODE: u8 = 41;
+        register_global_codec_with_metadata(
+            CODE,
+            "lz4-backed-plugin",
+            BLOSC_LZ4_LIB,
+            1,
+            passthrough_codec_compress,
+            passthrough_codec_decompress,
+        )
+        .unwrap();
+
+        assert_eq!(
+            registered_codec_name_by_complib(BLOSC_LZ4_LIB),
+            Some(BLOSC_LZ4_LIBNAME)
+        );
+        assert_eq!(
+            registered_codec_complib_info("lz4-backed-plugin"),
+            Some((BLOSC_LZ4_LIB, BLOSC_LZ4_LIBNAME, "1.10.0"))
         );
     }
 

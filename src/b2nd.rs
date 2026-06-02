@@ -436,10 +436,15 @@ pub fn b2nd_nans_c(meta: B2ndMeta, cparams: CParams, dparams: DParams) -> (i32, 
     if let Err(err) = b2nd_special_size_preflight(&meta, &cparams) {
         return (b2nd_array_error_code(err), None);
     }
-    if !matches!(cparams.typesize, 4 | 8) {
-        return (BLOSC2_ERROR_DATA, None);
+    let valid_nan_typesize = matches!(cparams.typesize, 4 | 8);
+    let array = match B2ndArray::nans_unchecked_with_metalayers(meta, cparams, dparams, &[]) {
+        Ok(array) => array,
+        Err(err) => return (b2nd_array_error_code(err), None),
+    };
+    if !valid_nan_typesize {
+        return (BLOSC2_ERROR_DATA, Some(array));
     }
-    b2nd_array_result_to_c(B2ndArray::nans(meta, cparams, dparams))
+    (BLOSC2_ERROR_SUCCESS, Some(array))
 }
 
 /// C-style context adapter for [`B2ndArray::nans`].
@@ -447,19 +452,25 @@ pub fn b2nd_nans_ctx_c(ctx: &B2ndContext) -> (i32, Option<B2ndArray>) {
     if let Err(err) = b2nd_special_size_preflight(&ctx.meta, &ctx.cparams) {
         return (b2nd_array_error_code(err), None);
     }
-    if !matches!(ctx.cparams.typesize, 4 | 8) {
-        return (BLOSC2_ERROR_DATA, None);
-    }
+    let valid_nan_typesize = matches!(ctx.cparams.typesize, 4 | 8);
     let metalayers = ctx.metalayer_refs();
-    b2nd_ctx_array_result_to_c(
-        ctx,
-        B2ndArray::nans_with_metalayers(
-            ctx.meta.clone(),
-            ctx.cparams.clone(),
-            ctx.dparams.clone(),
-            &metalayers,
-        ),
-    )
+    let array = match B2ndArray::nans_unchecked_with_metalayers(
+        ctx.meta.clone(),
+        ctx.cparams.clone(),
+        ctx.dparams.clone(),
+        &metalayers,
+    ) {
+        Ok(array) => array,
+        Err(err) => return (b2nd_array_error_code(err), None),
+    };
+    let array = match finish_ctx_array_storage(ctx, array) {
+        Ok(array) => array,
+        Err(err) => return (b2nd_ctx_storage_error_code(&err), None),
+    };
+    if !valid_nan_typesize {
+        return (BLOSC2_ERROR_DATA, Some(array));
+    }
+    (BLOSC2_ERROR_SUCCESS, Some(array))
 }
 
 /// C-name alias for [`B2ndArray::full`].
@@ -574,13 +585,10 @@ pub fn b2nd_from_schunk_c(schunk: Schunk) -> (i32, Option<B2ndArray>) {
     }
 }
 
-const B2ND_FROM_CFRAME_VIEW_UNSUPPORTED: &str =
-    "b2nd_from_cframe(copy=false) zero-copy/view semantics are not implemented";
-
 /// C-name alias for [`B2ndArray::from_frame`].
 pub fn b2nd_from_cframe(frame: &[u8], copy: bool) -> Result<B2ndArray, String> {
     if !copy {
-        return Err(B2ND_FROM_CFRAME_VIEW_UNSUPPORTED.into());
+        return B2ndArray::from_schunk(Schunk::from_frame_borrowed(frame)?).map_err(str::to_string);
     }
     B2ndArray::from_frame(frame)
 }
@@ -1729,9 +1737,7 @@ fn b2nd_ctx_storage_error_code(err: &str) -> i32 {
 }
 
 fn b2nd_frame_error_code(err: &str) -> i32 {
-    if err == B2ND_FROM_CFRAME_VIEW_UNSUPPORTED {
-        BLOSC2_ERROR_INVALID_PARAM
-    } else if matches!(
+    if matches!(
         err,
         "Schunk does not contain a B2ND metalayer"
             | "Missing b2nd metalayer"
@@ -1955,9 +1961,9 @@ impl B2ndMeta {
 
     fn deserialize_legacy_optional_dtype(
         data: &[u8],
-        typesize: usize,
+        _typesize: usize,
     ) -> Result<Self, &'static str> {
-        Self::deserialize_inner(data, Some(format!("|S{typesize}")))
+        Self::deserialize_inner(data, Some(B2ND_DEFAULT_DTYPE.to_string()))
     }
 
     fn deserialize_caterva(data: &[u8], typesize: usize) -> Result<Self, &'static str> {
@@ -2113,6 +2119,15 @@ impl B2ndArray {
         if cparams.typesize != 4 && cparams.typesize != 8 {
             return Err("NaN special only valid for 4 or 8 byte types");
         }
+        Self::from_special(meta, cparams, dparams, BLOSC2_SPECIAL_NAN, metalayers)
+    }
+
+    fn nans_unchecked_with_metalayers(
+        meta: B2ndMeta,
+        cparams: CParams,
+        dparams: DParams,
+        metalayers: &[(&str, &[u8])],
+    ) -> Result<Self, &'static str> {
         Self::from_special(meta, cparams, dparams, BLOSC2_SPECIAL_NAN, metalayers)
     }
 
@@ -6373,7 +6388,7 @@ mod tests {
         let restored_no_dtype = B2ndArray::from_schunk(legacy_no_dtype).unwrap();
         assert_eq!(
             restored_no_dtype.meta,
-            B2ndMeta::new(Vec::new(), Vec::new(), Vec::new(), "|S2", 0).unwrap()
+            B2ndMeta::new(Vec::new(), Vec::new(), Vec::new(), B2ND_DEFAULT_DTYPE, 0).unwrap()
         );
 
         let mut content_with_trailer = content.clone();
@@ -7593,9 +7608,15 @@ mod tests {
             b2nd_uninit_c(meta.clone(), cparams.clone(), DParams::default()).0,
             BLOSC2_ERROR_SUCCESS
         );
+        let (nans_u1_rc, nans_u1) = b2nd_nans_c(meta.clone(), cparams.clone(), DParams::default());
+        assert_eq!(nans_u1_rc, BLOSC2_ERROR_DATA);
+        let nans_u1 = nans_u1.unwrap();
+        assert_eq!(nans_u1.meta, meta);
         assert_eq!(
-            b2nd_nans_c(meta.clone(), cparams.clone(), DParams::default()).0,
-            BLOSC2_ERROR_DATA
+            ChunkHeader::read(nans_u1.schunk.compressed_chunk(0).unwrap())
+                .unwrap()
+                .special_type(),
+            BLOSC2_SPECIAL_NAN
         );
         let oversized_meta =
             B2ndMeta::new(vec![1], vec![i32::MAX], vec![1], "|u1", DTYPE_NUMPY_FORMAT).unwrap();
@@ -7663,7 +7684,16 @@ mod tests {
             ctx_zeros.unwrap().schunk.metalayer("owner"),
             Some(&b"ctx"[..])
         );
-        assert_eq!(b2nd_nans_ctx_c(&ctx).0, BLOSC2_ERROR_DATA);
+        let (ctx_nans_rc, ctx_nans) = b2nd_nans_ctx_c(&ctx);
+        assert_eq!(ctx_nans_rc, BLOSC2_ERROR_DATA);
+        let ctx_nans = ctx_nans.unwrap();
+        assert_eq!(ctx_nans.schunk.metalayer("owner"), Some(&b"ctx"[..]));
+        assert_eq!(
+            ChunkHeader::read(ctx_nans.schunk.compressed_chunk(0).unwrap())
+                .unwrap()
+                .special_type(),
+            BLOSC2_SPECIAL_NAN
+        );
         let (ctx_full_rc, ctx_full) = b2nd_full_ctx_c(&ctx, &[7, 99], 2);
         assert_eq!(ctx_full_rc, BLOSC2_ERROR_SUCCESS);
         let ctx_full = ctx_full.unwrap();
@@ -7791,14 +7821,43 @@ mod tests {
             b2nd_from_cframe_c(&frame, (frame.len() + 1) as i64, true).0,
             BLOSC2_ERROR_INVALID_PARAM
         );
-        match b2nd_from_cframe(&frame, false) {
-            Ok(_) => panic!("copy=false unexpectedly succeeded"),
-            Err(err) => assert_eq!(err, B2ND_FROM_CFRAME_VIEW_UNSUPPORTED),
-        }
+        let alias_cparams = CParams {
+            clevel: 0,
+            filters: [0; BLOSC2_MAX_FILTERS],
+            ..cparams.clone()
+        };
+        let alias_data: Vec<u8> = (10..34).collect();
+        let alias_array =
+            b2nd_from_cbuffer(meta.clone(), &alias_data, alias_cparams, DParams::default())
+                .unwrap();
+        let mut alias_frame = b2nd_to_cframe(&alias_array);
+        let copied = b2nd_from_cframe(&alias_frame, true).unwrap();
+        let borrowed = b2nd_from_cframe(&alias_frame, false).unwrap();
+        let borrowed_chunk = borrowed.schunk.compressed_chunk(0).unwrap();
+        let chunk_offset =
+            (borrowed_chunk.as_ptr() as usize).checked_sub(alias_frame.as_ptr() as usize);
+        let chunk_offset = chunk_offset.expect("borrowed chunk pointer should be inside frame");
+        assert!(chunk_offset < alias_frame.len());
+        let old_chunk_byte = borrowed_chunk[0];
+        let new_chunk_byte = old_chunk_byte.wrapping_add(1);
+        alias_frame[chunk_offset] = new_chunk_byte;
+        assert_eq!(b2nd_to_cbuffer_vec(&copied).unwrap(), alias_data);
+        assert_eq!(
+            copied.schunk.compressed_chunk(0).unwrap()[0],
+            old_chunk_byte
+        );
+        assert_eq!(
+            borrowed.schunk.compressed_chunk(0).unwrap()[0],
+            new_chunk_byte
+        );
+
         let (from_frame_view_rc, from_frame_view_c) =
             b2nd_from_cframe_c(&frame, frame.len() as i64, false);
-        assert_eq!(from_frame_view_rc, BLOSC2_ERROR_INVALID_PARAM);
-        assert!(from_frame_view_c.is_none());
+        assert_eq!(from_frame_view_rc, BLOSC2_ERROR_SUCCESS);
+        assert_eq!(
+            b2nd_to_cbuffer_vec(&from_frame_view_c.unwrap()).unwrap(),
+            data
+        );
         assert_eq!(b2nd_free_option_c(None), BLOSC2_ERROR_NULL_POINTER);
         assert_eq!(
             b2nd_free_option_c(Some(array.clone())),

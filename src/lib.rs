@@ -6,8 +6,7 @@
 //!
 //! The top-level modules expose the building blocks: chunk [`header`] parsing, [`filters`],
 //! [`codecs`], the core [`compress`] engine, [`schunk`] super-chunks, and the [`b2nd`]
-//! N-dimensional array layer. The [`Codec`] and [`Filter`] enums and [`DEFAULT_CHUNKSIZE`]
-//! constant are re-exported here for convenience.
+//! N-dimensional array layer.
 
 pub mod b2nd;
 pub mod codecs;
@@ -20,11 +19,13 @@ pub mod utils;
 
 pub use b2nd::{
     b2nd_append, b2nd_concatenate, b2nd_copy, b2nd_copy_buffer, b2nd_copy_buffer2, b2nd_create_ctx,
-    b2nd_delete, b2nd_deserialize_meta, b2nd_empty, b2nd_expand_dims, b2nd_free_c, b2nd_free_ctx_c,
-    b2nd_from_cbuffer, b2nd_from_cframe, b2nd_from_schunk, b2nd_full,
-    b2nd_get_orthogonal_selection_c, b2nd_get_slice, b2nd_get_slice_cbuffer, b2nd_insert,
-    b2nd_nans, b2nd_open, b2nd_open_offset, b2nd_print_meta, b2nd_resize, b2nd_save,
-    b2nd_save_append, b2nd_serialize_meta, b2nd_set_orthogonal_selection_c, b2nd_set_slice_cbuffer,
+    b2nd_delete, b2nd_deserialize_meta, b2nd_empty, b2nd_expand_dims, b2nd_free_c,
+    b2nd_free_c as b2nd_free, b2nd_free_ctx_c, b2nd_free_ctx_c as b2nd_free_ctx, b2nd_from_cbuffer,
+    b2nd_from_cframe, b2nd_from_schunk, b2nd_full, b2nd_get_orthogonal_selection_c,
+    b2nd_get_orthogonal_selection_c as b2nd_get_orthogonal_selection, b2nd_get_slice,
+    b2nd_get_slice_cbuffer, b2nd_insert, b2nd_nans, b2nd_open, b2nd_open_offset, b2nd_print_meta,
+    b2nd_resize, b2nd_save, b2nd_save_append, b2nd_serialize_meta, b2nd_set_orthogonal_selection_c,
+    b2nd_set_orthogonal_selection_c as b2nd_set_orthogonal_selection, b2nd_set_slice_cbuffer,
     b2nd_squeeze, b2nd_squeeze_index, b2nd_to_cbuffer, b2nd_to_cframe, b2nd_uninit, b2nd_zeros,
     B2ndArray, B2ndContext, B2ndMeta, B2ndStorage, B2ND_DEFAULT_DTYPE, B2ND_DEFAULT_DTYPE_FORMAT,
     B2ND_MAX_DIM, B2ND_MAX_METALAYERS, B2ND_METALAYER_NAME, B2ND_METALAYER_VERSION,
@@ -41,12 +42,73 @@ pub use compress::{
     blosc2_create_dctx, blosc2_ctx_get_cparams, blosc2_ctx_get_dparams, blosc2_decompress,
     blosc2_decompress_ctx, blosc2_free_ctx, blosc2_get_blosc2_cparams_defaults,
     blosc2_get_blosc2_dparams_defaults, blosc2_get_complib_info, blosc2_get_nthreads,
-    blosc2_get_version_string, blosc2_getitem_c, blosc2_getitem_ctx_c, blosc2_list_compressors,
+    blosc2_get_version_string, blosc2_getitem_c, blosc2_getitem_c as blosc2_getitem,
+    blosc2_getitem_ctx_c, blosc2_getitem_ctx_c as blosc2_getitem_ctx, blosc2_list_compressors,
     blosc2_set_delta, blosc2_set_maskout, blosc2_set_nthreads, blosc2_vlchunk_get_nblocks_c,
-    blosc2_vlcompress_ctx, blosc2_vldecompress_block_ctx, blosc2_vldecompress_ctx, CContext,
-    CParams, DContext, DParams,
+    blosc2_vlchunk_get_nblocks_c as blosc2_vlchunk_get_nblocks, blosc2_vlcompress_ctx,
+    blosc2_vldecompress_block_ctx, blosc2_vldecompress_ctx, CContext, CParams, DContext, DParams,
 };
-pub use constants::*;
+pub use constants::{
+    BLOSC1_VERSION_FORMAT, BLOSC1_VERSION_FORMAT_PRE1, BLOSC2_BIGENDIAN, BLOSC2_CHUNK_BLOCKSIZE,
+    BLOSC2_CHUNK_BLOSC2_FLAGS, BLOSC2_CHUNK_BLOSC2_FLAGS2, BLOSC2_CHUNK_CBYTES,
+    BLOSC2_CHUNK_FILTER_CODES, BLOSC2_CHUNK_FILTER_META, BLOSC2_CHUNK_FLAGS, BLOSC2_CHUNK_NBYTES,
+    BLOSC2_CHUNK_TYPESIZE, BLOSC2_CHUNK_VERSION, BLOSC2_CHUNK_VERSIONLZ,
+    BLOSC2_DEFINED_CODECS_START, BLOSC2_DEFINED_CODECS_STOP, BLOSC2_DEFINED_FILTERS_START,
+    BLOSC2_DEFINED_FILTERS_STOP, BLOSC2_DEFINED_TUNER_START, BLOSC2_DEFINED_TUNER_STOP,
+    BLOSC2_ERROR_2GB_LIMIT, BLOSC2_ERROR_CHUNK_APPEND, BLOSC2_ERROR_CHUNK_INSERT,
+    BLOSC2_ERROR_CHUNK_UPDATE, BLOSC2_ERROR_CODEC_DICT, BLOSC2_ERROR_CODEC_PARAM,
+    BLOSC2_ERROR_CODEC_SUPPORT, BLOSC2_ERROR_DATA, BLOSC2_ERROR_FAILURE, BLOSC2_ERROR_FILE_OPEN,
+    BLOSC2_ERROR_FILE_READ, BLOSC2_ERROR_FILE_REMOVE, BLOSC2_ERROR_FILE_TRUNCATE,
+    BLOSC2_ERROR_FILE_WRITE, BLOSC2_ERROR_FILTER_PIPELINE, BLOSC2_ERROR_FRAME_SPECIAL,
+    BLOSC2_ERROR_FRAME_TYPE, BLOSC2_ERROR_INVALID_HEADER, BLOSC2_ERROR_INVALID_INDEX,
+    BLOSC2_ERROR_INVALID_PARAM, BLOSC2_ERROR_MAX_BUFSIZE_EXCEEDED, BLOSC2_ERROR_MEMORY_ALLOC,
+    BLOSC2_ERROR_METALAYER_NOT_FOUND, BLOSC2_ERROR_NOT_FOUND, BLOSC2_ERROR_NULL_POINTER,
+    BLOSC2_ERROR_PLUGIN_IO, BLOSC2_ERROR_POSTFILTER, BLOSC2_ERROR_READ_BUFFER,
+    BLOSC2_ERROR_RUN_LENGTH, BLOSC2_ERROR_SCHUNK_COPY, BLOSC2_ERROR_SCHUNK_SPECIAL,
+    BLOSC2_ERROR_STREAM, BLOSC2_ERROR_SUCCESS, BLOSC2_ERROR_THREAD_CREATE, BLOSC2_ERROR_TUNER,
+    BLOSC2_ERROR_VERSION_SUPPORT, BLOSC2_ERROR_WRITE_BUFFER, BLOSC2_GLOBAL_REGISTERED_CODECS,
+    BLOSC2_GLOBAL_REGISTERED_CODECS_START, BLOSC2_GLOBAL_REGISTERED_CODECS_STOP,
+    BLOSC2_GLOBAL_REGISTERED_FILTERS, BLOSC2_GLOBAL_REGISTERED_FILTERS_START,
+    BLOSC2_GLOBAL_REGISTERED_FILTERS_STOP, BLOSC2_GLOBAL_REGISTERED_TUNERS,
+    BLOSC2_GLOBAL_REGISTERED_TUNER_START, BLOSC2_GLOBAL_REGISTERED_TUNER_STOP, BLOSC2_INSTR_CODEC,
+    BLOSC2_IO_BLOSC_DEFINED, BLOSC2_IO_FILESYSTEM, BLOSC2_IO_FILESYSTEM_MMAP, BLOSC2_IO_REGISTERED,
+    BLOSC2_IO_USER_DEFINED, BLOSC2_LAZY_CHUNK, BLOSC2_MAXBLOCKSIZE, BLOSC2_MAXDICTSIZE,
+    BLOSC2_MAXTYPESIZE, BLOSC2_MAX_BUFFERSIZE, BLOSC2_MAX_DIM, BLOSC2_MAX_FILTERS,
+    BLOSC2_MAX_METALAYERS, BLOSC2_MAX_OVERHEAD, BLOSC2_MAX_UDFILTERS, BLOSC2_MAX_VLMETALAYERS,
+    BLOSC2_METALAYER_NAME_MAXLEN, BLOSC2_MINUSEFULDICT, BLOSC2_NO_SPECIAL, BLOSC2_SPECIAL_LASTID,
+    BLOSC2_SPECIAL_MASK, BLOSC2_SPECIAL_NAN, BLOSC2_SPECIAL_UNINIT, BLOSC2_SPECIAL_VALUE,
+    BLOSC2_SPECIAL_ZERO, BLOSC2_USEDICT, BLOSC2_USER_DEFINED_CODECS_START,
+    BLOSC2_USER_DEFINED_CODECS_STOP, BLOSC2_USER_DEFINED_FILTERS_START,
+    BLOSC2_USER_REGISTERED_CODECS_START, BLOSC2_USER_REGISTERED_CODECS_STOP,
+    BLOSC2_USER_REGISTERED_FILTERS_START, BLOSC2_USER_REGISTERED_FILTERS_STOP,
+    BLOSC2_USER_REGISTERED_TUNER_START, BLOSC2_USER_REGISTERED_TUNER_STOP, BLOSC2_VERSION_DATE,
+    BLOSC2_VERSION_FORMAT, BLOSC2_VERSION_FORMAT_ALPHA, BLOSC2_VERSION_FORMAT_BETA1,
+    BLOSC2_VERSION_FORMAT_STABLE, BLOSC2_VERSION_FORMAT_VL_BLOCKS, BLOSC2_VERSION_FRAME_FORMAT,
+    BLOSC2_VERSION_FRAME_FORMAT_BETA2, BLOSC2_VERSION_FRAME_FORMAT_RC1,
+    BLOSC2_VERSION_FRAME_FORMAT_VL_BLOCKS, BLOSC2_VERSION_MAJOR, BLOSC2_VERSION_MINOR,
+    BLOSC2_VERSION_RELEASE, BLOSC2_VERSION_STRING, BLOSC2_VLMETALAYERS_NAME_MAXLEN,
+    BLOSC2_VL_BLOCKS, BLOSC_ALWAYS_SPLIT, BLOSC_AUTO_SPLIT, BLOSC_BITSHUFFLE, BLOSC_BLOSCLZ,
+    BLOSC_BLOSCLZ_COMPNAME, BLOSC_BLOSCLZ_FORMAT, BLOSC_BLOSCLZ_LIB, BLOSC_BLOSCLZ_LIBNAME,
+    BLOSC_BLOSCLZ_VERSION_FORMAT, BLOSC_BTUNE, BLOSC_CODEC_GROK, BLOSC_CODEC_NDLZ,
+    BLOSC_CODEC_OPENHTJ2K, BLOSC_CODEC_OPENZL, BLOSC_CODEC_ZFP_FIXED_ACCURACY,
+    BLOSC_CODEC_ZFP_FIXED_PRECISION, BLOSC_CODEC_ZFP_FIXED_RATE, BLOSC_DELTA, BLOSC_DOBITSHUFFLE,
+    BLOSC_DODELTA, BLOSC_DONT_SPLIT, BLOSC_DOSHUFFLE, BLOSC_EXTENDED_HEADER_LENGTH,
+    BLOSC_FILTER_BYTEDELTA, BLOSC_FILTER_BYTEDELTA_BUGGY, BLOSC_FILTER_INT_TRUNC,
+    BLOSC_FILTER_NDCELL, BLOSC_FILTER_NDMEAN, BLOSC_FORWARD_COMPAT_SPLIT,
+    BLOSC_IO_LAST_BLOSC_DEFINED, BLOSC_IO_LAST_REGISTERED, BLOSC_LAST_CODEC, BLOSC_LAST_FILTER,
+    BLOSC_LAST_REGISTERED_CODEC, BLOSC_LAST_REGISTERED_FILTER, BLOSC_LAST_REGISTERED_TUNE,
+    BLOSC_LAST_TUNER, BLOSC_LZ4, BLOSC_LZ4HC, BLOSC_LZ4HC_COMPNAME, BLOSC_LZ4HC_FORMAT,
+    BLOSC_LZ4HC_VERSION_FORMAT, BLOSC_LZ4_COMPNAME, BLOSC_LZ4_FORMAT, BLOSC_LZ4_LIB,
+    BLOSC_LZ4_LIBNAME, BLOSC_LZ4_VERSION_FORMAT, BLOSC_MAX_BUFFERSIZE, BLOSC_MAX_OVERHEAD,
+    BLOSC_MAX_TYPESIZE, BLOSC_MEMCPYED, BLOSC_MIN_BUFFERSIZE, BLOSC_MIN_HEADER_LENGTH,
+    BLOSC_NEVER_SPLIT, BLOSC_NOFILTER, BLOSC_NOSHUFFLE, BLOSC_SCHUNK_LIB, BLOSC_SHUFFLE,
+    BLOSC_STUNE, BLOSC_TRUNC_PREC, BLOSC_UDCODEC_FORMAT, BLOSC_UDCODEC_LIB,
+    BLOSC_UDCODEC_VERSION_FORMAT, BLOSC_VERSION_DATE, BLOSC_VERSION_MAJOR, BLOSC_VERSION_MINOR,
+    BLOSC_VERSION_RELEASE, BLOSC_VERSION_STRING, BLOSC_ZLIB, BLOSC_ZLIB_COMPNAME,
+    BLOSC_ZLIB_FORMAT, BLOSC_ZLIB_LIB, BLOSC_ZLIB_LIBNAME, BLOSC_ZLIB_VERSION_FORMAT, BLOSC_ZSTD,
+    BLOSC_ZSTD_COMPNAME, BLOSC_ZSTD_FORMAT, BLOSC_ZSTD_LIB, BLOSC_ZSTD_LIBNAME,
+    BLOSC_ZSTD_VERSION_FORMAT,
+};
 pub use filters::{
     blosc2_bitshuffle, blosc2_bitunshuffle, blosc2_register_filter, blosc2_shuffle,
     blosc2_unshuffle, Blosc2Filter,
@@ -56,85 +118,17 @@ pub use schunk::{
     blosc2_meta_get, blosc2_meta_update, blosc2_schunk_append_buffer, blosc2_schunk_append_chunk,
     blosc2_schunk_append_file, blosc2_schunk_copy, blosc2_schunk_decompress_chunk,
     blosc2_schunk_delete_chunk, blosc2_schunk_fill_special, blosc2_schunk_frame_len,
-    blosc2_schunk_free_c, blosc2_schunk_from_buffer, blosc2_schunk_get_chunk,
-    blosc2_schunk_get_cparams, blosc2_schunk_get_dparams, blosc2_schunk_get_lazychunk_c,
-    blosc2_schunk_get_slice_buffer, blosc2_schunk_get_vlblock, blosc2_schunk_insert_chunk,
-    blosc2_schunk_new_c, blosc2_schunk_open, blosc2_schunk_open_offset,
-    blosc2_schunk_reorder_offsets, blosc2_schunk_set_slice_buffer, blosc2_schunk_to_buffer,
-    blosc2_schunk_to_file, blosc2_schunk_update_chunk, blosc2_vlmeta_add, blosc2_vlmeta_delete,
-    blosc2_vlmeta_exists, blosc2_vlmeta_get, blosc2_vlmeta_get_names, blosc2_vlmeta_update, Schunk,
+    blosc2_schunk_free_c, blosc2_schunk_free_c as blosc2_schunk_free, blosc2_schunk_from_buffer,
+    blosc2_schunk_get_chunk, blosc2_schunk_get_cparams, blosc2_schunk_get_dparams,
+    blosc2_schunk_get_lazychunk_c, blosc2_schunk_get_slice_buffer, blosc2_schunk_get_vlblock,
+    blosc2_schunk_insert_chunk, blosc2_schunk_new_c, blosc2_schunk_new_c as blosc2_schunk_new,
+    blosc2_schunk_open, blosc2_schunk_open_offset, blosc2_schunk_reorder_offsets,
+    blosc2_schunk_set_slice_buffer, blosc2_schunk_to_buffer, blosc2_schunk_to_file,
+    blosc2_schunk_update_chunk, blosc2_vlmeta_add, blosc2_vlmeta_delete, blosc2_vlmeta_exists,
+    blosc2_vlmeta_get, blosc2_vlmeta_get_names, blosc2_vlmeta_update, Schunk,
 };
 pub use utils::{
     blosc2_destroy, blosc2_error_string, blosc2_free_resources, blosc2_init,
     blosc2_multidim_to_unidim, blosc2_remove_dir, blosc2_remove_urlpath, blosc2_rename_urlpath,
     blosc2_unidim_to_multidim,
 };
-
-/// Codec identifiers matching the C library constants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Codec {
-    BloscLz = 0,
-    Lz4 = 1,
-    Lz4hc = 2,
-    Zlib = 4,
-    Zstd = 5,
-}
-
-impl Codec {
-    /// Parses a codec name (case-insensitive) into a [`Codec`] variant.
-    ///
-    /// Accepts `blosclz`, `lz4`, `lz4hc`, `zlib`, or `zstd`; returns `None` otherwise.
-    pub fn parse_name(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "blosclz" => Some(Codec::BloscLz),
-            "lz4" => Some(Codec::Lz4),
-            "lz4hc" => Some(Codec::Lz4hc),
-            "zlib" => Some(Codec::Zlib),
-            "zstd" => Some(Codec::Zstd),
-            _ => None,
-        }
-    }
-}
-
-impl std::str::FromStr for Codec {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::parse_name(s).ok_or(())
-    }
-}
-
-/// Filter identifiers matching the C library constants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Filter {
-    NoFilter = 0,
-    Shuffle = 1,
-    BitShuffle = 2,
-    Delta = 3,
-    TruncPrec = 4,
-}
-
-impl Filter {
-    /// Parses a filter name (case-insensitive) into a [`Filter`] variant.
-    ///
-    /// Accepts `nofilter`/`none`, `shuffle`, `bitshuffle`, `delta`, or `truncprec`/`trunc_prec`;
-    /// returns `None` otherwise.
-    pub fn parse_name(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "nofilter" | "none" => Some(Filter::NoFilter),
-            "shuffle" => Some(Filter::Shuffle),
-            "bitshuffle" => Some(Filter::BitShuffle),
-            "delta" => Some(Filter::Delta),
-            "truncprec" | "trunc_prec" => Some(Filter::TruncPrec),
-            _ => None,
-        }
-    }
-}
-
-impl std::str::FromStr for Filter {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::parse_name(s).ok_or(())
-    }
-}

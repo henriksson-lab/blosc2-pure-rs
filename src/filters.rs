@@ -1386,6 +1386,10 @@ fn registered_filter(filter_id: u8) -> Option<UserFilter> {
         .and_then(|filters| filters.get(&filter_id).copied())
 }
 
+fn is_blosc_defined_filter(filter_id: u8) -> bool {
+    (BLOSC2_DEFINED_FILTERS_START..=BLOSC2_DEFINED_FILTERS_STOP).contains(&filter_id)
+}
+
 /// Apply byte-wise shuffle: transpose bytes within elements of size `typesize`.
 ///
 /// For each byte position `j` in `0..typesize`, all `j`-th bytes of the
@@ -3152,6 +3156,7 @@ pub fn pipeline_backward_with_context(
         user_data: 0,
     });
     let mut current = current_buf as u8;
+    let mut pipeline_failed = false;
 
     // Filters applied in reverse order
     for i in (0..BLOSC2_MAX_FILTERS).rev() {
@@ -3192,6 +3197,9 @@ pub fn pipeline_backward_with_context(
                 // and does not cycle buffers on the backward path.
                 continue;
             }
+            _ if is_blosc_defined_filter(filter) => {
+                pipeline_failed = true;
+            }
             _ => {
                 if let Some(user_filter) = registered_filter(filter) {
                     let mut callback_context = FilterCallbackContext {
@@ -3229,7 +3237,11 @@ pub fn pipeline_backward_with_context(
         current = if current == 1 { 2 } else { 1 };
     }
 
-    current as usize
+    if pipeline_failed {
+        0
+    } else {
+        current as usize
+    }
 }
 
 /// Truncate precision: zero out least-significant bits of IEEE-754 floats.
@@ -4702,6 +4714,33 @@ mod tests {
             0
         );
         assert_eq!(buf1, src);
+        assert_eq!(buf2, vec![0x5A; 16]);
+    }
+
+    #[test]
+    fn test_pipeline_backward_unknown_defined_filter_cycles_before_failure() {
+        let src: Vec<u8> = (0..16).collect();
+        let mut buf1 = src.clone();
+        let mut buf2 = vec![0x5A; 16];
+        let filters = [BLOSC_SHUFFLE, BLOSC_LAST_FILTER, 0, 0, 0, 0];
+        let filters_meta = [0; BLOSC2_MAX_FILTERS];
+
+        assert_eq!(
+            pipeline_backward(
+                &mut buf1,
+                &mut buf2,
+                16,
+                &filters,
+                &filters_meta,
+                BLOSC2_VERSION_FORMAT,
+                4,
+                0,
+                None,
+                1,
+            ),
+            0
+        );
+        assert_eq!(buf1, vec![0x5A; 16]);
         assert_eq!(buf2, vec![0x5A; 16]);
     }
 

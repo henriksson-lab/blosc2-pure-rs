@@ -48,7 +48,7 @@ impl ChunkHeader {
             return Err("Buffer too small for header");
         }
 
-        let mut h = ChunkHeader {
+        Ok(ChunkHeader {
             version: data[BLOSC2_CHUNK_VERSION],
             versionlz: data[BLOSC2_CHUNK_VERSIONLZ],
             flags: data[BLOSC2_CHUNK_FLAGS],
@@ -57,27 +57,31 @@ impl ChunkHeader {
             blocksize: i32::from_le_bytes(data[8..12].try_into().unwrap()),
             cbytes: i32::from_le_bytes(data[12..16].try_into().unwrap()),
             ..Default::default()
-        };
+        })
+    }
 
-        if h.cbytes < BLOSC_MIN_HEADER_LENGTH as i32 {
+    fn validate_legacy_fields(&self) -> Result<(), &'static str> {
+        if self.cbytes < BLOSC_MIN_HEADER_LENGTH as i32 {
             return Err("Invalid cbytes");
         }
-        if h.blocksize <= 0 || h.blocksize as usize > BLOSC2_MAXBLOCKSIZE {
+        if self.blocksize <= 0 || self.blocksize as usize > BLOSC2_MAXBLOCKSIZE {
             return Err("Invalid blocksize");
         }
-        if h.typesize == 0 {
+        if self.typesize == 0 {
             return Err("Invalid typesize");
         }
+        Ok(())
+    }
 
-        if h.flags & BLOSC_DOBITSHUFFLE != 0 {
-            h.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_BITSHUFFLE;
-        } else if h.flags & BLOSC_DOSHUFFLE != 0 {
-            h.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_SHUFFLE;
+    fn flags_to_filters(&mut self) {
+        if self.flags & BLOSC_DOBITSHUFFLE != 0 {
+            self.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_BITSHUFFLE;
+        } else if self.flags & BLOSC_DOSHUFFLE != 0 {
+            self.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_SHUFFLE;
         }
-        if h.flags & BLOSC_DODELTA != 0 {
-            h.filters[BLOSC2_MAX_FILTERS - 2] = BLOSC_DELTA;
+        if self.flags & BLOSC_DODELTA != 0 {
+            self.filters[BLOSC2_MAX_FILTERS - 2] = BLOSC_DELTA;
         }
-        Ok(h)
     }
 
     fn normalize_regular_blocksize(&mut self) {
@@ -88,10 +92,12 @@ impl ChunkHeader {
 
     /// Parses only the 16-byte legacy prefix of a chunk header.
     ///
-    /// This mirrors C-Blosc metadata queries, which can inspect size and basic
-    /// filter information without requiring the full compressed payload.
+    /// This mirrors C-Blosc metadata queries, which inspect only the size and
+    /// legacy scalar fields without requiring the full compressed payload.
     pub fn read_minimal(data: &[u8]) -> Result<Self, &'static str> {
         let mut h = Self::read_legacy_fields(data)?;
+        h.validate_legacy_fields()?;
+        h.flags_to_filters();
         h.normalize_regular_blocksize();
         Ok(h)
     }
@@ -192,6 +198,7 @@ impl ChunkHeader {
     /// fields are required when both extended-header flag bits are set.
     pub fn read(data: &[u8]) -> Result<Self, &'static str> {
         let mut h = Self::read_legacy_fields(data)?;
+        h.validate_legacy_fields()?;
 
         // Extended header (32 bytes)
         if h.is_extended() {
@@ -233,6 +240,8 @@ impl ChunkHeader {
             if h.version > BLOSC2_VERSION_FORMAT && (h.blosc2_flags2 & !BLOSC2_VL_BLOCKS) != 0 {
                 return Err("Unsupported chunk version features");
             }
+        } else {
+            h.flags_to_filters();
         }
         h.normalize_regular_blocksize();
 
@@ -400,6 +409,60 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_flag_bits_populate_filter_slots_like_c() {
+        let mut buf = [0u8; BLOSC_MIN_HEADER_LENGTH];
+        buf[BLOSC2_CHUNK_VERSION] = BLOSC2_VERSION_FORMAT_STABLE;
+        buf[BLOSC2_CHUNK_VERSIONLZ] = 1;
+        buf[BLOSC2_CHUNK_FLAGS] = BLOSC_DOSHUFFLE | BLOSC_DODELTA | (BLOSC_LZ4_FORMAT << 5);
+        buf[BLOSC2_CHUNK_TYPESIZE] = 4;
+        buf[BLOSC2_CHUNK_NBYTES..BLOSC2_CHUNK_NBYTES + 4].copy_from_slice(&100i32.to_le_bytes());
+        buf[BLOSC2_CHUNK_BLOCKSIZE..BLOSC2_CHUNK_BLOCKSIZE + 4]
+            .copy_from_slice(&100i32.to_le_bytes());
+        buf[BLOSC2_CHUNK_CBYTES..BLOSC2_CHUNK_CBYTES + 4].copy_from_slice(&16i32.to_le_bytes());
+
+        let full = ChunkHeader::read(&buf).unwrap();
+        let minimal = ChunkHeader::read_minimal(&buf).unwrap();
+
+        assert_eq!(
+            full.flags & (BLOSC_DOSHUFFLE | BLOSC_DODELTA),
+            BLOSC_DOSHUFFLE | BLOSC_DODELTA
+        );
+        assert_eq!(
+            minimal.flags & (BLOSC_DOSHUFFLE | BLOSC_DODELTA),
+            BLOSC_DOSHUFFLE | BLOSC_DODELTA
+        );
+        assert_eq!(
+            full.filters,
+            [
+                BLOSC_NOFILTER,
+                BLOSC_NOFILTER,
+                BLOSC_NOFILTER,
+                BLOSC_NOFILTER,
+                BLOSC_DELTA,
+                BLOSC_SHUFFLE,
+            ]
+        );
+        assert_eq!(minimal.filters, full.filters);
+    }
+
+    #[test]
+    fn test_legacy_bitshuffle_takes_precedence_over_shuffle_like_c_minimal() {
+        let mut buf = [0u8; BLOSC_MIN_HEADER_LENGTH];
+        buf[BLOSC2_CHUNK_VERSION] = BLOSC2_VERSION_FORMAT_STABLE;
+        buf[BLOSC2_CHUNK_VERSIONLZ] = 1;
+        buf[BLOSC2_CHUNK_FLAGS] = BLOSC_DOSHUFFLE | BLOSC_DOBITSHUFFLE | (BLOSC_LZ4_FORMAT << 5);
+        buf[BLOSC2_CHUNK_TYPESIZE] = 4;
+        buf[BLOSC2_CHUNK_NBYTES..BLOSC2_CHUNK_NBYTES + 4].copy_from_slice(&100i32.to_le_bytes());
+        buf[BLOSC2_CHUNK_BLOCKSIZE..BLOSC2_CHUNK_BLOCKSIZE + 4]
+            .copy_from_slice(&100i32.to_le_bytes());
+        buf[BLOSC2_CHUNK_CBYTES..BLOSC2_CHUNK_CBYTES + 4].copy_from_slice(&16i32.to_le_bytes());
+
+        let minimal = ChunkHeader::read_minimal(&buf).unwrap();
+
+        assert_eq!(minimal.filters[BLOSC2_MAX_FILTERS - 1], BLOSC_BITSHUFFLE);
+    }
+
+    #[test]
     fn test_read_rejects_c_invalid_legacy_fields() {
         let mut valid = [0u8; BLOSC_MIN_HEADER_LENGTH];
         valid[BLOSC2_CHUNK_VERSION] = BLOSC2_VERSION_FORMAT_STABLE;
@@ -520,6 +583,30 @@ mod tests {
         let mut buf = [0u8; BLOSC_EXTENDED_HEADER_LENGTH];
         h.try_write(&mut buf).unwrap();
 
-        assert!(ChunkHeader::read(&buf).is_err());
+        let err = ChunkHeader::read(&buf).unwrap_err();
+        assert!(err.contains("version") || err.contains("Version"));
+    }
+
+    #[test]
+    fn test_alpha_extended_header_clears_last_filter_slot_like_c() {
+        let h = ChunkHeader {
+            version: BLOSC2_VERSION_FORMAT_ALPHA,
+            versionlz: 1,
+            flags: BLOSC_DOSHUFFLE | BLOSC_DOBITSHUFFLE,
+            typesize: 1,
+            nbytes: 1,
+            blocksize: 1,
+            cbytes: BLOSC_EXTENDED_HEADER_LENGTH as i32,
+            filters: [1, 2, 3, 4, 5, 6],
+            filters_meta: [6, 5, 4, 3, 2, 1],
+            ..Default::default()
+        };
+
+        let mut buf = [0u8; BLOSC_EXTENDED_HEADER_LENGTH];
+        h.try_write(&mut buf).unwrap();
+
+        let parsed = ChunkHeader::read(&buf).unwrap();
+        assert_eq!(parsed.filters, [1, 2, 3, 4, 5, BLOSC_NOFILTER]);
+        assert_eq!(parsed.filters_meta, [6, 5, 4, 3, 2, 0]);
     }
 }

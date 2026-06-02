@@ -89,7 +89,7 @@ pub const BLOSC2_DEFINED_TUNER_STOP: u8 = 31;
 pub const BLOSC2_GLOBAL_REGISTERED_TUNER_START: u8 = 32;
 /// Last tuner ID reserved for globally registered Blosc2 tuners.
 pub const BLOSC2_GLOBAL_REGISTERED_TUNER_STOP: u8 = 159;
-/// Number of globally registered Blosc2 tuners in the vendored C header.
+/// Number of globally registered Blosc2 tuners exposed by the public Blosc2 header.
 pub const BLOSC2_GLOBAL_REGISTERED_TUNERS: u8 = 0;
 /// First tuner ID reserved for user-registered tuners.
 pub const BLOSC2_USER_REGISTERED_TUNER_START: u8 = 160;
@@ -101,8 +101,9 @@ pub const BLOSC_STUNE: u8 = 0;
 pub const BLOSC_BTUNE: u8 = 32;
 /// First tuner code outside the Blosc built-in tuner set.
 pub const BLOSC_LAST_TUNER: u8 = 1;
-/// Last globally registered tuner ID in the vendored C header.
-pub const BLOSC_LAST_REGISTERED_TUNE: u8 = 31;
+/// Last globally registered tuner ID exposed by the public Blosc2 header.
+pub const BLOSC_LAST_REGISTERED_TUNE: u8 =
+    BLOSC2_GLOBAL_REGISTERED_TUNER_START + BLOSC2_GLOBAL_REGISTERED_TUNERS - 1;
 
 /// C API return code: success.
 pub const BLOSC2_ERROR_SUCCESS: i32 = 0;
@@ -272,7 +273,7 @@ pub const BLOSC2_DEFINED_CODECS_STOP: u8 = 31;
 pub const BLOSC2_GLOBAL_REGISTERED_CODECS_START: u8 = 32;
 /// Last codec ID reserved for globally registered Blosc2 codecs.
 pub const BLOSC2_GLOBAL_REGISTERED_CODECS_STOP: u8 = 159;
-/// Number of globally registered Blosc2 codecs in the vendored public header.
+/// Number of globally registered Blosc2 codecs exposed by the public Blosc2 header.
 pub const BLOSC2_GLOBAL_REGISTERED_CODECS: u8 = 5;
 /// Global plugin codec ID: NDLZ.
 pub const BLOSC_CODEC_NDLZ: u8 = 32;
@@ -298,7 +299,7 @@ pub const BLOSC2_USER_DEFINED_CODECS_STOP: u8 = u8::MAX;
 pub const BLOSC2_USER_REGISTERED_CODECS_START: u8 = BLOSC2_USER_DEFINED_CODECS_START;
 /// Last user-registered codec ID.
 pub const BLOSC2_USER_REGISTERED_CODECS_STOP: u8 = BLOSC2_USER_DEFINED_CODECS_STOP;
-/// Last globally registered codec ID in the vendored C header.
+/// Last globally registered codec ID exposed by the public Blosc2 header.
 pub const BLOSC_LAST_REGISTERED_CODEC: u8 =
     BLOSC2_GLOBAL_REGISTERED_CODECS_START + BLOSC2_GLOBAL_REGISTERED_CODECS - 1;
 
@@ -335,8 +336,17 @@ pub const BLOSC_ZLIB_FORMAT: u8 = 3;
 pub const BLOSC_ZSTD_FORMAT: u8 = 4;
 /// Codec format code signalling that the actual codec is stored in the user-defined codec slot.
 pub const BLOSC_UDCODEC_FORMAT: u8 = 6;
-/// Codec format code signalling that the codec is defined by the enclosing super-chunk.
-pub const BLOSC_SCHUNK_FORMAT: u8 = BLOSC_SCHUNK_LIB;
+/// Deprecated compatibility alias for super-chunk-defined codec chunks.
+///
+/// C-Blosc2 has `BLOSC_SCHUNK_LIB` as a compression-library code, but no
+/// separate public `BLOSC_SCHUNK_FORMAT` header-format constant. Chunk headers
+/// that carry the actual codec in the user-defined codec slot use
+/// [`BLOSC_UDCODEC_FORMAT`].
+#[deprecated(
+    since = "0.1.0",
+    note = "C-Blosc2 has no public BLOSC_SCHUNK_FORMAT; use BLOSC_UDCODEC_FORMAT for chunk headers or BLOSC_SCHUNK_LIB for compression library codes"
+)]
+pub const BLOSC_SCHUNK_FORMAT: u8 = BLOSC_UDCODEC_FORMAT;
 
 /// On-disk format version for BloscLZ-compressed streams.
 pub const BLOSC_BLOSCLZ_VERSION_FORMAT: u8 = 1;
@@ -493,6 +503,27 @@ mod tests {
 
     #[test]
     fn registered_codec_range_matches_public_header() {
+        assert_eq!(BLOSC2_GLOBAL_REGISTERED_CODECS, 5);
         assert_eq!(BLOSC_LAST_REGISTERED_CODEC, BLOSC_CODEC_OPENHTJ2K);
+    }
+
+    #[test]
+    fn registered_tuner_range_matches_public_header() {
+        assert_eq!(BLOSC2_GLOBAL_REGISTERED_TUNERS, 0);
+        assert_eq!(
+            BLOSC_LAST_REGISTERED_TUNE,
+            BLOSC2_GLOBAL_REGISTERED_TUNER_START - 1
+        );
+        assert!(
+            (BLOSC2_GLOBAL_REGISTERED_TUNER_START..=BLOSC2_GLOBAL_REGISTERED_TUNER_STOP)
+                .contains(&BLOSC_BTUNE)
+        );
+    }
+
+    #[test]
+    fn schunk_format_alias_uses_user_defined_chunk_format() {
+        #[allow(deprecated)]
+        let schunk_format = BLOSC_SCHUNK_FORMAT;
+        assert_eq!(schunk_format, BLOSC_UDCODEC_FORMAT);
     }
 }

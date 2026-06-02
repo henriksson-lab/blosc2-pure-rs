@@ -231,7 +231,7 @@ const API_MATRIX: &[ApiRow] = &[
     partial!("b2nd_zeros", "Array creation exists, but storage/urlpath behavior is not fully modeled."),
     partial!("b2nd_nans", "Array creation exists, but storage/urlpath behavior is not fully modeled."),
     partial!("b2nd_full", "Array creation exists, but storage/urlpath behavior is not fully modeled."),
-    partial!("b2nd_from_cframe", "copy=false zero-copy/view semantics are explicitly rejected."),
+    covered!("b2nd_from_cframe"),
     covered!("b2nd_squeeze_index"),
     covered!("b2nd_squeeze"),
     covered!("b2nd_expand_dims"),

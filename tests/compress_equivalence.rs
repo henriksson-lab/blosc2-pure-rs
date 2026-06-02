@@ -510,6 +510,7 @@ fn test_legacy_blosc1_bitshuffle_fixture_matches_c_decompress() {
     assert_eq!(header.header_len(), BLOSC_MIN_HEADER_LENGTH);
     assert_eq!(header.typesize, 8);
     assert_eq!(header.compcode(), BLOSC_LZ4);
+    assert_eq!(header.flags & BLOSC_DOBITSHUFFLE, BLOSC_DOBITSHUFFLE);
     assert_eq!(header.filters[BLOSC2_MAX_FILTERS - 1], BLOSC_BITSHUFFLE);
     assert_eq!(cbuffer_sizes(&chunk).unwrap(), (641_092, 22_760, 524_288));
 

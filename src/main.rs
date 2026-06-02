@@ -7,17 +7,12 @@
 use blosc2_pure_rs::compress::{CParams, DParams};
 use blosc2_pure_rs::constants::*;
 use blosc2_pure_rs::schunk::{frame, Schunk};
-use blosc2_pure_rs::{Codec, Filter};
 use clap::{Parser, Subcommand};
-use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
-const MAX_TEMP_CREATE_ATTEMPTS: usize = 128;
 const CLI_DEFAULT_CHUNKSIZE: usize = 1_000_000;
 
 #[derive(Parser)]
@@ -77,14 +72,14 @@ enum Commands {
 
 /// Collected compression parameters passed to [`compress_file`].
 struct CompressOptions {
-    codec: Codec,
+    codec: u8,
     clevel: u8,
     typesize: i32,
     blocksize: i32,
     chunksize: usize,
     splitmode: i32,
     nthreads: i16,
-    filter: Filter,
+    filter: u8,
     filter_meta: u8,
 }
 
@@ -105,8 +100,8 @@ fn parse_chunksize(value: &str) -> Result<usize, String> {
 ///
 /// Reads the input file in `chunksize` segments, appends each as a chunk to a [`Schunk`]
 /// configured with `options`, streams the super-chunk frame to disk, and prints ratio and
-/// throughput statistics. Output is first written to a sibling temporary file before replacing
-/// `output`, so failed compression or serialization does not leave a partial destination file.
+/// throughput statistics. Like the C example, the destination is created/truncated before the
+/// input is opened and before compression starts.
 fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::Result<()> {
     if options.chunksize == 0 {
         return Err(io::Error::new(
@@ -115,16 +110,18 @@ fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::R
         ));
     }
 
+    let foutput = File::create(output)?;
+
     let mut filters_meta = [0; BLOSC2_MAX_FILTERS];
     filters_meta[BLOSC2_MAX_FILTERS - 1] = options.filter_meta;
     let cparams = CParams {
-        compcode: options.codec as u8,
+        compcode: options.codec,
         compcode_meta: 0,
         clevel: options.clevel,
         typesize: options.typesize,
         blocksize: options.blocksize,
         splitmode: options.splitmode,
-        filters: [0, 0, 0, 0, 0, options.filter as u8],
+        filters: [0, 0, 0, 0, 0, options.filter],
         filters_meta,
         use_dict: false,
         nthreads: options.nthreads,
@@ -154,10 +151,12 @@ fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::R
     }
 
     let nbytes = schunk.nbytes;
-    let cbytes = schunk.cbytes;
-    atomic_write_with(output, |writer| {
-        frame::write_frame_to_writer(&schunk, writer)
-    })?;
+    {
+        let mut writer = BufWriter::new(foutput);
+        frame::write_frame_to_writer(&schunk, &mut writer)?;
+        writer.flush()?;
+    }
+    let cbytes = frame_equivalent_cbytes(output)?;
     let elapsed = start.elapsed().as_secs_f64();
 
     print_compression_stats(nbytes, cbytes, elapsed);
@@ -180,8 +179,8 @@ fn read_next_chunk<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize>
 /// Decompresses a Blosc2 frame at `input` into the raw file at `output`.
 ///
 /// Opens the frame as a [`Schunk`], iterates over its chunks decoding each in turn, and writes
-/// the concatenated result via a buffered temporary file before replacing `output`. Empty frames
-/// produce an empty output file.
+/// the concatenated result directly to `output`. Empty frames produce an empty output file.
+/// Like the C example, mid-stream decompression failures can leave the chunks already written.
 /// Prints ratio and throughput statistics on completion.
 fn decompress_file(input: &Path, output: &Path, nthreads: i16) -> io::Result<()> {
     let mut schunk = Schunk::open_offset(input, 0)
@@ -189,15 +188,7 @@ fn decompress_file(input: &Path, output: &Path, nthreads: i16) -> io::Result<()>
     schunk.dparams.nthreads = nthreads;
 
     let start = Instant::now();
-    atomic_write_with(output, |foutput| {
-        for i in 0..schunk.nchunks() {
-            let data = schunk
-                .decompress_chunk(i)
-                .map_err(|e| io::Error::other(format!("Decompression error: {e}")))?;
-            foutput.write_all(&data)?;
-        }
-        Ok(())
-    })?;
+    write_decompressed_chunks_direct(&schunk, output)?;
 
     let nbytes = schunk.nbytes;
     let cbytes = schunk.cbytes;
@@ -208,108 +199,37 @@ fn decompress_file(input: &Path, output: &Path, nthreads: i16) -> io::Result<()>
     Ok(())
 }
 
-fn atomic_write_with<F>(output: &Path, write: F) -> io::Result<()>
-where
-    F: FnOnce(&mut BufWriter<File>) -> io::Result<()>,
-{
-    let (temp_path, temp_file) = create_temp_output_file(output)?;
-    let write_result = (|| {
-        let mut writer = BufWriter::new(temp_file);
-        write(&mut writer)?;
-        writer.flush()
-    })();
-
-    if let Err(err) = write_result {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(err);
+fn write_decompressed_chunks_direct(schunk: &Schunk, output: &Path) -> io::Result<()> {
+    let mut foutput = File::create(output)?;
+    for i in 0..schunk.nchunks() {
+        let data = schunk
+            .decompress_chunk(i)
+            .map_err(|e| io::Error::other(format!("Decompression error: {e}")))?;
+        foutput.write_all(&data)?;
     }
-    replace_output(&temp_path, output)
+    foutput.flush()?;
+    Ok(())
 }
 
-fn create_temp_output_file(output: &Path) -> io::Result<(PathBuf, File)> {
-    let mut last_exists = None;
-    for _ in 0..MAX_TEMP_CREATE_ATTEMPTS {
-        let temp_path = temp_output_path(output);
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-        {
-            Ok(file) => return Ok((temp_path, file)),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                last_exists = Some(err);
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        format!(
-            "failed to create a unique temporary output after {MAX_TEMP_CREATE_ATTEMPTS} attempts: {}",
-            last_exists
-                .map(|err| err.to_string())
-                .unwrap_or_else(|| "temporary output already exists".to_string())
-        ),
-    ))
+fn frame_equivalent_cbytes(path: &Path) -> io::Result<i64> {
+    Schunk::open_offset(path, 0)
+        .map(|schunk| schunk.cbytes)
+        .map_err(|e| io::Error::other(format!("Failed to reopen frame for stats: {e}")))
 }
 
-fn temp_output_path(output: &Path) -> PathBuf {
-    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    temp_output_path_for(output, counter)
-}
-
-fn temp_output_path_for(output: &Path, counter: u64) -> PathBuf {
-    let file_name = output
-        .file_name()
-        .unwrap_or_else(|| ".blosc2-output".as_ref());
-    let mut temp_name = OsString::from(".");
-    temp_name.push(file_name);
-    temp_name.push(format!(".tmp.{}.{}", std::process::id(), counter));
-    output.with_file_name(temp_name)
-}
-
-fn replace_output(temp_path: &Path, output: &Path) -> io::Result<()> {
-    replace_output_impl(temp_path, output).inspect_err(|_err| {
-        if temp_path.exists() {
-            let _ = std::fs::remove_file(temp_path);
-        }
-    })
-}
-
-#[cfg(windows)]
-fn replace_output_impl(temp_path: &Path, output: &Path) -> io::Result<()> {
-    match std::fs::remove_file(output) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
-    }
-    std::fs::rename(temp_path, output)
-}
-
-#[cfg(not(windows))]
-fn replace_output_impl(temp_path: &Path, output: &Path) -> io::Result<()> {
-    std::fs::rename(temp_path, output)
-}
-
-/// Returns `numerator / denominator` as `f64`, or `0.0` when `denominator` is not positive.
+/// Returns `numerator / denominator` using the same floating-point behavior as the C examples.
 fn ratio(numerator: i64, denominator: i64) -> f64 {
-    if denominator > 0 {
-        numerator as f64 / denominator as f64
-    } else {
-        0.0
-    }
+    c_float(numerator) / c_float(denominator)
 }
 
 /// Computes throughput in MiB/s given a byte count and an elapsed time in seconds.
 ///
-/// Returns `0.0` for non-positive elapsed times to avoid division by zero.
 fn throughput_mib(nbytes: i64, elapsed_secs: f64) -> f64 {
-    if elapsed_secs > 0.0 {
-        nbytes as f64 / (elapsed_secs * 1024.0 * 1024.0)
-    } else {
-        0.0
-    }
+    c_float(nbytes) / (elapsed_secs * 1024.0 * 1024.0)
+}
+
+fn c_float(value: i64) -> f64 {
+    value as f32 as f64
 }
 
 fn c_general_3(value: f64) -> String {
@@ -367,8 +287,8 @@ fn compression_stats_lines(nbytes: i64, cbytes: i64, elapsed_secs: f64) -> (Stri
     (
         format!(
             "Compression ratio: {:.1} MB -> {:.1} MB ({:.1}x)",
-            nbytes as f64 / mb,
-            cbytes as f64 / mb,
+            c_float(nbytes) / mb,
+            c_float(cbytes) / mb,
             ratio(nbytes, cbytes)
         ),
         format!(
@@ -390,8 +310,8 @@ fn decompression_stats_lines(nbytes: i64, cbytes: i64, elapsed_secs: f64) -> (St
     (
         format!(
             "Decompression ratio: {:.1} MB -> {:.1} MB ({:.1}x)",
-            cbytes as f64 / mb,
-            nbytes as f64 / mb,
+            c_float(cbytes) / mb,
+            c_float(nbytes) / mb,
             ratio(cbytes, nbytes)
         ),
         format!(
@@ -424,36 +344,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn temp_output_creation_skips_stale_sibling_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("out.b2frame");
-        let stale = temp_output_path_for(&output, 0);
-        std::fs::write(&stale, b"stale").unwrap();
-
-        TEMP_FILE_COUNTER.store(0, Ordering::Relaxed);
-        let (created, file) = create_temp_output_file(&output).unwrap();
-        drop(file);
-
-        assert_ne!(created, stale);
-        assert_eq!(std::fs::read(&stale).unwrap(), b"stale");
-        assert!(created.exists());
-    }
-
-    #[test]
-    fn replace_output_overwrites_existing_destination() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("out.b2frame");
-        let temp = dir.path().join(".out.b2frame.tmp");
-        std::fs::write(&output, b"old").unwrap();
-        std::fs::write(&temp, b"new").unwrap();
-
-        replace_output(&temp, &output).unwrap();
-
-        assert_eq!(std::fs::read(&output).unwrap(), b"new");
-        assert!(!temp.exists());
-    }
-
-    #[test]
     fn cli_default_chunksize_matches_c_example() {
         assert_eq!(CLI_DEFAULT_CHUNKSIZE, 1_000_000);
         assert_eq!(
@@ -474,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn compression_stats_use_schunk_cbytes_like_c_example() {
+    fn compression_stats_use_frame_equivalent_cbytes_like_c_example() {
         let (ratio_line, time_line) =
             compression_stats_lines(4 * 1024 * 1024, 2 * 1024 * 1024, 0.5);
 
@@ -489,6 +379,24 @@ mod tests {
 
         assert_eq!(ratio_line, "Decompression ratio: 2.0 MB -> 4.0 MB (0.5x)");
         assert_eq!(time_line, "Decompression time: 0.25 s, 16.0 MB/s");
+    }
+
+    #[test]
+    fn decompression_stats_empty_payload_ratio_matches_c_division() {
+        let (ratio_line, _) = decompression_stats_lines(0, 128, 0.25);
+
+        assert_eq!(ratio_line, "Decompression ratio: 0.0 MB -> 0.0 MB (infx)");
+    }
+
+    #[test]
+    fn stats_byte_counts_use_c_float_precision() {
+        let (ratio_line, time_line) = compression_stats_lines(16_777_217, 1, 1.0);
+
+        assert_eq!(
+            ratio_line,
+            "Compression ratio: 16.0 MB -> 0.0 MB (16777216.0x)"
+        );
+        assert_eq!(time_line, "Compression time: 1 s, 16.0 MB/s");
     }
 
     #[test]
@@ -532,6 +440,71 @@ mod tests {
         assert_eq!(&buf[..4], b"ijkl");
     }
 
+    fn default_test_options(chunksize: usize) -> CompressOptions {
+        CompressOptions {
+            codec: BLOSC_BLOSCLZ as u8,
+            clevel: 9,
+            typesize: 1,
+            blocksize: 0,
+            chunksize,
+            splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
+            nthreads: 1,
+            filter: BLOSC_SHUFFLE as u8,
+            filter_meta: 0,
+        }
+    }
+
+    #[test]
+    fn compress_truncates_destination_before_input_open_failure_like_c_example() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_input = dir.path().join("missing.bin");
+        let output = dir.path().join("out.b2frame");
+        std::fs::write(&output, b"old destination").unwrap();
+
+        let err = compress_file(
+            &missing_input,
+            &output,
+            default_test_options(CLI_DEFAULT_CHUNKSIZE),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read(&output).unwrap(), b"");
+    }
+
+    #[test]
+    fn decompression_writes_directly_and_keeps_completed_chunks_on_later_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("restored.bin");
+        let mut schunk = Schunk::new(CParams::default(), DParams::default());
+        schunk.append_buffer(b"first chunk").unwrap();
+        schunk.append_buffer(b"second chunk").unwrap();
+        schunk.chunks[1] = b"not a valid blosc chunk".to_vec();
+        std::fs::write(&output, b"old destination").unwrap();
+
+        let err = write_decompressed_chunks_direct(&schunk, &output).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(std::fs::read(&output).unwrap(), b"first chunk");
+    }
+
+    #[test]
+    fn frame_equivalent_cbytes_uses_serialized_special_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("special-offsets.b2frame");
+        let mut schunk = Schunk::new(CParams::default(), DParams::default());
+        schunk.append_buffer(&vec![0u8; 128]).unwrap();
+        assert!(schunk.cbytes > 0);
+
+        {
+            let mut writer = BufWriter::new(File::create(&output).unwrap());
+            frame::write_frame_to_writer(&schunk, &mut writer).unwrap();
+            writer.flush().unwrap();
+        }
+
+        assert_eq!(frame_equivalent_cbytes(&output).unwrap(), 0);
+    }
+
     #[test]
     fn compress_empty_input_creates_decompressible_empty_chunk_frame() {
         let dir = tempfile::tempdir().unwrap();
@@ -540,22 +513,7 @@ mod tests {
         let restored = dir.path().join("restored.bin");
         std::fs::write(&input, []).unwrap();
 
-        compress_file(
-            &input,
-            &output,
-            CompressOptions {
-                codec: Codec::BloscLz,
-                clevel: 9,
-                typesize: 1,
-                blocksize: 0,
-                chunksize: CLI_DEFAULT_CHUNKSIZE,
-                splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
-                nthreads: 1,
-                filter: Filter::Shuffle,
-                filter_meta: 0,
-            },
-        )
-        .unwrap();
+        compress_file(&input, &output, default_test_options(CLI_DEFAULT_CHUNKSIZE)).unwrap();
 
         let schunk = Schunk::open_offset(&output, 0).unwrap();
         assert_eq!(schunk.nchunks(), 1);
@@ -575,22 +533,7 @@ mod tests {
         let data = b"abcdefgh".repeat(2);
         std::fs::write(&input, &data).unwrap();
 
-        compress_file(
-            &input,
-            &output,
-            CompressOptions {
-                codec: Codec::BloscLz,
-                clevel: 9,
-                typesize: 1,
-                blocksize: 0,
-                chunksize: 8,
-                splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
-                nthreads: 1,
-                filter: Filter::Shuffle,
-                filter_meta: 0,
-            },
-        )
-        .unwrap();
+        compress_file(&input, &output, default_test_options(8)).unwrap();
 
         let schunk = Schunk::open_offset(&output, 0).unwrap();
         assert_eq!(schunk.nbytes, data.len() as i64);
@@ -610,6 +553,28 @@ fn parse_splitmode(s: &str) -> Option<i32> {
         "never" | "never_split" => Some(BLOSC_NEVER_SPLIT),
         "auto" | "auto_split" => Some(BLOSC_AUTO_SPLIT),
         "forward" | "forward_compat" | "forward_compat_split" => Some(BLOSC_FORWARD_COMPAT_SPLIT),
+        _ => None,
+    }
+}
+
+fn parse_codec(s: &str) -> Option<u8> {
+    match s.to_lowercase().as_str() {
+        "blosclz" => Some(BLOSC_BLOSCLZ as u8),
+        "lz4" => Some(BLOSC_LZ4 as u8),
+        "lz4hc" => Some(BLOSC_LZ4HC as u8),
+        "zlib" => Some(BLOSC_ZLIB as u8),
+        "zstd" => Some(BLOSC_ZSTD as u8),
+        _ => None,
+    }
+}
+
+fn parse_filter(s: &str) -> Option<u8> {
+    match s.to_lowercase().as_str() {
+        "nofilter" | "none" => Some(BLOSC_NOFILTER as u8),
+        "shuffle" => Some(BLOSC_SHUFFLE as u8),
+        "bitshuffle" | "bit_shuffle" => Some(BLOSC_BITSHUFFLE as u8),
+        "delta" => Some(BLOSC_DELTA as u8),
+        "truncprec" | "trunc_prec" => Some(BLOSC_TRUNC_PREC as u8),
         _ => None,
     }
 }
@@ -645,14 +610,14 @@ fn main() {
             filter,
             filter_meta,
         } => {
-            let codec = codec.parse::<Codec>().unwrap_or_else(|_| {
+            let codec = parse_codec(codec).unwrap_or_else(|| {
                 eprintln!(
                     "Unknown codec '{}'. Available: blosclz, lz4, lz4hc, zlib, zstd",
                     codec
                 );
                 std::process::exit(1);
             });
-            let filter = filter.parse::<Filter>().unwrap_or_else(|_| {
+            let filter = parse_filter(filter).unwrap_or_else(|| {
                 eprintln!(
                     "Unknown filter '{}'. Available: nofilter, shuffle, bitshuffle, delta, truncprec",
                     filter

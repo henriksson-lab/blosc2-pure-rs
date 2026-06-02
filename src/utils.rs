@@ -147,6 +147,7 @@ pub fn blosc2_error_string(error_code: i32) -> &'static str {
 /// Convert a row-major linear index to multidimensional coordinates.
 pub fn blosc2_unidim_to_multidim(shape: &[i64], i: i64) -> Vec<i64> {
     let ndim = shape.len();
+    assert!(ndim <= crate::b2nd::B2ND_MAX_DIM);
     let mut index = vec![0; ndim];
     if ndim == 0 {
         return index;
@@ -171,6 +172,9 @@ pub fn blosc2_unidim_to_multidim_checked(shape: &[i64], i: i64) -> Result<Vec<i6
         return Err("Invalid linear index");
     }
     let ndim = shape.len();
+    if ndim > crate::b2nd::B2ND_MAX_DIM {
+        return Err("Too many dimensions");
+    }
     let mut index = vec![0; ndim];
     if ndim == 0 {
         return if i == 0 {
@@ -237,11 +241,17 @@ pub fn blosc2_remove_dir(path: impl AsRef<std::path::Path>) -> i32 {
     let path = path.as_ref();
     let entries = match std::fs::read_dir(path) {
         Ok(entries) => entries,
+        #[cfg(windows)]
+        Err(_) => return BLOSC2_ERROR_FILE_OPEN,
+        #[cfg(not(windows))]
         Err(_) => return BLOSC2_ERROR_NOT_FOUND,
     };
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
+            #[cfg(windows)]
+            Err(_) => return BLOSC2_ERROR_FILE_OPEN,
+            #[cfg(not(windows))]
             Err(_) => return BLOSC2_ERROR_FAILURE,
         };
         let entry_path = entry.path();
@@ -249,6 +259,11 @@ pub fn blosc2_remove_dir(path: impl AsRef<std::path::Path>) -> i32 {
             return BLOSC2_ERROR_FAILURE;
         }
     }
+    #[cfg(windows)]
+    if std::fs::remove_dir(path).is_err() {
+        return BLOSC2_ERROR_FAILURE;
+    }
+    #[cfg(not(windows))]
     let _ = std::fs::remove_dir(path);
     BLOSC2_ERROR_SUCCESS
 }
@@ -336,6 +351,11 @@ mod tests {
         assert!(blosc2_unidim_to_multidim_checked(&[10, 0], 0).is_err());
         assert!(blosc2_unidim_to_multidim_checked(&[i64::MAX, 2], 0).is_err());
         assert!(blosc2_unidim_to_multidim_checked(&[3, 4], 12).is_err());
+        let too_many_dims = vec![1; crate::b2nd::B2ND_MAX_DIM + 1];
+        assert_eq!(
+            blosc2_unidim_to_multidim_checked(&too_many_dims, 0),
+            Err("Too many dimensions")
+        );
         assert!(blosc2_multidim_to_unidim_checked(&[1, 2], &[4]).is_err());
         assert!(blosc2_multidim_to_unidim_checked(&[-1], &[1]).is_err());
         assert!(blosc2_multidim_to_unidim_checked(&[i64::MAX], &[2]).is_err());
@@ -349,6 +369,13 @@ mod tests {
             "ignored/file:///frame.b2frame"
         );
         assert_eq!(normalize_urlpath("plain.b2frame"), "plain.b2frame");
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_unidim_to_multidim_enforces_b2nd_max_dim() {
+        let too_many_dims = vec![1; crate::b2nd::B2ND_MAX_DIM + 1];
+        let _ = blosc2_unidim_to_multidim(&too_many_dims, 0);
     }
 
     #[test]
@@ -370,6 +397,12 @@ mod tests {
             blosc2_rename_urlpath(dir.path().join("ignored"), None::<&std::path::Path>),
             BLOSC2_ERROR_SUCCESS
         );
+        #[cfg(windows)]
+        assert_eq!(
+            blosc2_remove_dir(dir.path().join("missing-dir")),
+            BLOSC2_ERROR_FILE_OPEN
+        );
+        #[cfg(not(windows))]
         assert_eq!(
             blosc2_remove_dir(dir.path().join("missing-dir")),
             BLOSC2_ERROR_NOT_FOUND
@@ -404,6 +437,9 @@ mod tests {
         std::fs::create_dir(&nested).unwrap();
         std::fs::write(nested.join("child"), b"payload").unwrap();
         let nested_prefixed = format!("file:///{}", nested.display());
+        #[cfg(windows)]
+        assert_eq!(blosc2_remove_dir(nested_prefixed), BLOSC2_ERROR_FILE_OPEN);
+        #[cfg(not(windows))]
         assert_eq!(blosc2_remove_dir(nested_prefixed), BLOSC2_ERROR_NOT_FOUND);
         assert!(nested.exists());
         assert_eq!(blosc2_remove_dir(&nested), BLOSC2_ERROR_SUCCESS);
@@ -421,6 +457,9 @@ mod tests {
 
         let not_dir = dir.path().join("not-dir");
         std::fs::write(&not_dir, b"x").unwrap();
+        #[cfg(windows)]
+        assert_eq!(blosc2_remove_dir(&not_dir), BLOSC2_ERROR_FILE_OPEN);
+        #[cfg(not(windows))]
         assert_eq!(blosc2_remove_dir(&not_dir), BLOSC2_ERROR_NOT_FOUND);
         assert_eq!(blosc2_remove_urlpath(&not_dir), BLOSC2_ERROR_SUCCESS);
     }
