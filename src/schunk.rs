@@ -851,19 +851,14 @@ fn validate_compressed_chunk_for_schunk(
     schunk: &Schunk,
     chunk: &[u8],
     replacing: Option<usize>,
-) -> Result<(), &'static str> {
+) -> Result<usize, &'static str> {
+    let (_, cbytes, _) = compress::cbuffer_sizes(chunk)?;
+    if cbytes > chunk.len() {
+        return Err("Chunk truncated");
+    }
+    let chunk = &chunk[..cbytes];
     compress::cbuffer_validate(chunk)?;
     let header = ChunkHeader::read(chunk)?;
-    let (_, cbytes, _) = compress::cbuffer_sizes(chunk)?;
-    if cbytes != chunk.len() {
-        return Err("Compressed chunk size mismatch");
-    }
-    let expected_typesize =
-        chunk_header_typesize(compress::normalized_cparams(&schunk.cparams).typesize);
-    if header.nbytes > 0 && header.typesize != expected_typesize {
-        return Err("Compressed chunk typesize does not match schunk");
-    }
-
     let new_vl = header.vl_blocks();
     let active_chunks = schunk.active_chunks_snapshot();
     let existing_vl = active_chunks
@@ -882,7 +877,7 @@ fn validate_compressed_chunk_for_schunk(
     if existing_vl.is_some_and(|existing_vl| existing_vl != new_vl) {
         return Err("Cannot mix regular and VL-block chunks");
     }
-    Ok(())
+    Ok(cbytes)
 }
 
 fn schunk_cparams_raw_copy_compatible(src: &CParams, dst: &CParams) -> bool {
@@ -1148,7 +1143,8 @@ impl Schunk {
     /// The chunk is stored byte-for-byte after validating its Blosc header and
     /// regular/VL-block consistency with the existing super-chunk.
     pub fn append_chunk(&mut self, chunk: &[u8]) -> Result<i64, &'static str> {
-        validate_compressed_chunk_for_schunk(self, chunk, None)?;
+        let cbytes = validate_compressed_chunk_for_schunk(self, chunk, None)?;
+        let chunk = &chunk[..cbytes];
         let mut chunks = self.active_chunks_snapshot();
         chunks.push(chunk.to_vec());
         let persistent_offsets =
@@ -1449,7 +1445,8 @@ impl Schunk {
         if nchunk < 0 || nchunk as usize > self.active_chunks_len() {
             return Err("Chunk index out of range");
         }
-        validate_compressed_chunk_for_schunk(self, chunk, None)?;
+        let cbytes = validate_compressed_chunk_for_schunk(self, chunk, None)?;
+        let chunk = &chunk[..cbytes];
         let mut chunks = self.active_chunks_snapshot();
         chunks.insert(nchunk as usize, chunk.to_vec());
         let persistent_offsets = self.persistent_offsets_after_insert(nchunk as usize, chunk);
@@ -1495,6 +1492,9 @@ impl Schunk {
         special: u8,
         chunksize: usize,
     ) -> Result<i64, &'static str> {
+        if nitems == 0 {
+            return Ok(0);
+        }
         if self.active_chunks_len() != 0 || self.nbytes != 0 || self.cbytes != 0 {
             return Err("Can only fill an empty schunk");
         }
@@ -1512,31 +1512,25 @@ impl Schunk {
         if typesize == 0 {
             return Err("Invalid typesize");
         }
+        if chunksize == 0 {
+            return Err("Invalid chunksize");
+        }
+        let chunkitems = chunksize / typesize;
+        if chunkitems == 0 {
+            return Err("Invalid chunksize");
+        }
+        if chunksize % typesize != 0 {
+            return Err("Special chunk creation failed");
+        }
         let total_nbytes = nitems
             .checked_mul(typesize)
             .ok_or("Schunk nbytes overflow")?;
-        if total_nbytes != 0 && chunksize == 0 {
+        let chunk_nbytes = chunksize;
+        if chunk_nbytes > BLOSC2_MAX_BUFFERSIZE as usize {
             return Err("Invalid chunksize");
         }
-        let chunk_nbytes = if chunksize != 0 {
-            chunksize
-        } else if self.chunksize != 0 {
-            self.chunksize
-        } else {
-            total_nbytes
-        };
-        if total_nbytes != 0
-            && (chunk_nbytes == 0
-                || chunk_nbytes > BLOSC2_MAX_BUFFERSIZE as usize
-                || !chunk_nbytes.is_multiple_of(typesize))
-        {
-            return Err("Invalid chunksize");
-        }
-        let nchunks = if total_nbytes == 0 {
-            0
-        } else {
-            total_nbytes.div_ceil(chunk_nbytes)
-        };
+        let leftover_items = nitems % chunkitems;
+        let nchunks = nitems / chunkitems + usize::from(leftover_items != 0);
         if nchunks > i32::MAX as usize {
             return Err("Too many chunks");
         }
@@ -1671,7 +1665,8 @@ impl Schunk {
         if nchunk < 0 || nchunk as usize >= self.active_chunks_len() {
             return Err("Chunk index out of range");
         }
-        validate_compressed_chunk_for_schunk(self, chunk, Some(nchunk as usize))?;
+        let cbytes = validate_compressed_chunk_for_schunk(self, chunk, Some(nchunk as usize))?;
+        let chunk = &chunk[..cbytes];
         let mut chunks = self.active_chunks_snapshot();
         chunks[nchunk as usize] = chunk.to_vec();
         let persistent_offsets = self.persistent_offsets_after_update(nchunk as usize, chunk);
@@ -1697,9 +1692,12 @@ impl Schunk {
     /// decompression parameters.
     pub fn copy_schunk_with_params(
         &self,
-        cparams: CParams,
+        mut cparams: CParams,
         dparams: DParams,
     ) -> Result<Self, &'static str> {
+        if cparams.blocksize == 0 {
+            cparams.blocksize = self.cparams.blocksize;
+        }
         let mut copied = Schunk::new(cparams, dparams);
         copied.metalayers = self.metalayers.clone();
         copied.vlmetalayers = self.vlmetalayers.clone();
@@ -2885,6 +2883,7 @@ impl Schunk {
             }
         }
         self.storage = attached.storage;
+        self.cbytes = frame::frame_data_cbytes(self);
         self.attached_frame = Some(attached);
         Ok(())
     }
@@ -3571,7 +3570,7 @@ pub fn blosc2_schunk_decompress_chunk(schunk: &Schunk, nchunk: i64, dest: &mut [
     match schunk.decompress_chunk_into(nchunk, dest) {
         Ok(len) => i32::try_from(len).unwrap_or(BLOSC2_ERROR_2GB_LIMIT),
         Err("Chunk index out of range") => BLOSC2_ERROR_INVALID_PARAM,
-        Err("Destination too small") => BLOSC2_ERROR_WRITE_BUFFER,
+        Err("Destination too small") => BLOSC2_ERROR_INVALID_PARAM,
         Err(err) => schunk_error_code(err),
     }
 }
@@ -3590,7 +3589,7 @@ pub fn blosc2_schunk_decompress_chunk_c(
     match schunk.decompress_chunk_into(nchunk, &mut dest[..destsize]) {
         Ok(len) => i32::try_from(len).unwrap_or(BLOSC2_ERROR_2GB_LIMIT),
         Err("Chunk index out of range") => BLOSC2_ERROR_INVALID_PARAM,
-        Err("Destination too small") => BLOSC2_ERROR_WRITE_BUFFER,
+        Err("Destination too small") => BLOSC2_ERROR_INVALID_PARAM,
         Err(err) => schunk_error_code(err),
     }
 }
@@ -3642,14 +3641,17 @@ pub fn blosc2_schunk_frame_len(schunk: &Schunk) -> i64 {
     if let Some(frame_len) = schunk.attached_frame_len {
         return frame_len;
     }
-    schunk
-        .frame_len()
+    let nchunk_offsets_len = schunk
+        .nchunks()
+        .checked_mul(std::mem::size_of::<i64>() as i64);
+    nchunk_offsets_len
+        .and_then(|offsets_len| schunk.cbytes.checked_add(offsets_len))
         .unwrap_or(i64::from(BLOSC2_ERROR_2GB_LIMIT))
 }
 
 fn schunk_c_slice_nchunks(schunk: &Schunk, start: usize, stop: usize) -> (i32, Option<Vec<i64>>) {
     if schunk.nchunks() == 0 {
-        return (0, Some(Vec::new()));
+        return (0, None);
     }
     let typesize = match usize::try_from(schunk.cparams.typesize) {
         Ok(typesize) if typesize > 0 => typesize,
@@ -3877,9 +3879,9 @@ pub fn blosc2_schunk_fill_special(
         Ok(nchunks) => nchunks,
         Err("Can only fill an empty schunk") => i64::from(BLOSC2_ERROR_FRAME_SPECIAL),
         Err("Invalid chunksize" | "Invalid typesize") => i64::from(BLOSC2_ERROR_INVALID_PARAM),
-        Err("Unsupported special value") | Err("Too many chunks") => {
-            i64::from(BLOSC2_ERROR_SCHUNK_SPECIAL)
-        }
+        Err("Unsupported special value")
+        | Err("Too many chunks")
+        | Err("Special chunk creation failed") => i64::from(BLOSC2_ERROR_SCHUNK_SPECIAL),
         Err(err) => i64::from(schunk_error_code(err)),
     }
 }
@@ -4861,6 +4863,23 @@ pub mod frame {
 
     pub(super) fn stored_frame_chunk_len(chunk: &[u8], encode_special_offsets: bool) -> usize {
         stored_frame_chunk(chunk, encode_special_offsets).map_or(0, |stored| stored.len())
+    }
+
+    pub(super) fn frame_data_cbytes(schunk: &Schunk) -> i64 {
+        let mut schunk_view = schunk.clone();
+        schunk_view.chunks = schunk.active_chunks_snapshot();
+        let chunksize = derive_frame_chunksize(&schunk_view);
+        let encode_special_offsets = chunksize > 0;
+        repeat_value_frame_layout(&schunk_view, encode_special_offsets).map_or_else(
+            || {
+                schunk_view
+                    .chunks
+                    .iter()
+                    .map(|chunk| stored_frame_chunk_len(chunk, encode_special_offsets) as i64)
+                    .sum()
+            },
+            |layout| layout.cbytes,
+        )
     }
 
     fn stored_frame_chunk(chunk: &[u8], encode_special_offsets: bool) -> Option<Cow<'_, [u8]>> {
@@ -7531,7 +7550,7 @@ mod tests {
         let mut tiny = [0u8; 8];
         assert_eq!(
             blosc2_schunk_decompress_chunk_c(&schunk, 0, &mut tiny, 8),
-            BLOSC2_ERROR_WRITE_BUFFER
+            BLOSC2_ERROR_INVALID_PARAM
         );
         assert_eq!(
             blosc2_schunk_get_slice_buffer(&schunk, 0, 1024, &mut tiny),
@@ -8031,7 +8050,7 @@ mod tests {
         assert_eq!(chunk_dest, b"bbbb");
         assert_eq!(
             blosc2_schunk_decompress_chunk_c(&wrapped, 1, &mut chunk_dest, 3),
-            BLOSC2_ERROR_WRITE_BUFFER
+            BLOSC2_ERROR_INVALID_PARAM
         );
         assert_eq!(
             blosc2_schunk_decompress_chunk_c(&wrapped, 1, &mut chunk_dest, -1),
@@ -8040,7 +8059,7 @@ mod tests {
         let mut short_dest = vec![0u8; 3];
         assert_eq!(
             blosc2_schunk_decompress_chunk(&wrapped, 1, &mut short_dest),
-            BLOSC2_ERROR_WRITE_BUFFER
+            BLOSC2_ERROR_INVALID_PARAM
         );
         assert_eq!(
             blosc2_schunk_decompress_chunk(&wrapped, wrapped.nchunks(), &mut chunk_dest),
@@ -8258,6 +8277,39 @@ mod tests {
         let mut changed = copied.clone();
         changed.update_chunk(0, &[7u8; 64]).unwrap();
         assert_eq!(schunk.decompress_chunk(0).unwrap(), first);
+    }
+
+    #[test]
+    fn test_schunk_copy_with_params_zero_blocksize_uses_source_blocksize() {
+        let src_cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 1,
+            blocksize: 32,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_NOFILTER],
+            ..Default::default()
+        };
+        let mut schunk = Schunk::new(src_cparams.clone(), DParams::default());
+        schunk
+            .append_buffer(&(0..96u8).collect::<Vec<_>>())
+            .unwrap();
+        let original_chunk = schunk.compressed_chunk(0).unwrap().to_vec();
+
+        let dst_cparams = CParams {
+            blocksize: 0,
+            ..src_cparams
+        };
+        let copied = schunk
+            .copy_schunk_with_params(dst_cparams, DParams::default())
+            .unwrap();
+
+        assert_eq!(copied.get_cparams().blocksize, 32);
+        assert_eq!(copied.compressed_chunk(0).unwrap(), original_chunk);
+        assert_eq!(
+            copied.decompress_all().unwrap(),
+            schunk.decompress_all().unwrap()
+        );
     }
 
     #[test]
@@ -9097,15 +9149,9 @@ mod tests {
         );
         assert!(blosc2_schunk_get_slice_nchunks(&schunk, 8, 2).0 < 0);
         let empty = Schunk::new(CParams::default(), DParams::default());
-        assert_eq!(
-            blosc2_schunk_get_slice_nchunks(&empty, 10, 20),
-            (0, Some(vec![]))
-        );
-        assert_eq!(
-            blosc2_schunk_get_slice_nchunks_c(&empty, 10, 20),
-            (0, Some(vec![]))
-        );
-        assert_eq!(blosc2_get_slice_nchunks(&empty, 10, 20), (0, Some(vec![])));
+        assert_eq!(blosc2_schunk_get_slice_nchunks(&empty, 10, 20), (0, None));
+        assert_eq!(blosc2_schunk_get_slice_nchunks_c(&empty, 10, 20), (0, None));
+        assert_eq!(blosc2_get_slice_nchunks(&empty, 10, 20), (0, None));
         assert_eq!(
             blosc2_schunk_frame_get_offsets(&schunk),
             (BLOSC2_ERROR_FAILURE, None)
@@ -9118,7 +9164,7 @@ mod tests {
         assert!(empty_offsets.is_none());
         assert_eq!(
             blosc2_schunk_frame_len(&schunk),
-            schunk.to_frame().len() as i64
+            schunk.cbytes + schunk.nchunks() * std::mem::size_of::<i64>() as i64
         );
         let mut typed = Schunk::new(
             CParams {
@@ -9199,6 +9245,13 @@ mod tests {
         );
         assert_eq!(blosc2_schunk_fill_special(&mut wrapped_zeros, 0, 99, 0), 0);
         assert_eq!(wrapped_zeros.decompress_all().unwrap(), vec![0u8; 10]);
+        assert_eq!(
+            wrapped_zeros
+                .fill_special(0, BLOSC2_SPECIAL_ZERO, 0)
+                .unwrap(),
+            0
+        );
+        assert_eq!(wrapped_zeros.decompress_all().unwrap(), vec![0u8; 10]);
         let mut invalid_special = Schunk::new(
             CParams {
                 typesize: 1,
@@ -9251,6 +9304,18 @@ mod tests {
             .fill_special(1, BLOSC2_SPECIAL_ZERO, 0)
             .err(),
             Some("Invalid chunksize")
+        );
+        assert_eq!(
+            Schunk::new(
+                CParams {
+                    typesize: 4,
+                    ..Default::default()
+                },
+                DParams::default(),
+            )
+            .fill_special(2, BLOSC2_SPECIAL_ZERO, 6)
+            .err(),
+            Some("Special chunk creation failed")
         );
         assert_eq!(
             Schunk::new(
@@ -9310,7 +9375,7 @@ mod tests {
         let chunk = uninit.compressed_chunk(0).unwrap();
         let mut dest = vec![0xAA; 4];
         assert_eq!(compress::decompress_into(chunk, &mut dest).unwrap(), 4);
-        assert_eq!(dest, vec![0; 4]);
+        assert_eq!(dest, vec![0xAA; 4]);
         assert_eq!(uninit.decompress_all().unwrap(), vec![0u8; 6]);
 
         let mut invalid_nan = Schunk::new(
@@ -10085,6 +10150,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_attached_special_chunk_mutations_report_frame_cbytes_like_c() {
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 1,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            ..Default::default()
+        };
+        let zeros = vec![0u8; 4096];
+
+        let dir = tempfile::tempdir().unwrap();
+        let cframe_path = dir.path().join("attached-special.b2frame");
+        Schunk::new(cparams.clone(), DParams::default())
+            .to_file(cframe_path.to_str().unwrap())
+            .unwrap();
+        let mut opened = Schunk::open(cframe_path.to_str().unwrap()).unwrap();
+        opened.append_buffer(&zeros).unwrap();
+        assert_eq!(
+            ChunkHeader::read(&opened.chunks[0]).unwrap().special_type(),
+            BLOSC2_SPECIAL_ZERO
+        );
+        assert_eq!(opened.cbytes, 0);
+        let frame = std::fs::read(&cframe_path).unwrap();
+        assert_eq!(i64::from_be_bytes(frame[39..47].try_into().unwrap()), 0);
+        assert_eq!(
+            Schunk::open(cframe_path.to_str().unwrap())
+                .unwrap()
+                .decompress_all()
+                .unwrap(),
+            zeros
+        );
+
+        let sframe_path = dir.path().join("attached-special-sframe");
+        Schunk::new(cparams, DParams::default())
+            .to_sframe_dir(&sframe_path)
+            .unwrap();
+        let mut opened = Schunk::open_sframe(&sframe_path).unwrap();
+        opened.append_buffer(&zeros).unwrap();
+        assert_eq!(opened.cbytes, 0);
+        assert!(!sframe_path.join("00000000.chunk").exists());
+        let index = std::fs::read(sframe_path.join("chunks.b2frame")).unwrap();
+        assert_eq!(i64::from_be_bytes(index[39..47].try_into().unwrap()), 0);
+        assert_eq!(
+            Schunk::open_sframe(&sframe_path)
+                .unwrap()
+                .decompress_all()
+                .unwrap(),
+            zeros
+        );
+    }
+
     fn frame_offsets_from_bytes(frame: &[u8], data_cbytes: usize) -> Vec<u64> {
         let header_size = i32::from_be_bytes(frame[11..15].try_into().unwrap()) as usize;
         let data_end = header_size + data_cbytes;
@@ -10601,17 +10718,14 @@ mod tests {
     fn test_frame_len_matches_serialized_frame_size() {
         let empty = Schunk::new(CParams::default(), DParams::default());
         assert_eq!(empty.frame_len().unwrap(), empty.to_frame().len() as i64);
-        assert_eq!(
-            blosc2_schunk_frame_len(&empty),
-            empty.to_frame().len() as i64
-        );
+        assert_eq!(blosc2_schunk_frame_len(&empty), 0);
 
         let mut schunk = Schunk::new(CParams::default(), DParams::default());
         schunk.append_buffer(b"payload").unwrap();
         assert_eq!(schunk.frame_len().unwrap(), schunk.to_frame().len() as i64);
         assert_eq!(
             blosc2_schunk_frame_len(&schunk),
-            schunk.to_frame().len() as i64
+            schunk.cbytes + schunk.nchunks() * std::mem::size_of::<i64>() as i64
         );
 
         let dir = tempfile::tempdir().unwrap();
@@ -12686,7 +12800,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_chunk_rejects_typesize_mismatch() {
+    fn test_compressed_chunk_mutators_accept_typesize_mismatch_like_c() {
         let chunk = compress::compress(
             &[0u8; 16],
             &CParams {
@@ -12702,10 +12816,37 @@ mod tests {
             },
             DParams::default(),
         );
+        assert_eq!(schunk.append_chunk(&chunk), Ok(1));
+        assert_eq!(schunk.insert_chunk(0, &chunk), Ok(2));
+        assert_eq!(schunk.update_compressed_chunk(1, &chunk), Ok(2));
+        assert_eq!(schunk.decompress_chunk(0).unwrap(), vec![0u8; 16]);
+        assert_eq!(schunk.decompress_chunk(1).unwrap(), vec![0u8; 16]);
+    }
+
+    #[test]
+    fn test_compressed_chunk_mutators_ignore_trailing_buffer_bytes_like_c() {
+        let chunk = compress::compress(b"stored-prefix", &CParams::default()).unwrap();
+        let mut chunk_with_tail = chunk.clone();
+        chunk_with_tail.extend_from_slice(b"ignored tail bytes");
+
+        let mut schunk = Schunk::new(CParams::default(), DParams::default());
+        assert_eq!(schunk.append_chunk(&chunk_with_tail), Ok(1));
+        assert_eq!(schunk.compressed_chunk(0).unwrap(), chunk.as_slice());
+        assert_eq!(schunk.decompress_chunk(0).unwrap(), b"stored-prefix");
+
+        assert_eq!(schunk.insert_chunk(0, &chunk_with_tail), Ok(2));
+        assert_eq!(schunk.compressed_chunk(0).unwrap(), chunk.as_slice());
+        assert_eq!(schunk.decompress_chunk(0).unwrap(), b"stored-prefix");
+
+        let replacement = compress::compress(b"replacement", &CParams::default()).unwrap();
+        let mut replacement_with_tail = replacement.clone();
+        replacement_with_tail.extend_from_slice(b"ignored replacement tail");
         assert_eq!(
-            schunk.append_chunk(&chunk),
-            Err("Compressed chunk typesize does not match schunk")
+            schunk.update_compressed_chunk(1, &replacement_with_tail),
+            Ok(2)
         );
+        assert_eq!(schunk.compressed_chunk(1).unwrap(), replacement.as_slice());
+        assert_eq!(schunk.decompress_chunk(1).unwrap(), b"replacement");
     }
 
     #[test]

@@ -24,9 +24,9 @@ use crate::compress::{self, CParams, DParams};
 use crate::constants::{
     BLOSC2_ERROR_DATA, BLOSC2_ERROR_FAILURE, BLOSC2_ERROR_FILE_OPEN, BLOSC2_ERROR_FILE_WRITE,
     BLOSC2_ERROR_INVALID_INDEX, BLOSC2_ERROR_INVALID_PARAM, BLOSC2_ERROR_MAX_BUFSIZE_EXCEEDED,
-    BLOSC2_ERROR_METALAYER_NOT_FOUND, BLOSC2_ERROR_SUCCESS, BLOSC2_ERROR_WRITE_BUFFER,
-    BLOSC2_MAX_BUFFERSIZE, BLOSC2_MAX_METALAYERS, BLOSC2_SPECIAL_NAN, BLOSC2_SPECIAL_UNINIT,
-    BLOSC2_SPECIAL_ZERO,
+    BLOSC2_ERROR_METALAYER_NOT_FOUND, BLOSC2_ERROR_NULL_POINTER, BLOSC2_ERROR_SUCCESS,
+    BLOSC2_ERROR_WRITE_BUFFER, BLOSC2_MAX_BUFFERSIZE, BLOSC2_MAX_METALAYERS, BLOSC2_SPECIAL_NAN,
+    BLOSC2_SPECIAL_UNINIT, BLOSC2_SPECIAL_ZERO,
 };
 use crate::schunk::{FrameStorage, Schunk};
 use crate::utils::normalized_path;
@@ -250,6 +250,9 @@ pub fn b2nd_serialize_meta(meta: &B2ndMeta) -> Result<Vec<u8>, &'static str> {
 
 /// C-style metadata serializer for [`B2ndMeta::serialize`].
 pub fn b2nd_serialize_meta_c(meta: &B2ndMeta, dest: &mut [u8]) -> i32 {
+    if meta.dtype_format < 0 {
+        return BLOSC2_ERROR_FAILURE;
+    }
     match meta.serialize() {
         Ok(encoded) => {
             if dest.len() < encoded.len() {
@@ -270,7 +273,10 @@ pub fn b2nd_deserialize_meta(data: &[u8]) -> Result<B2ndMeta, &'static str> {
 /// C-style metadata deserializer for [`B2ndMeta::deserialize`].
 pub fn b2nd_deserialize_meta_c(data: &[u8]) -> (i32, Option<B2ndMeta>) {
     match B2ndMeta::deserialize(data) {
-        Ok(meta) => (BLOSC2_ERROR_SUCCESS, Some(meta)),
+        Ok(meta) => (
+            i32::try_from(data.len()).unwrap_or(BLOSC2_ERROR_INVALID_PARAM),
+            Some(meta),
+        ),
         Err(_) => (BLOSC2_ERROR_INVALID_PARAM, None),
     }
 }
@@ -612,7 +618,10 @@ pub fn b2nd_free_c(_array: B2ndArray) -> i32 {
 }
 
 /// Nullable lifecycle adapter for C API parity.
-pub fn b2nd_free_option_c(_array: Option<B2ndArray>) -> i32 {
+pub fn b2nd_free_option_c(array: Option<B2ndArray>) -> i32 {
+    if array.is_none() {
+        return BLOSC2_ERROR_NULL_POINTER;
+    }
     BLOSC2_ERROR_SUCCESS
 }
 
@@ -1276,30 +1285,21 @@ impl B2ndArray {
     ) -> Result<(), &'static str> {
         let (coords, extents, _) = validate_orthogonal_selection_c(&self.meta, selection)?;
         validate_orthogonal_buffershape_c(buffershape, &extents)?;
-        if buffershape
-            .iter()
-            .zip(&extents)
-            .any(|(&dim, &extent)| dim as usize != extent)
-        {
-            return Err("B2ND C selection buffer shape must match compact selection shape");
-        }
         let typesize = b2nd_cparams_typesize(&self.schunk.cparams)?;
-        let compact_len = product_usize(&extents)?
+        let selection_nbytes = product_usize(&extents)?
             .checked_mul(typesize)
             .ok_or("B2ND selection too large")?;
-        if buffersize != compact_len {
+        if buffersize > selection_nbytes {
             return Err("B2ND selection buffer size does not match selection shape and typesize");
         }
         if extents.iter().any(|&extent| extent == 0) {
             return Ok(());
         }
-        self.read_orthogonal_selection_chunks(
-            &coords,
-            &extents,
-            buffershape,
-            &mut dest[..buffersize],
-            typesize,
-        )
+        let required_len = dense_region_required_len(buffershape, &extents, typesize)?;
+        let dest = dest
+            .get_mut(..required_len)
+            .ok_or("B2ND destination too small")?;
+        self.read_orthogonal_selection_chunks(&coords, &extents, buffershape, dest, typesize)
     }
 }
 
@@ -2172,6 +2172,7 @@ impl B2ndArray {
 
         let mut schunk = Schunk::new(cparams, dparams);
         schunk.set_storage(FrameStorage::Sparse);
+        schunk.chunksize = chunk_nbytes;
         let encoded_meta = meta.serialize()?;
         schunk.cparams.b2nd_metalayer = Some(encoded_meta.clone());
         schunk.dparams.b2nd_metalayer = Some(encoded_meta.clone());
@@ -2216,6 +2217,7 @@ impl B2ndArray {
 
         let mut schunk = Schunk::new(cparams, dparams);
         schunk.set_storage(FrameStorage::Sparse);
+        schunk.chunksize = chunk_nbytes;
         let encoded_meta = meta.serialize()?;
         schunk.cparams.b2nd_metalayer = Some(encoded_meta.clone());
         schunk.dparams.b2nd_metalayer = Some(encoded_meta.clone());
@@ -3112,25 +3114,19 @@ impl B2ndArray {
     ) -> Result<(), &'static str> {
         let (coords, extents, _) = validate_orthogonal_selection_c(&self.meta, selection)?;
         validate_orthogonal_buffershape_c(buffershape, &extents)?;
-        if buffershape
-            .iter()
-            .zip(&extents)
-            .any(|(&dim, &extent)| dim as usize != extent)
-        {
-            return Err("B2ND C selection buffer shape must match compact selection shape");
-        }
         let typesize = b2nd_cparams_typesize(&self.schunk.cparams)?;
-        let compact_len = product_usize(&extents)?
+        let selection_nbytes = product_usize(&extents)?
             .checked_mul(typesize)
             .ok_or("B2ND selection too large")?;
-        if buffersize != compact_len {
+        if buffersize > selection_nbytes {
             return Err("B2ND selection buffer size does not match selection shape and typesize");
         }
         if extents.iter().any(|&extent| extent == 0) {
             return Ok(());
         }
+        let required_len = dense_region_required_len(buffershape, &extents, typesize)?;
         let data = data
-            .get(..buffersize)
+            .get(..required_len)
             .ok_or("B2ND selection buffer size does not match selection shape and typesize")?;
         self.transactional_mutation(|array| {
             array.update_orthogonal_chunks_from_dense(
@@ -4296,14 +4292,13 @@ fn validate_orthogonal_selection_c(
             .ok_or("B2ND selection coordinate overflow")?;
         let mut dim_coords = Vec::with_capacity(dim_selection.len());
         for &coord in dim_selection {
-            if coord < 0 || coord >= meta.shape[dim] {
+            if coord < 0 || coord > meta.shape[dim] {
                 return Err("Invalid B2ND selection coordinate");
             }
-            let coord = coord as usize;
-            if coord >= padded_stop {
-                return Err("Invalid B2ND selection coordinate");
+            if coord as usize >= padded_stop {
+                return Err("B2ND selection chunk index out of range");
             }
-            dim_coords.push(coord);
+            dim_coords.push(coord as usize);
         }
         extents.push(dim_coords.len());
         shape.push(dim_coords.len() as i64);
@@ -5617,13 +5612,24 @@ mod tests {
             b2nd_serialize_meta_c(&meta, &mut encoded_dest[..encoded.len() - 1]),
             BLOSC2_ERROR_WRITE_BUFFER
         );
+        let negative_dtype_format_meta = B2ndMeta {
+            shape: vec![10, 20],
+            chunkshape: vec![4, 5],
+            blockshape: vec![2, 5],
+            dtype: "<i4".to_string(),
+            dtype_format: -1,
+        };
+        assert_eq!(
+            b2nd_serialize_meta_c(&negative_dtype_format_meta, &mut encoded_dest),
+            BLOSC2_ERROR_FAILURE
+        );
 
         let decoded = B2ndMeta::deserialize(&encoded).unwrap();
         assert_eq!(decoded, meta);
         assert_eq!(b2nd_deserialize_meta(&encoded).unwrap(), meta);
         assert_eq!(
             b2nd_deserialize_meta_c(&encoded),
-            (BLOSC2_ERROR_SUCCESS, Some(meta.clone()))
+            (encoded.len() as i32, Some(meta.clone()))
         );
         let mut invalid_encoded = encoded.clone();
         invalid_encoded.push(0xff);
@@ -7793,7 +7799,11 @@ mod tests {
             b2nd_from_cframe_c(&frame, frame.len() as i64, false);
         assert_eq!(from_frame_view_rc, BLOSC2_ERROR_INVALID_PARAM);
         assert!(from_frame_view_c.is_none());
-        assert_eq!(b2nd_free_option_c(None), BLOSC2_ERROR_SUCCESS);
+        assert_eq!(b2nd_free_option_c(None), BLOSC2_ERROR_NULL_POINTER);
+        assert_eq!(
+            b2nd_free_option_c(Some(array.clone())),
+            BLOSC2_ERROR_SUCCESS
+        );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("array.b2frame");
         assert_eq!(b2nd_save(&array, &path), BLOSC2_ERROR_SUCCESS);
@@ -8188,8 +8198,9 @@ mod tests {
                 &[2, 2],
                 3,
             ),
-            BLOSC2_ERROR_INVALID_PARAM
+            BLOSC2_ERROR_SUCCESS
         );
+        assert_eq!(selected_dest, vec![1, 3, 13, 15]);
         let padded_array = B2ndArray::from_cbuffer(
             B2ndMeta::new(vec![3, 4], vec![2, 2], vec![1, 2], "|u1", 0).unwrap(),
             &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
@@ -8209,9 +8220,10 @@ mod tests {
                 &[2, 3],
                 4,
             ),
-            BLOSC2_ERROR_INVALID_PARAM
+            BLOSC2_ERROR_SUCCESS
         );
-        assert_eq!(padded_dest, vec![0xaa; 6]);
+        assert_eq!(padded_dest, vec![1, 2, 0xaa, 5, 6, 0xaa]);
+        padded_dest.fill(0xaa);
         assert_eq!(
             b2nd_get_orthogonal_selection_cbuffer_c(
                 &padded_array,
@@ -8245,9 +8257,9 @@ mod tests {
                 &[1, 1],
                 1,
             ),
-            BLOSC2_ERROR_INVALID_INDEX
+            BLOSC2_ERROR_SUCCESS
         );
-        assert_eq!(tail_dest, vec![0xff]);
+        assert_eq!(tail_dest, vec![0]);
         let mut small_dest = vec![0u8; 2];
         assert_eq!(
             b2nd_get_orthogonal_selection_cbuffer_c(
@@ -8257,8 +8269,9 @@ mod tests {
                 &[1, 2],
                 1,
             ),
-            BLOSC2_ERROR_INVALID_PARAM
+            BLOSC2_ERROR_SUCCESS
         );
+        assert_eq!(small_dest, vec![1, 2]);
         let mut too_wide_dest = vec![0xaa; 6];
         assert_eq!(
             b2nd_get_orthogonal_selection_cbuffer_c(
@@ -8362,7 +8375,7 @@ mod tests {
                 &src,
                 4,
             ),
-            BLOSC2_ERROR_INVALID_PARAM
+            BLOSC2_ERROR_SUCCESS
         );
         assert_eq!(
             b2nd_set_orthogonal_selection_cbuffer_c(
@@ -8397,9 +8410,44 @@ mod tests {
                 &[99],
                 1,
             ),
-            BLOSC2_ERROR_INVALID_INDEX
+            BLOSC2_ERROR_SUCCESS
         );
         assert_eq!(padded_target.to_cbuffer().unwrap(), before);
+
+        let mut edge_target = B2ndArray::from_cbuffer(
+            B2ndMeta::new(vec![4, 2], vec![2, 2], vec![1, 2], "|u1", 0).unwrap(),
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            CParams {
+                typesize: 1,
+                ..Default::default()
+            },
+            DParams::default(),
+        )
+        .unwrap();
+        let mut edge_dest = vec![0xff; 1];
+        assert_eq!(
+            b2nd_get_orthogonal_selection_cbuffer_c(
+                &edge_target,
+                &[vec![4], vec![0]],
+                &mut edge_dest,
+                &[1, 1],
+                1,
+            ),
+            BLOSC2_ERROR_INVALID_PARAM
+        );
+        assert_eq!(edge_dest, vec![0xff]);
+        let edge_before = edge_target.to_cbuffer().unwrap();
+        assert_eq!(
+            b2nd_set_orthogonal_selection_cbuffer_c(
+                &mut edge_target,
+                &[vec![4], vec![0]],
+                &[1, 1],
+                &[99],
+                1,
+            ),
+            BLOSC2_ERROR_INVALID_PARAM
+        );
+        assert_eq!(edge_target.to_cbuffer().unwrap(), edge_before);
 
         let expanded = b2nd_expand_dims_final_c(&array, &[true, false, false], 3)
             .1
@@ -8912,6 +8960,65 @@ mod tests {
             .set_orthogonal_selection_cbuffer(&[Vec::new(), vec![0]], &[0, 1], &[1, 2])
             .is_err());
         assert_eq!(array.to_cbuffer().unwrap(), before);
+    }
+
+    #[test]
+    fn test_b2nd_orthogonal_c_adapter_buffersize_matches_c_bounds() {
+        let meta = B2ndMeta::new(vec![3, 4], vec![2, 2], vec![1, 2], "<u2", 0).unwrap();
+        let values: Vec<u16> = (0..12u16).collect();
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 2,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            ..Default::default()
+        };
+        let mut array =
+            B2ndArray::from_cbuffer(meta, &u16_bytes(&values), cparams, DParams::default())
+                .unwrap();
+        let selection = vec![vec![2, 0], vec![3, 1]];
+        let compact_len = 4 * 2;
+
+        let mut dest = vec![0xff; compact_len];
+        assert_eq!(
+            b2nd_get_orthogonal_selection_cbuffer_c(
+                &array,
+                &selection,
+                &mut dest,
+                &[2, 2],
+                (compact_len - 2) as i64,
+            ),
+            BLOSC2_ERROR_SUCCESS
+        );
+        assert_eq!(dest, u16_bytes(&[11, 9, 3, 1]));
+        assert_eq!(
+            b2nd_get_orthogonal_selection_cbuffer_c(
+                &array,
+                &selection,
+                &mut dest,
+                &[2, 2],
+                (compact_len + 1) as i64,
+            ),
+            BLOSC2_ERROR_INVALID_PARAM
+        );
+
+        assert_eq!(
+            b2nd_set_orthogonal_selection_cbuffer_c(
+                &mut array,
+                &selection,
+                &[2, 2],
+                &u16_bytes(&[100, 101, 102, 103]),
+                (compact_len - 2) as i64,
+            ),
+            BLOSC2_ERROR_SUCCESS
+        );
+        let mut expected = values;
+        expected[2 * 4 + 3] = 100;
+        expected[2 * 4 + 1] = 101;
+        expected[3] = 102;
+        expected[1] = 103;
+        assert_eq!(array.to_cbuffer().unwrap(), u16_bytes(&expected));
     }
 
     #[test]

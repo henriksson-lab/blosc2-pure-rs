@@ -18,6 +18,7 @@ use std::time::Instant;
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_TEMP_CREATE_ATTEMPTS: usize = 128;
+const CLI_DEFAULT_CHUNKSIZE: usize = 1_000_000;
 
 #[derive(Parser)]
 #[command(name = "blosc2", about = "Blosc2 compression tool")]
@@ -47,7 +48,7 @@ enum Commands {
         #[arg(short = 'b', long, default_value_t = 0, value_parser = clap::value_parser!(i32).range(0..))]
         blocksize: i32,
         /// Input bytes per frame chunk
-        #[arg(long, default_value_t = DEFAULT_CHUNKSIZE, value_parser = parse_chunksize)]
+        #[arg(long, default_value_t = CLI_DEFAULT_CHUNKSIZE, value_parser = parse_chunksize)]
         chunksize: usize,
         /// Split mode (always, never, auto, forward)
         #[arg(short = 's', long, default_value = "forward")]
@@ -142,36 +143,38 @@ fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::R
     let mut buf = vec![0u8; options.chunksize];
 
     loop {
-        let bytes_read = finput.read(&mut buf)?;
-        if bytes_read == 0 {
+        let bytes_read = read_next_chunk(&mut finput, &mut buf)?;
+        let chunk = &buf[..bytes_read];
+        schunk
+            .append_buffer(chunk)
+            .map_err(|e| io::Error::other(format!("Error compressing: {e}")))?;
+        if bytes_read < options.chunksize {
             break;
         }
-        schunk
-            .append_buffer(&buf[..bytes_read])
-            .map_err(|e| io::Error::other(format!("Error compressing: {e}")))?;
     }
 
     let nbytes = schunk.nbytes;
+    let cbytes = schunk.cbytes;
     atomic_write_with(output, |writer| {
         frame::write_frame_to_writer(&schunk, writer)
     })?;
-    let cbytes = std::fs::metadata(output)?.len() as i64;
     let elapsed = start.elapsed().as_secs_f64();
 
-    let mb = 1024.0 * 1024.0;
-    println!(
-        "Compression ratio: {:.1} MB -> {:.1} MB ({:.1}x)",
-        nbytes as f64 / mb,
-        cbytes as f64 / mb,
-        ratio(nbytes, cbytes)
-    );
-    println!(
-        "Compression time: {:.3} s, {:.1} MB/s",
-        elapsed,
-        throughput_mib(nbytes, elapsed)
-    );
+    print_compression_stats(nbytes, cbytes, elapsed);
 
     Ok(())
+}
+
+fn read_next_chunk<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+    let mut total_read = 0;
+    while total_read < buf.len() {
+        let bytes_read = reader.read(&mut buf[total_read..])?;
+        if bytes_read == 0 {
+            break;
+        }
+        total_read += bytes_read;
+    }
+    Ok(total_read)
 }
 
 /// Decompresses a Blosc2 frame at `input` into the raw file at `output`.
@@ -184,13 +187,6 @@ fn decompress_file(input: &Path, output: &Path, nthreads: i16) -> io::Result<()>
     let mut schunk = Schunk::open_offset(input, 0)
         .map_err(|e| io::Error::other(format!("Failed to open frame: {e}")))?;
     schunk.dparams.nthreads = nthreads;
-
-    if schunk.nchunks() == 0 {
-        atomic_write_all(output, &[])?;
-        println!("Decompression ratio: 0.0 MB -> 0.0 MB (0.0x)");
-        println!("Decompression time: 0.000 s, 0.0 MB/s");
-        return Ok(());
-    }
 
     let start = Instant::now();
     atomic_write_with(output, |foutput| {
@@ -207,25 +203,9 @@ fn decompress_file(input: &Path, output: &Path, nthreads: i16) -> io::Result<()>
     let cbytes = schunk.cbytes;
     let elapsed = start.elapsed().as_secs_f64();
 
-    let mb = 1024.0 * 1024.0;
-    println!(
-        "Decompression ratio: {:.1} MB -> {:.1} MB ({:.1}x)",
-        cbytes as f64 / mb,
-        nbytes as f64 / mb,
-        ratio(cbytes, nbytes)
-    );
-    println!(
-        "Decompression time: {:.3} s, {:.1} MB/s",
-        elapsed,
-        throughput_mib(nbytes, elapsed)
-    );
+    print_decompression_stats(nbytes, cbytes, elapsed);
 
     Ok(())
-}
-
-/// Writes bytes to `output` through a sibling temporary file, then replaces the destination.
-fn atomic_write_all(output: &Path, bytes: &[u8]) -> io::Result<()> {
-    atomic_write_with(output, |writer| writer.write_all(bytes))
 }
 
 fn atomic_write_with<F>(output: &Path, write: F) -> io::Result<()>
@@ -332,6 +312,113 @@ fn throughput_mib(nbytes: i64, elapsed_secs: f64) -> f64 {
     }
 }
 
+fn c_general_3(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    if !value.is_finite() {
+        return value.to_string();
+    }
+
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    let abs = value.abs();
+    let exponent = abs.log10().floor() as i32;
+
+    let mut formatted = if !(-4..3).contains(&exponent) {
+        trim_general_number(format!("{abs:.2e}"))
+    } else {
+        let decimals = (2 - exponent).max(0) as usize;
+        trim_general_number(format!("{abs:.decimals$}"))
+    };
+
+    if !sign.is_empty() {
+        formatted.insert_str(0, sign);
+    }
+    formatted
+}
+
+fn trim_general_number(mut value: String) -> String {
+    let exponent_index = value.find(['e', 'E']);
+    let exponent = exponent_index.map(|idx| value.split_off(idx));
+
+    if value.contains('.') {
+        while value.ends_with('0') {
+            value.pop();
+        }
+        if value.ends_with('.') {
+            value.pop();
+        }
+    }
+
+    if let Some(exponent) = exponent {
+        value.push_str(&normalize_c_exponent(&exponent));
+    }
+    value
+}
+
+fn normalize_c_exponent(exponent: &str) -> String {
+    let (marker, digits) = exponent.split_at(1);
+    let parsed = digits.parse::<i32>().unwrap_or(0);
+    format!("{marker}{parsed:+03}")
+}
+
+fn compression_stats_lines(nbytes: i64, cbytes: i64, elapsed_secs: f64) -> (String, String) {
+    let mb = 1024.0 * 1024.0;
+    (
+        format!(
+            "Compression ratio: {:.1} MB -> {:.1} MB ({:.1}x)",
+            nbytes as f64 / mb,
+            cbytes as f64 / mb,
+            ratio(nbytes, cbytes)
+        ),
+        format!(
+            "Compression time: {} s, {:.1} MB/s",
+            c_general_3(elapsed_secs),
+            throughput_mib(nbytes, elapsed_secs)
+        ),
+    )
+}
+
+fn print_compression_stats(nbytes: i64, cbytes: i64, elapsed_secs: f64) {
+    let (ratio_line, time_line) = compression_stats_lines(nbytes, cbytes, elapsed_secs);
+    println!("{ratio_line}");
+    println!("{time_line}");
+}
+
+fn decompression_stats_lines(nbytes: i64, cbytes: i64, elapsed_secs: f64) -> (String, String) {
+    let mb = 1024.0 * 1024.0;
+    (
+        format!(
+            "Decompression ratio: {:.1} MB -> {:.1} MB ({:.1}x)",
+            cbytes as f64 / mb,
+            nbytes as f64 / mb,
+            ratio(cbytes, nbytes)
+        ),
+        format!(
+            "Decompression time: {} s, {:.1} MB/s",
+            c_general_3(elapsed_secs),
+            throughput_mib(nbytes, elapsed_secs)
+        ),
+    )
+}
+
+fn print_decompression_stats(nbytes: i64, cbytes: i64, elapsed_secs: f64) {
+    let (ratio_line, time_line) = decompression_stats_lines(nbytes, cbytes, elapsed_secs);
+    println!("{ratio_line}");
+    println!("{time_line}");
+}
+
+fn version_info_line() -> String {
+    format!(
+        "Blosc version info: {} ({})",
+        BLOSC2_VERSION_STRING, BLOSC2_VERSION_DATE
+    )
+}
+
+fn print_version_info() {
+    println!("{}", version_info_line());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +452,152 @@ mod tests {
         assert_eq!(std::fs::read(&output).unwrap(), b"new");
         assert!(!temp.exists());
     }
+
+    #[test]
+    fn cli_default_chunksize_matches_c_example() {
+        assert_eq!(CLI_DEFAULT_CHUNKSIZE, 1_000_000);
+        assert_eq!(
+            parse_chunksize(&CLI_DEFAULT_CHUNKSIZE.to_string()).unwrap(),
+            CLI_DEFAULT_CHUNKSIZE
+        );
+    }
+
+    #[test]
+    fn version_info_line_matches_c_example_prefix() {
+        assert_eq!(
+            version_info_line(),
+            format!(
+                "Blosc version info: {} ({})",
+                BLOSC2_VERSION_STRING, BLOSC2_VERSION_DATE
+            )
+        );
+    }
+
+    #[test]
+    fn compression_stats_use_schunk_cbytes_like_c_example() {
+        let (ratio_line, time_line) =
+            compression_stats_lines(4 * 1024 * 1024, 2 * 1024 * 1024, 0.5);
+
+        assert_eq!(ratio_line, "Compression ratio: 4.0 MB -> 2.0 MB (2.0x)");
+        assert_eq!(time_line, "Compression time: 0.5 s, 8.0 MB/s");
+    }
+
+    #[test]
+    fn decompression_stats_match_c_example_order() {
+        let (ratio_line, time_line) =
+            decompression_stats_lines(4 * 1024 * 1024, 2 * 1024 * 1024, 0.25);
+
+        assert_eq!(ratio_line, "Decompression ratio: 2.0 MB -> 4.0 MB (0.5x)");
+        assert_eq!(time_line, "Decompression time: 0.25 s, 16.0 MB/s");
+    }
+
+    #[test]
+    fn stats_elapsed_seconds_use_c_general_precision() {
+        assert_eq!(c_general_3(0.0), "0");
+        assert_eq!(c_general_3(0.0185), "0.0185");
+        assert_eq!(c_general_3(12.345), "12.3");
+        assert_eq!(c_general_3(1234.0), "1.23e+03");
+    }
+
+    #[test]
+    fn read_next_chunk_fills_buffer_across_short_reads_like_fread() {
+        struct ShortReader {
+            data: Vec<u8>,
+            pos: usize,
+            max_read: usize,
+        }
+
+        impl Read for ShortReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.pos == self.data.len() {
+                    return Ok(0);
+                }
+                let len = self.max_read.min(buf.len()).min(self.data.len() - self.pos);
+                buf[..len].copy_from_slice(&self.data[self.pos..self.pos + len]);
+                self.pos += len;
+                Ok(len)
+            }
+        }
+
+        let mut reader = ShortReader {
+            data: b"abcdefghijkl".to_vec(),
+            pos: 0,
+            max_read: 3,
+        };
+        let mut buf = [0u8; 8];
+
+        assert_eq!(read_next_chunk(&mut reader, &mut buf).unwrap(), 8);
+        assert_eq!(&buf, b"abcdefgh");
+        assert_eq!(read_next_chunk(&mut reader, &mut buf).unwrap(), 4);
+        assert_eq!(&buf[..4], b"ijkl");
+    }
+
+    #[test]
+    fn compress_empty_input_creates_decompressible_empty_chunk_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("empty.bin");
+        let output = dir.path().join("empty.b2frame");
+        let restored = dir.path().join("restored.bin");
+        std::fs::write(&input, []).unwrap();
+
+        compress_file(
+            &input,
+            &output,
+            CompressOptions {
+                codec: Codec::BloscLz,
+                clevel: 9,
+                typesize: 1,
+                blocksize: 0,
+                chunksize: CLI_DEFAULT_CHUNKSIZE,
+                splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
+                nthreads: 1,
+                filter: Filter::Shuffle,
+                filter_meta: 0,
+            },
+        )
+        .unwrap();
+
+        let schunk = Schunk::open_offset(&output, 0).unwrap();
+        assert_eq!(schunk.nchunks(), 1);
+        assert_eq!(schunk.nbytes, 0);
+        assert!(schunk.cbytes > 0);
+
+        decompress_file(&output, &restored, 1).unwrap();
+        assert_eq!(std::fs::read(restored).unwrap(), b"");
+    }
+
+    #[test]
+    fn compress_exact_chunk_multiple_roundtrips_after_c_example_final_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("exact.bin");
+        let output = dir.path().join("exact.b2frame");
+        let restored = dir.path().join("restored.bin");
+        let data = b"abcdefgh".repeat(2);
+        std::fs::write(&input, &data).unwrap();
+
+        compress_file(
+            &input,
+            &output,
+            CompressOptions {
+                codec: Codec::BloscLz,
+                clevel: 9,
+                typesize: 1,
+                blocksize: 0,
+                chunksize: 8,
+                splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
+                nthreads: 1,
+                filter: Filter::Shuffle,
+                filter_meta: 0,
+            },
+        )
+        .unwrap();
+
+        let schunk = Schunk::open_offset(&output, 0).unwrap();
+        assert_eq!(schunk.nbytes, data.len() as i64);
+
+        decompress_file(&output, &restored, 1).unwrap();
+        assert_eq!(std::fs::read(restored).unwrap(), data);
+    }
 }
 
 /// Parses a split-mode name (case-insensitive) into its Blosc2 constant.
@@ -385,6 +618,7 @@ fn parse_splitmode(s: &str) -> Option<i32> {
 /// `compress` or `decompress` handler. Exits with status 1 on error.
 fn main() {
     let cli = Cli::parse();
+    print_version_info();
 
     // Set rayon global thread pool based on nthreads from first subcommand
     let nthreads = match &cli.command {

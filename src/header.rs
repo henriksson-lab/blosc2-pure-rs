@@ -59,6 +59,16 @@ impl ChunkHeader {
             ..Default::default()
         };
 
+        if h.cbytes < BLOSC_MIN_HEADER_LENGTH as i32 {
+            return Err("Invalid cbytes");
+        }
+        if h.blocksize <= 0 || h.blocksize as usize > BLOSC2_MAXBLOCKSIZE {
+            return Err("Invalid blocksize");
+        }
+        if h.typesize == 0 {
+            return Err("Invalid typesize");
+        }
+
         if h.flags & BLOSC_DOBITSHUFFLE != 0 {
             h.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_BITSHUFFLE;
         } else if h.flags & BLOSC_DOSHUFFLE != 0 {
@@ -67,8 +77,13 @@ impl ChunkHeader {
         if h.flags & BLOSC_DODELTA != 0 {
             h.filters[BLOSC2_MAX_FILTERS - 2] = BLOSC_DELTA;
         }
-
         Ok(h)
+    }
+
+    fn normalize_regular_blocksize(&mut self) {
+        if !self.vl_blocks() && self.nbytes > 0 && self.blocksize > self.nbytes {
+            self.blocksize = self.nbytes;
+        }
     }
 
     /// Parses only the 16-byte legacy prefix of a chunk header.
@@ -76,7 +91,9 @@ impl ChunkHeader {
     /// This mirrors C-Blosc metadata queries, which can inspect size and basic
     /// filter information without requiring the full compressed payload.
     pub fn read_minimal(data: &[u8]) -> Result<Self, &'static str> {
-        Self::read_legacy_fields(data)
+        let mut h = Self::read_legacy_fields(data)?;
+        h.normalize_regular_blocksize();
+        Ok(h)
     }
 
     /// Returns `true` if this chunk uses the extended 32-byte Blosc2 header.
@@ -97,7 +114,7 @@ impl ChunkHeader {
     /// [`udcompcode`](Self::udcompcode) is returned; otherwise the 3-bit format
     /// code is mapped back to a codec ID via [`compformat_to_compcode`].
     pub fn compcode(&self) -> u8 {
-        if self.is_extended() && self.compformat() == BLOSC_UDCODEC_FORMAT {
+        if self.compformat() == BLOSC_UDCODEC_FORMAT {
             self.udcompcode
         } else {
             compformat_to_compcode(self.compformat())
@@ -142,9 +159,13 @@ impl ChunkHeader {
 
     /// Returns the number of blocks that make up this chunk.
     ///
-    /// Computed as `ceil(nbytes / blocksize)`. Returns 0 for negative or zero
-    /// sizes so that malformed headers do not panic.
+    /// Regular chunks compute this as `ceil(nbytes / blocksize)`. For
+    /// variable-length-block chunks, the header `blocksize` field stores the
+    /// encoded block count.
     pub fn nblocks(&self) -> usize {
+        if self.vl_blocks() {
+            return self.blocksize.max(0) as usize;
+        }
         if self.nbytes <= 0 || self.blocksize <= 0 {
             return 0;
         }
@@ -153,18 +174,16 @@ impl ChunkHeader {
 
     /// Returns the size of the last (possibly partial) block.
     ///
-    /// When `nbytes` is an exact multiple of `blocksize` this returns the full
-    /// block size. Returns 0 for invalid signed sizes.
+    /// When `nbytes` is an exact multiple of `blocksize` this returns 0,
+    /// matching C-Blosc2's `leftover` field. Returns 0 for invalid signed sizes.
     pub fn leftover(&self) -> usize {
+        if self.vl_blocks() {
+            return 0;
+        }
         if self.nbytes <= 0 || self.blocksize <= 0 {
             return 0;
         }
-        let rem = self.nbytes as usize % self.blocksize as usize;
-        if rem == 0 {
-            self.blocksize as usize
-        } else {
-            rem
-        }
+        self.nbytes as usize % self.blocksize as usize
     }
 
     /// Parses a chunk header from raw bytes.
@@ -176,6 +195,9 @@ impl ChunkHeader {
 
         // Extended header (32 bytes)
         if h.is_extended() {
+            if h.cbytes < BLOSC_EXTENDED_HEADER_LENGTH as i32 {
+                return Err("Invalid cbytes");
+            }
             if data.len() < BLOSC_EXTENDED_HEADER_LENGTH {
                 return Err("Buffer too small for extended header");
             }
@@ -191,7 +213,28 @@ impl ChunkHeader {
                 h.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_NOFILTER;
                 h.filters_meta[BLOSC2_MAX_FILTERS - 1] = 0;
             }
+            if h.vl_blocks() && h.special_type() != BLOSC2_NO_SPECIAL {
+                return Err("Invalid VL-block special chunk");
+            }
+            if h.special_type() != BLOSC2_NO_SPECIAL {
+                if h.special_type() == BLOSC2_SPECIAL_VALUE {
+                    let typesize = h.cbytes - BLOSC_EXTENDED_HEADER_LENGTH as i32;
+                    if typesize <= 0
+                        || typesize as usize > BLOSC2_MAXTYPESIZE
+                        || typesize > h.nbytes
+                        || h.nbytes % typesize != 0
+                    {
+                        return Err("Invalid special value typesize");
+                    }
+                } else if h.nbytes % h.typesize as i32 != 0 {
+                    return Err("Invalid special chunk nbytes");
+                }
+            }
+            if h.version > BLOSC2_VERSION_FORMAT && (h.blosc2_flags2 & !BLOSC2_VL_BLOCKS) != 0 {
+                return Err("Unsupported chunk version features");
+            }
         }
+        h.normalize_regular_blocksize();
 
         Ok(h)
     }
@@ -276,6 +319,22 @@ mod tests {
     }
 
     #[test]
+    fn test_user_codec_format_uses_udcompcode_like_c() {
+        let parsed_legacy = ChunkHeader {
+            flags: BLOSC_UDCODEC_FORMAT << 5,
+            ..Default::default()
+        };
+        assert_eq!(parsed_legacy.compcode(), 0);
+
+        let parsed_extended = ChunkHeader {
+            flags: BLOSC_DOSHUFFLE | BLOSC_DOBITSHUFFLE | (BLOSC_UDCODEC_FORMAT << 5),
+            udcompcode: 201,
+            ..Default::default()
+        };
+        assert_eq!(parsed_extended.compcode(), 201);
+    }
+
+    #[test]
     fn test_nblocks_calculation() {
         let h = ChunkHeader {
             nbytes: 10000,
@@ -284,6 +343,18 @@ mod tests {
         };
         assert_eq!(h.nblocks(), 3); // ceil(10000/4096)
         assert_eq!(h.leftover(), 10000 - 4096 * 2);
+    }
+
+    #[test]
+    fn test_leftover_is_zero_for_exact_block_multiple_like_c() {
+        let h = ChunkHeader {
+            nbytes: 8192,
+            blocksize: 4096,
+            ..Default::default()
+        };
+
+        assert_eq!(h.nblocks(), 2);
+        assert_eq!(h.leftover(), 0);
     }
 
     #[test]
@@ -308,5 +379,147 @@ mod tests {
             assert_eq!(h.nblocks(), 0);
             assert_eq!(h.leftover(), 0);
         }
+    }
+
+    #[test]
+    fn test_read_normalizes_oversized_regular_blocksize_like_c() {
+        let mut buf = [0u8; BLOSC_MIN_HEADER_LENGTH];
+        buf[BLOSC2_CHUNK_VERSION] = BLOSC2_VERSION_FORMAT_STABLE;
+        buf[BLOSC2_CHUNK_VERSIONLZ] = 1;
+        buf[BLOSC2_CHUNK_FLAGS] = BLOSC_LZ4_FORMAT << 5;
+        buf[BLOSC2_CHUNK_TYPESIZE] = 4;
+        buf[BLOSC2_CHUNK_NBYTES..BLOSC2_CHUNK_NBYTES + 4].copy_from_slice(&100i32.to_le_bytes());
+        buf[BLOSC2_CHUNK_BLOCKSIZE..BLOSC2_CHUNK_BLOCKSIZE + 4]
+            .copy_from_slice(&200i32.to_le_bytes());
+        buf[BLOSC2_CHUNK_CBYTES..BLOSC2_CHUNK_CBYTES + 4].copy_from_slice(&16i32.to_le_bytes());
+
+        let h = ChunkHeader::read_minimal(&buf).unwrap();
+
+        assert_eq!(h.blocksize, 100);
+        assert_eq!(h.nblocks(), 1);
+    }
+
+    #[test]
+    fn test_read_rejects_c_invalid_legacy_fields() {
+        let mut valid = [0u8; BLOSC_MIN_HEADER_LENGTH];
+        valid[BLOSC2_CHUNK_VERSION] = BLOSC2_VERSION_FORMAT_STABLE;
+        valid[BLOSC2_CHUNK_VERSIONLZ] = 1;
+        valid[BLOSC2_CHUNK_TYPESIZE] = 1;
+        valid[BLOSC2_CHUNK_NBYTES..BLOSC2_CHUNK_NBYTES + 4].copy_from_slice(&1i32.to_le_bytes());
+        valid[BLOSC2_CHUNK_BLOCKSIZE..BLOSC2_CHUNK_BLOCKSIZE + 4]
+            .copy_from_slice(&1i32.to_le_bytes());
+        valid[BLOSC2_CHUNK_CBYTES..BLOSC2_CHUNK_CBYTES + 4].copy_from_slice(&16i32.to_le_bytes());
+
+        let mut bad_cbytes = valid;
+        bad_cbytes[BLOSC2_CHUNK_CBYTES..BLOSC2_CHUNK_CBYTES + 4]
+            .copy_from_slice(&15i32.to_le_bytes());
+        assert!(ChunkHeader::read_minimal(&bad_cbytes).is_err());
+
+        let mut bad_blocksize = valid;
+        bad_blocksize[BLOSC2_CHUNK_BLOCKSIZE..BLOSC2_CHUNK_BLOCKSIZE + 4]
+            .copy_from_slice(&0i32.to_le_bytes());
+        assert!(ChunkHeader::read_minimal(&bad_blocksize).is_err());
+
+        let mut bad_typesize = valid;
+        bad_typesize[BLOSC2_CHUNK_TYPESIZE] = 0;
+        assert!(ChunkHeader::read_minimal(&bad_typesize).is_err());
+    }
+
+    #[test]
+    fn test_read_preserves_vl_block_count_like_c() {
+        let h = ChunkHeader {
+            version: BLOSC2_VERSION_FORMAT_VL_BLOCKS,
+            versionlz: 1,
+            flags: BLOSC_DOSHUFFLE | BLOSC_DOBITSHUFFLE | (BLOSC_LZ4_FORMAT << 5),
+            typesize: 4,
+            nbytes: 100,
+            blocksize: 200,
+            cbytes: BLOSC_EXTENDED_HEADER_LENGTH as i32,
+            blosc2_flags2: BLOSC2_VL_BLOCKS,
+            ..Default::default()
+        };
+
+        let mut buf = [0u8; BLOSC_EXTENDED_HEADER_LENGTH];
+        h.try_write(&mut buf).unwrap();
+        let h2 = ChunkHeader::read(&buf).unwrap();
+
+        assert_eq!(h2.blocksize, 200);
+        assert_eq!(h2.nblocks(), 200);
+        assert_eq!(h2.leftover(), 0);
+        assert!(h2.vl_blocks());
+    }
+
+    #[test]
+    fn test_vl_nblocks_uses_encoded_block_count_like_c() {
+        let h = ChunkHeader {
+            nbytes: 10_000,
+            blocksize: 3,
+            blosc2_flags2: BLOSC2_VL_BLOCKS,
+            ..Default::default()
+        };
+
+        assert_eq!(h.nblocks(), 3);
+        assert_eq!(h.leftover(), 0);
+    }
+
+    #[test]
+    fn test_read_rejects_vl_special_like_c() {
+        let h = ChunkHeader {
+            version: BLOSC2_VERSION_FORMAT_VL_BLOCKS,
+            versionlz: 1,
+            flags: BLOSC_DOSHUFFLE | BLOSC_DOBITSHUFFLE,
+            typesize: 1,
+            nbytes: 1,
+            blocksize: 1,
+            cbytes: BLOSC_EXTENDED_HEADER_LENGTH as i32,
+            blosc2_flags2: BLOSC2_VL_BLOCKS,
+            blosc2_flags: BLOSC2_SPECIAL_ZERO << 4,
+            ..Default::default()
+        };
+
+        let mut buf = [0u8; BLOSC_EXTENDED_HEADER_LENGTH];
+        h.try_write(&mut buf).unwrap();
+
+        assert!(ChunkHeader::read(&buf).is_err());
+    }
+
+    #[test]
+    fn test_read_rejects_zero_nbytes_repeat_value_like_c() {
+        let h = ChunkHeader {
+            version: BLOSC2_VERSION_FORMAT_STABLE,
+            versionlz: 1,
+            flags: BLOSC_DOSHUFFLE | BLOSC_DOBITSHUFFLE,
+            typesize: 1,
+            nbytes: 0,
+            blocksize: 1,
+            cbytes: BLOSC_EXTENDED_HEADER_LENGTH as i32 + 1,
+            blosc2_flags: BLOSC2_SPECIAL_VALUE << 4,
+            ..Default::default()
+        };
+
+        let mut buf = [0u8; BLOSC_EXTENDED_HEADER_LENGTH];
+        h.try_write(&mut buf).unwrap();
+
+        assert!(ChunkHeader::read(&buf).is_err());
+    }
+
+    #[test]
+    fn test_read_rejects_future_version_unknown_flags2_like_c() {
+        let h = ChunkHeader {
+            version: BLOSC2_VERSION_FORMAT + 1,
+            versionlz: 1,
+            flags: BLOSC_DOSHUFFLE | BLOSC_DOBITSHUFFLE,
+            typesize: 1,
+            nbytes: 1,
+            blocksize: 1,
+            cbytes: BLOSC_EXTENDED_HEADER_LENGTH as i32,
+            blosc2_flags2: BLOSC2_VL_BLOCKS | 0x80,
+            ..Default::default()
+        };
+
+        let mut buf = [0u8; BLOSC_EXTENDED_HEADER_LENGTH];
+        h.try_write(&mut buf).unwrap();
+
+        assert!(ChunkHeader::read(&buf).is_err());
     }
 }

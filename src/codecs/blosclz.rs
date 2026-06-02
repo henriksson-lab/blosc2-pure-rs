@@ -1028,6 +1028,12 @@ pub fn decompress(input: &[u8], output: &mut [u8]) -> i32 {
                 return 0;
             }
 
+            if ip >= ip_limit {
+                break;
+            }
+            ctrl = read(ip) as u32;
+            ip += 1;
+
             let ref_pos = op - distance;
             let match_len = len;
 
@@ -1035,12 +1041,6 @@ pub fn decompress(input: &[u8], output: &mut [u8]) -> i32 {
                 output[op + i] = output[ref_pos + i];
             }
             op += match_len;
-
-            if ip >= ip_limit {
-                break;
-            }
-            ctrl = read(ip) as u32;
-            ip += 1;
         } else {
             // Literal
             ctrl += 1;
@@ -1195,6 +1195,17 @@ mod tests {
                 "malformed BloscLZ block should be rejected: {case:02x?}"
             );
         }
+    }
+
+    #[test]
+    fn decompress_terminal_match_token_matches_c_break_before_copy() {
+        let input = [0x00, b'a', 0xe0, 0x00, 0x00];
+        let mut output = [0u8; 16];
+
+        let written = decompress(&input, &mut output);
+
+        assert_eq!(written, 1);
+        assert_eq!(output[0], b'a');
     }
 
     #[test]

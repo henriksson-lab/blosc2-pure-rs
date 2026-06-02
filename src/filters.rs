@@ -683,14 +683,14 @@ fn bytedelta_typesize(meta: u8) -> Option<usize> {
 
 fn bytedelta_context_typesize(ctx: &FilterCallbackContext<'_>) -> Option<usize> {
     if ctx.meta == 0 {
-        (ctx.chunk.schunk != 0).then_some(ctx.typesize)
+        (ctx.chunk.schunk != 0 && ctx.typesize != 0).then_some(ctx.typesize)
     } else {
         bytedelta_typesize(ctx.meta)
     }
 }
 
 fn bytedelta_forward_core(typesize: usize, src: &[u8], dest: &mut [u8]) -> i32 {
-    if dest.len() < src.len() {
+    if dest.len() < src.len() || !(1..=BLOSC2_MAXTYPESIZE).contains(&typesize) {
         return 1;
     }
 
@@ -708,7 +708,7 @@ fn bytedelta_forward_core(typesize: usize, src: &[u8], dest: &mut [u8]) -> i32 {
 }
 
 fn bytedelta_backward_core(typesize: usize, src: &[u8], dest: &mut [u8]) -> i32 {
-    if dest.len() < src.len() {
+    if dest.len() < src.len() || !(1..=BLOSC2_MAXTYPESIZE).contains(&typesize) {
         return 1;
     }
 
@@ -744,12 +744,11 @@ fn bytedelta_backward_impl(
 }
 
 fn bytedelta_buggy_forward_core(typesize: usize, src: &[u8], dest: &mut [u8]) -> i32 {
-    if dest.len() < src.len() {
+    if dest.len() < src.len() || !(1..=BLOSC2_MAXTYPESIZE).contains(&typesize) {
         return 1;
     }
 
     let stream_len = src.len() / typesize;
-    let main_len = stream_len * typesize;
     for channel in 0..typesize {
         let base = channel * stream_len;
         let vectorizable_len = stream_len - (stream_len % 16);
@@ -767,17 +766,15 @@ fn bytedelta_buggy_forward_core(typesize: usize, src: &[u8], dest: &mut [u8]) ->
             previous = value;
         }
     }
-    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
     0
 }
 
 fn bytedelta_buggy_backward_core(typesize: usize, src: &[u8], dest: &mut [u8]) -> i32 {
-    if dest.len() < src.len() {
+    if dest.len() < src.len() || !(1..=BLOSC2_MAXTYPESIZE).contains(&typesize) {
         return 1;
     }
 
     let stream_len = src.len() / typesize;
-    let main_len = stream_len * typesize;
     for channel in 0..typesize {
         let base = channel * stream_len;
         let vectorizable_len = stream_len - (stream_len % 16);
@@ -795,7 +792,6 @@ fn bytedelta_buggy_backward_core(typesize: usize, src: &[u8], dest: &mut [u8]) -
             previous = value;
         }
     }
-    dest[main_len..src.len()].copy_from_slice(&src[main_len..]);
     0
 }
 
@@ -821,13 +817,7 @@ fn bytedelta_buggy_backward_impl(
     bytedelta_buggy_backward_core(typesize, src, dest)
 }
 
-fn int_trunc_forward_impl(
-    meta: u8,
-    typesize: usize,
-    _block_offset: usize,
-    src: &[u8],
-    dest: &mut [u8],
-) -> i32 {
+fn int_trunc_forward_core(meta: u8, typesize: usize, src: &[u8], dest: &mut [u8]) -> i32 {
     if dest.len() < src.len() || !matches!(typesize, 1 | 2 | 4 | 8) {
         return 1;
     }
@@ -883,10 +873,20 @@ fn int_trunc_forward_impl(
     0
 }
 
-fn int_trunc_backward_impl(
-    _meta: u8,
-    _typesize: usize,
-    _block_offset: usize,
+fn int_trunc_context_forward_impl(
+    ctx: &mut FilterCallbackContext<'_>,
+    src: &[u8],
+    dest: &mut [u8],
+) -> i32 {
+    let typesize = ctx
+        .cparams
+        .and_then(|cparams| usize::try_from(cparams.typesize).ok())
+        .unwrap_or(ctx.typesize);
+    int_trunc_forward_core(ctx.meta, typesize, src, dest)
+}
+
+fn int_trunc_context_backward_impl(
+    _ctx: &mut FilterCallbackContext<'_>,
     src: &[u8],
     dest: &mut [u8],
 ) -> i32 {
@@ -936,12 +936,12 @@ fn ensure_known_global_filters_registered() {
                     bytedelta_forward_impl,
                     bytedelta_backward_impl,
                 ),
-                BLOSC_FILTER_INT_TRUNC => register_global_fallible_filter_with_metadata(
+                BLOSC_FILTER_INT_TRUNC => register_global_context_filter_with_metadata(
                     filter.filter_id,
                     filter.name,
                     filter.version,
-                    int_trunc_forward_impl,
-                    int_trunc_backward_impl,
+                    int_trunc_context_forward_impl,
+                    int_trunc_context_backward_impl,
                 ),
                 _ => register_global_fallible_filter_with_metadata(
                     filter.filter_id,
@@ -1074,13 +1074,7 @@ fn register_blosc2_filter_impl(filter: &Blosc2Filter) -> Result<(), &'static str
         .write()
         .map_err(|_| "Filter registry poisoned")?;
     if let Some(existing) = filters.get(&filter.id) {
-        let registered = UserFilter {
-            name: Some(filter.name),
-            version: Some(filter.version),
-            forward: UserFilterForward::Fallible(filter.forward),
-            backward: UserFilterBackward::Fallible(filter.backward),
-        };
-        return if existing.same_callbacks(registered) {
+        return if existing.name == Some(filter.name) {
             Ok(())
         } else {
             Err("User-defined filter ID already registered")
@@ -2832,7 +2826,6 @@ pub fn delta_encode(
     if offset == 0 {
         // Reference block: delta against previous elements in dref.
         if main_len == 0 {
-            dest[..nbytes].copy_from_slice(&src[..nbytes]);
             return;
         }
         let head = effective_typesize;
@@ -2856,9 +2849,11 @@ pub fn delta_encode(
 
 /// Reverse the delta filter in place over `dest`.
 ///
-/// For `offset == 0` (the reference block), decoding is self-referential:
-/// each element XORs against the previous element in `dest`. For later
-/// blocks, each element XORs against the corresponding entry in `dref`.
+/// For `offset == 0` (the reference block), each element XORs against the
+/// previous element in `dref`, matching C's `delta_decoder`. Passing `None`
+/// uses `dest` as that reference, which is the in-place reference-block path.
+/// For later blocks, each element XORs against the corresponding entry in
+/// `dref`.
 pub fn delta_decode(
     dref: Option<&[u8]>,
     offset: usize,
@@ -2881,9 +2876,19 @@ pub fn delta_decode(
     };
 
     if offset == 0 {
-        // Reference block: self-referential decode (dest[i] ^= dest[i-typesize])
-        for i in effective_typesize..main_len {
-            dest[i] ^= dest[i - effective_typesize];
+        // Reference block: C uses the dref pointer. In the normal in-place
+        // path dref aliases dest, so keep that behavior when no dref is passed.
+        if let Some(dref) = dref {
+            if dref.len() < main_len {
+                return;
+            }
+            for i in effective_typesize..main_len {
+                dest[i] ^= dref[i - effective_typesize];
+            }
+        } else {
+            for i in effective_typesize..main_len {
+                dest[i] ^= dest[i - effective_typesize];
+            }
         }
     } else if let Some(dref) = dref {
         // Non-reference block: undo delta against dref
@@ -2974,8 +2979,9 @@ pub fn pipeline_forward_with_context(
         user_data: 0,
     });
 
-    // Track current data location: 0 = src (read-only), 1 = buf1, 2 = buf2
-    // Start from src without copying — first filter reads src directly.
+    // Track current data location: 0 = src (read-only), 1 = buf1, 2 = buf2.
+    // Match C's pipeline_forward: first active filter writes to dest (buf1),
+    // then the destination cycles through the temporary buffer.
     let mut current = 0u8;
 
     for i in 0..BLOSC2_MAX_FILTERS {
@@ -2986,8 +2992,8 @@ pub fn pipeline_forward_with_context(
 
         // Determine input and output buffers.
         // Input: src (0), buf1 (1), or buf2 (2)
-        // Output: alternates between buf1 and buf2
-        let out_buf = if current == 2 { 1u8 } else { 2u8 };
+        // Output: first active filter writes buf1, then alternates.
+        let out_buf = if current == 1 { 2u8 } else { 1u8 };
 
         let (inp, out) = match (current, out_buf) {
             (0, 1) => (&src[..bsize], &mut buf1[..bsize]),
@@ -3013,7 +3019,7 @@ pub fn pipeline_forward_with_context(
             }
             BLOSC_DELTA => {
                 let actual_dref = if block_offset == 0 {
-                    inp
+                    src
                 } else {
                     dref.unwrap_or(src)
                 };
@@ -3024,7 +3030,6 @@ pub fn pipeline_forward_with_context(
                 // "drop this many mantissa bits" semantics.
                 let prec = filters_meta[i] as i8;
                 if !trunc_prec_forward(inp, out, typesize, prec) {
-                    out.copy_from_slice(inp);
                     return 0;
                 }
             }
@@ -3057,7 +3062,6 @@ pub fn pipeline_forward_with_context(
                         return 0;
                     }
                 } else {
-                    out.copy_from_slice(inp);
                     return 0;
                 }
             }
@@ -3184,8 +3188,9 @@ pub fn pipeline_backward_with_context(
                 delta_decode(dref, block_offset, bsize, typesize, out);
             }
             BLOSC_TRUNC_PREC => {
-                // Truncation is lossy — backward is a no-op (data already truncated)
-                out.copy_from_slice(inp);
+                // Truncation is lossy. C leaves the current buffer untouched
+                // and does not cycle buffers on the backward path.
+                continue;
             }
             _ => {
                 if let Some(user_filter) = registered_filter(filter) {
@@ -3216,7 +3221,6 @@ pub fn pipeline_backward_with_context(
                         return 0;
                     }
                 } else {
-                    out.copy_from_slice(inp);
                     return 0;
                 }
             }
@@ -3477,7 +3481,7 @@ mod tests {
         };
         assert_eq!(
             blosc2_register_filter(&same_name_different_callbacks),
-            BLOSC2_ERROR_FAILURE
+            BLOSC2_ERROR_SUCCESS
         );
         let same_id_different_name = Blosc2Filter {
             name: "other-copy",
@@ -3769,6 +3773,35 @@ mod tests {
     }
 
     #[test]
+    fn test_bytedelta_cores_reject_zero_typesize_and_leave_partial_tails_unwritten() {
+        let src: Vec<u8> = (0..23).map(|idx| (idx * 11 + 5) as u8).collect();
+
+        for forward in [
+            bytedelta_forward_core as fn(usize, &[u8], &mut [u8]) -> i32,
+            bytedelta_buggy_forward_core,
+        ] {
+            let mut dest = vec![0xA5; src.len()];
+            assert_eq!(forward(0, &src, &mut dest), 1);
+            assert_eq!(dest, vec![0xA5; src.len()]);
+
+            assert_eq!(forward(5, &src, &mut dest), 0);
+            assert_eq!(&dest[20..], &[0xA5, 0xA5, 0xA5]);
+        }
+
+        for backward in [
+            bytedelta_backward_core as fn(usize, &[u8], &mut [u8]) -> i32,
+            bytedelta_buggy_backward_core,
+        ] {
+            let mut dest = vec![0x5A; src.len()];
+            assert_eq!(backward(0, &src, &mut dest), 1);
+            assert_eq!(dest, vec![0x5A; src.len()]);
+
+            assert_eq!(backward(5, &src, &mut dest), 0);
+            assert_eq!(&dest[20..], &[0x5A, 0x5A, 0x5A]);
+        }
+    }
+
+    #[test]
     fn test_int_trunc_global_filter_truncates_integer_precision() {
         let values = [0x1234_5678u32, 0xFFFF_FFFF, 0x0000_0001, 0x8765_4321];
         let src: Vec<u8> = values.into_iter().flat_map(u32::to_ne_bytes).collect();
@@ -3829,7 +3862,7 @@ mod tests {
         );
         assert_ne!(current, 0);
         let encoded = if current == 1 { encoded } else { scratch };
-        assert_eq!(&encoded[src.len()..], &[0x5A, 0x5A]);
+        assert_eq!(&encoded[src.len()..], &[0xA5, 0xA5]);
 
         let mut decoded = encoded.clone();
         let mut scratch = vec![0x5Au8; src_with_tail.len()];
@@ -3848,7 +3881,64 @@ mod tests {
         assert_ne!(current, 0);
         let decoded = if current == 1 { decoded } else { scratch };
         assert_eq!(&decoded[..src.len()], &expected);
-        assert_eq!(&decoded[src.len()..], &[0x5A, 0x5A]);
+        assert_eq!(&decoded[src.len()..], &[0xA5, 0xA5]);
+    }
+
+    #[test]
+    fn test_int_trunc_context_uses_cparams_typesize() {
+        let values = [0x1234_5678u32, 0x8765_4321];
+        let src: Vec<u8> = values.into_iter().flat_map(u32::to_ne_bytes).collect();
+        let filters = [0, 0, 0, 0, 0, BLOSC_FILTER_INT_TRUNC];
+        let mut filters_meta = [0; BLOSC2_MAX_FILTERS];
+        filters_meta[BLOSC2_MAX_FILTERS - 1] = 20;
+        let cparams = FilterCParamsContext {
+            compcode: 0,
+            compcode_meta: 0,
+            clevel: 0,
+            typesize: 4,
+            blocksize: src.len() as i32,
+            splitmode: 0,
+            filters,
+            filters_meta,
+            nthreads: 1,
+            nchunk: -1,
+            user_data: 0,
+        };
+        let context = FilterPipelineContext {
+            cparams: Some(&cparams),
+            dparams: None,
+            chunk: FilterChunkContext {
+                schunk: 0,
+                nchunk: -1,
+                nblock: 0,
+                block_offset: 0,
+                blocksize: src.len(),
+                bsize: src.len(),
+            },
+            b2nd_metalayer: None,
+            user_data: 0,
+        };
+        let mut encoded = vec![0u8; src.len()];
+        let mut scratch = vec![0u8; src.len()];
+
+        let current = pipeline_forward_with_context(
+            &src,
+            &mut encoded,
+            &mut scratch,
+            &filters,
+            &filters_meta,
+            2,
+            0,
+            None,
+            Some(context),
+        );
+        assert_ne!(current, 0);
+        let encoded = if current == 1 { encoded } else { scratch };
+        let expected: Vec<u8> = [0x1234_5000u32, 0x8765_4000]
+            .into_iter()
+            .flat_map(u32::to_ne_bytes)
+            .collect();
+        assert_eq!(encoded, expected);
     }
 
     #[test]
@@ -3999,7 +4089,7 @@ mod tests {
 
         filters[BLOSC2_MAX_FILTERS - 1] = FILTER_ID;
         let current = pipeline_forward(&src, &mut buf1, &mut buf2, &filters, &meta, 1, 0, None);
-        assert_eq!(if current == 1 { buf1 } else { buf2 }, [0x5Au8; 4]);
+        assert_eq!(if current == 1 { buf1 } else { buf2 }, [0xA5u8; 4]);
 
         buf1 = [0xA5; 4];
         buf2 = [0x5A; 4];
@@ -4305,7 +4395,8 @@ mod tests {
     #[test]
     fn test_delta_reference_block() {
         // For offset=0, dref should equal the source data (no prior filters).
-        // The encoder uses dref for XOR reference, decoder is self-referential.
+        // The encoder uses dref for XOR reference, and C's decoder uses the
+        // dref pointer it was passed.
         let src: Vec<u8> = (0..16).map(|i| i * 3 + 7).collect();
         let mut encoded = vec![0u8; 16];
         let mut decoded = vec![0u8; 16];
@@ -4313,8 +4404,40 @@ mod tests {
         // Reference block (offset == 0) — dref == src
         delta_encode(&src, 0, 16, 1, &src, &mut encoded);
         decoded.copy_from_slice(&encoded);
-        delta_decode(None, 0, 16, 1, &mut decoded); // self-referential at offset=0
+        delta_decode(Some(&src), 0, 16, 1, &mut decoded);
         assert_eq!(src, decoded);
+
+        decoded.copy_from_slice(&encoded);
+        delta_decode(None, 0, 16, 1, &mut decoded);
+        assert_eq!(src, decoded);
+    }
+
+    #[test]
+    fn test_pipeline_delta_reference_block_uses_raw_src_after_prefix_filters() {
+        let src: Vec<u8> = (0..16).map(|i| i * 5 + 11).collect();
+        let mut buf1 = vec![0u8; src.len()];
+        let mut buf2 = vec![0u8; src.len()];
+        let filters = [BLOSC_SHUFFLE, BLOSC_DELTA, 0, 0, 0, 0];
+        let filters_meta = [0u8; BLOSC2_MAX_FILTERS];
+
+        let current = pipeline_forward(
+            &src,
+            &mut buf1,
+            &mut buf2,
+            &filters,
+            &filters_meta,
+            4,
+            0,
+            None,
+        );
+        assert_ne!(current, 0);
+        let encoded = if current == 1 { &buf1 } else { &buf2 };
+
+        let mut shuffled = vec![0u8; src.len()];
+        let mut expected = vec![0u8; src.len()];
+        shuffle(4, &src, &mut shuffled);
+        delta_encode(&src, 0, src.len(), 4, &shuffled, &mut expected);
+        assert_eq!(encoded, &expected);
     }
 
     // C's delta_{encoder,decoder} (c-blosc2/blosc/delta.c) falls back to typesize=1
@@ -4345,7 +4468,7 @@ mod tests {
 
         // Symmetric check for decode.
         let mut dest = encoded.clone();
-        delta_decode(None, 0, 12, 3, &mut dest);
+        delta_decode(Some(&src), 0, 12, 3, &mut dest);
         assert_eq!(dest, src, "decode must roundtrip after C-compatible encode");
     }
 
@@ -4369,7 +4492,7 @@ mod tests {
         );
 
         let mut dest = encoded.clone();
-        delta_decode(None, 0, 32, 16, &mut dest);
+        delta_decode(Some(&src), 0, 32, 16, &mut dest);
         assert_eq!(dest, src);
     }
 
@@ -4432,6 +4555,25 @@ mod tests {
                 &ref_encoded[main_len..],
                 vec![0xA5; nbytes - main_len].as_slice(),
                 "reference-block delta must leave partial tail bytes unwritten for typesize={typesize}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_delta_reference_block_smaller_than_one_fixed_width_element_is_unwritten() {
+        for typesize in [2usize, 4, 8] {
+            let nbytes = typesize - 1;
+            let src: Vec<u8> = (0..nbytes)
+                .map(|i: usize| (i.wrapping_mul(17).wrapping_add(3)) as u8)
+                .collect();
+            let mut encoded = vec![0xA5; nbytes];
+
+            delta_encode(&src, 0, nbytes, typesize, &src, &mut encoded);
+
+            assert_eq!(
+                encoded,
+                vec![0xA5; nbytes],
+                "C delta_encoder leaves sub-element reference blocks untouched for typesize={typesize}"
             );
         }
     }
@@ -4521,8 +4663,8 @@ mod tests {
     #[test]
     fn test_pipeline_rejects_unknown_filters() {
         let src: Vec<u8> = (0..16).collect();
-        let mut buf1 = vec![0u8; 16];
-        let mut buf2 = vec![0u8; 16];
+        let mut buf1 = vec![0xA5; 16];
+        let mut buf2 = vec![0x5A; 16];
         let filters = [BLOSC2_USER_DEFINED_FILTERS_START - 1, 0, 0, 0, 0, 0];
         let filters_meta = [0; BLOSC2_MAX_FILTERS];
 
@@ -4539,8 +4681,11 @@ mod tests {
             ),
             0
         );
+        assert_eq!(buf1, vec![0xA5; 16]);
+        assert_eq!(buf2, vec![0x5A; 16]);
 
         buf1.copy_from_slice(&src);
+        buf2.fill(0x5A);
         assert_eq!(
             pipeline_backward(
                 &mut buf1,
@@ -4556,6 +4701,8 @@ mod tests {
             ),
             0
         );
+        assert_eq!(buf1, src);
+        assert_eq!(buf2, vec![0x5A; 16]);
     }
 
     #[test]
@@ -4579,8 +4726,12 @@ mod tests {
             ),
             0
         );
+        assert_eq!(buf1, vec![0u8; 16]);
+        assert_eq!(buf2, vec![0u8; 16]);
 
         let filters_meta = [0; BLOSC2_MAX_FILTERS];
+        buf1.fill(0xA5);
+        buf2.fill(0x5A);
         assert_eq!(
             pipeline_forward(
                 &src,
@@ -4594,6 +4745,53 @@ mod tests {
             ),
             0
         );
+        assert_eq!(buf1, vec![0xA5; 16]);
+        assert_eq!(buf2, vec![0x5A; 16]);
+    }
+
+    #[test]
+    fn test_pipeline_backward_trunc_prec_does_not_cycle_buffers() {
+        let src: Vec<u8> = [1.3333333f32, -7.25, 1024.5, 0.03125]
+            .into_iter()
+            .flat_map(f32::to_ne_bytes)
+            .collect();
+        let filters = [BLOSC_TRUNC_PREC, 0, 0, 0, 0, 0];
+        let filters_meta = [10; BLOSC2_MAX_FILTERS];
+        let mut buf1 = vec![0u8; src.len()];
+        let mut buf2 = vec![0u8; src.len()];
+
+        let current = pipeline_forward(
+            &src,
+            &mut buf1,
+            &mut buf2,
+            &filters,
+            &filters_meta,
+            4,
+            0,
+            None,
+        );
+        assert_eq!(current, 1);
+
+        let mut expected = vec![0u8; src.len()];
+        assert!(trunc_prec_forward(&src, &mut expected, 4, 10));
+        assert_eq!(buf1, expected);
+
+        let before_other_buffer = buf2.clone();
+        let current = pipeline_backward(
+            &mut buf1,
+            &mut buf2,
+            src.len(),
+            &filters,
+            &filters_meta,
+            BLOSC2_VERSION_FORMAT,
+            4,
+            0,
+            None,
+            current,
+        );
+        assert_eq!(current, 1);
+        assert_eq!(buf1, expected);
+        assert_eq!(buf2, before_other_buffer);
     }
 
     #[test]

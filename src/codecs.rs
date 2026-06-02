@@ -616,9 +616,10 @@ fn register_context_codec_impl(
 /// Returns `true` if `compcode` corresponds to a user-defined codec
 /// currently present in the registry.
 pub fn is_registered_codec(compcode: u8) -> bool {
-    user_codecs()
-        .read()
-        .is_ok_and(|codecs| codecs.contains_key(&compcode))
+    is_known_global_codec(compcode)
+        || user_codecs()
+            .read()
+            .is_ok_and(|codecs| codecs.contains_key(&compcode))
 }
 
 /// Return the registered codec name for a plugin/user-defined codec.
@@ -741,11 +742,12 @@ pub fn compress_block_with_context(
         BLOSC_ZLIB => zlib_compress(src, dest, clevel),
         BLOSC_ZSTD => zstd_compress(src, dest, clevel),
         BLOSC_CODEC_NDLZ => ndlz_compress(meta, src, dest, context.as_ref()),
-        _ => user_codecs()
+        _ => match user_codecs()
             .read()
             .ok()
             .and_then(|codecs| codecs.get(&compcode).copied())
-            .map_or(0, |codec| {
+        {
+            Some(codec) => {
                 let mut callback_context = context.unwrap_or(CodecCallbackContext {
                     compcode,
                     complib: codec.complib,
@@ -772,7 +774,9 @@ pub fn compress_block_with_context(
                 codec
                     .compress
                     .run(&mut callback_context, clevel, meta, src, dest)
-            }),
+            }
+            None => BLOSC2_ERROR_CODEC_SUPPORT,
+        },
     }
 }
 
@@ -825,11 +829,12 @@ pub fn decompress_block_with_context(
         BLOSC_ZLIB => zlib_decompress(src, dest),
         BLOSC_ZSTD => zstd_decompress(src, dest),
         BLOSC_CODEC_NDLZ => ndlz_decompress(meta, src, dest),
-        _ => user_codecs()
+        _ => match user_codecs()
             .read()
             .ok()
             .and_then(|codecs| codecs.get(&compcode).copied())
-            .map_or(-1, |codec| {
+        {
+            Some(codec) => {
                 let mut callback_context = context.unwrap_or(CodecCallbackContext {
                     compcode,
                     complib: codec.complib,
@@ -853,7 +858,9 @@ pub fn decompress_block_with_context(
                 callback_context.meta = meta;
                 dest.fill(0);
                 codec.decompress.run(&mut callback_context, meta, src, dest)
-            }),
+            }
+            None => BLOSC2_ERROR_CODEC_SUPPORT,
+        },
     }
 }
 
@@ -872,8 +879,7 @@ pub fn decompress_block_with_dict(compcode: u8, src: &[u8], dest: &mut [u8], dic
 fn lz4_compress(clevel: u8, src: &[u8], dest: &mut [u8]) -> i32 {
     use lz4_pure::block::CompressionMode;
 
-    let _ = clevel;
-    let accel = lz4_acceleration();
+    let accel = lz4_acceleration(clevel);
     match lz4_pure::block::compress_to_buffer(src, Some(CompressionMode::FAST(accel)), false, dest)
     {
         Ok(n) => n as i32,
@@ -881,7 +887,10 @@ fn lz4_compress(clevel: u8, src: &[u8], dest: &mut [u8]) -> i32 {
     }
 }
 
-fn lz4_acceleration() -> i32 {
+fn lz4_acceleration(clevel: u8) -> i32 {
+    let _ = clevel;
+    // c-blosc2 computes 10 - clevel in get_accel(), but the non-IPP LZ4
+    // wrapper overrides that value to 1 before calling LZ4_compress_fast.
     1
 }
 
@@ -930,8 +939,7 @@ fn lz4_compress_with_dict(clevel: u8, src: &[u8], dest: &mut [u8], dict: &[u8]) 
     let Some(dict_len) = len_as_c_int(dict.len()) else {
         return 0;
     };
-    let _ = clevel;
-    let accel = lz4_acceleration();
+    let accel = lz4_acceleration(clevel);
 
     unsafe {
         let stream = LZ4_createStream();
@@ -1241,6 +1249,9 @@ pub fn ndlz_compress_block_2d(meta: u8, blockshape: [i32; 2], src: &[u8], dest: 
     if src.len() != expected_len {
         return -1;
     }
+    if dest.len() < 1 + 2 * std::mem::size_of::<i32>() {
+        return -1;
+    }
     if expected_len < cell_shape * cell_shape {
         return 0;
     }
@@ -1292,6 +1303,9 @@ pub fn ndlz_compress_block_2d(meta: u8, blockshape: [i32; 2], src: &[u8], dest: 
                 dest[op] = 0x40;
                 dest[op + 1] = cell[0];
                 op += 2;
+                if op > src.len() {
+                    return 0;
+                }
                 continue;
             }
 
@@ -1307,6 +1321,9 @@ pub fn ndlz_compress_block_2d(meta: u8, blockshape: [i32; 2], src: &[u8], dest: 
                         dest[op] = 0xc0;
                         dest[op + 1..op + 3].copy_from_slice(&(offset as u16).to_le_bytes());
                         op += 3;
+                        if op > src.len() {
+                            return 0;
+                        }
                         continue;
                     }
                 }
@@ -1338,6 +1355,9 @@ pub fn ndlz_compress_block_2d(meta: u8, blockshape: [i32; 2], src: &[u8], dest: 
                                         op += cell_shape;
                                     }
                                 }
+                                if op > src.len() {
+                                    return 0;
+                                }
                                 continue 'cell_cols;
                             }
                         }
@@ -1366,11 +1386,56 @@ pub fn ndlz_compress_block_2d(meta: u8, blockshape: [i32; 2], src: &[u8], dest: 
                                         op += cell_shape;
                                     }
                                 }
+                                if op > src.len() {
+                                    return 0;
+                                }
                                 continue 'cell_cols;
                             }
                         }
                     }
                 } else {
+                    for j in 1..cell_shape {
+                        let first_key = ndlz_rows_key(&cell, cell_shape, [0, j]);
+                        let Some(&first_ref_start) = row_pair_matches.get(&first_key) else {
+                            continue;
+                        };
+                        let Some(first_offset) = token_pos.checked_sub(first_ref_start) else {
+                            return -1;
+                        };
+                        if first_offset == 0 || first_offset >= u16::MAX as usize {
+                            continue;
+                        }
+
+                        let mut remaining = (1..cell_shape).filter(|&row| row != j);
+                        let Some(l) = remaining.next() else {
+                            return -1;
+                        };
+                        let Some(m) = remaining.next() else {
+                            return -1;
+                        };
+                        let second_key = ndlz_rows_key(&cell, cell_shape, [l, m]);
+                        let Some(&second_ref_start) = row_pair_matches.get(&second_key) else {
+                            continue;
+                        };
+                        let Some(second_offset) = token_pos.checked_sub(second_ref_start) else {
+                            return -1;
+                        };
+                        if second_offset == 0 || second_offset >= u16::MAX as usize {
+                            continue;
+                        }
+                        if op + 5 > dest.len() {
+                            return 0;
+                        }
+                        dest[op] = (1 << 5) | ((j as u8) << 3);
+                        dest[op + 1..op + 3].copy_from_slice(&(first_offset as u16).to_le_bytes());
+                        dest[op + 3..op + 5].copy_from_slice(&(second_offset as u16).to_le_bytes());
+                        op += 5;
+                        if op > src.len() {
+                            return 0;
+                        }
+                        continue 'cell_cols;
+                    }
+
                     for rows in [[0usize, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]] {
                         let key = ndlz_rows_key(&cell, cell_shape, rows);
                         if let Some(&ref_start) = row_triple_matches.get(&key) {
@@ -1399,6 +1464,9 @@ pub fn ndlz_compress_block_2d(meta: u8, blockshape: [i32; 2], src: &[u8], dest: 
                                         op += cell_shape;
                                         break;
                                     }
+                                }
+                                if op > src.len() {
+                                    return 0;
                                 }
                                 continue 'cell_cols;
                             }
@@ -1431,6 +1499,9 @@ pub fn ndlz_compress_block_2d(meta: u8, blockshape: [i32; 2], src: &[u8], dest: 
                                         op += cell_shape;
                                     }
                                 }
+                                if op > src.len() {
+                                    return 0;
+                                }
                                 continue 'cell_cols;
                             }
                         }
@@ -1460,6 +1531,10 @@ pub fn ndlz_compress_block_2d(meta: u8, blockshape: [i32; 2], src: &[u8], dest: 
                 );
                 full_cell_matches.insert(cell, literal_start);
             }
+
+            if op > src.len() {
+                return 0;
+            }
         }
     }
 
@@ -1485,6 +1560,9 @@ fn ndlz_copy_rows_from_stream(
 }
 
 fn ndlz_decompress_cell(cell_shape: usize, src: &[u8], dest: &mut [u8]) -> i32 {
+    if src.len() < 8 {
+        return 0;
+    }
     if src.len() < 9 || src[0] != 2 {
         return -1;
     }
@@ -1759,11 +1837,27 @@ mod tests {
 
     #[test]
     fn lz4_acceleration_matches_current_c_blosc2_fast_mode() {
-        assert_eq!(lz4_acceleration(), 1);
+        // c-blosc2/blosc/blosc2.c lz4_wrap_compress overrides get_accel's
+        // 10 - clevel value to 1 in the non-IPP implementation.
+        let expected = [
+            (0, 1),
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 1),
+            (5, 1),
+            (6, 1),
+            (7, 1),
+            (8, 1),
+            (9, 1),
+        ];
+        for (clevel, accel) in expected {
+            assert_eq!(lz4_acceleration(clevel), accel);
+        }
     }
 
     #[test]
-    fn lz4_fast_paths_ignore_clevel_for_acceleration() {
+    fn lz4_fast_paths_roundtrip_with_clevel_acceleration() {
         let data = b"abcdefghijklmnopabcdefghZZZZabcdefghijklmnopabcdefghijklmnop";
         let dict = b"abcdefghijklmnop0123456789abcdefghijklmnop0123456789";
 
@@ -1772,16 +1866,155 @@ mod tests {
         let low_size = lz4_compress(1, data, &mut low);
         let high_size = lz4_compress(9, data, &mut high);
         assert!(low_size > 0);
-        assert_eq!(low_size, high_size);
-        assert_eq!(&low[..low_size as usize], &high[..high_size as usize]);
+        assert!(high_size > 0);
+        let mut restored = vec![0; data.len()];
+        assert_eq!(
+            lz4_decompress(&low[..low_size as usize], &mut restored),
+            data.len() as i32
+        );
+        assert_eq!(restored, data);
+        restored.fill(0);
+        assert_eq!(
+            lz4_decompress(&high[..high_size as usize], &mut restored),
+            data.len() as i32
+        );
+        assert_eq!(restored, data);
 
         low.fill(0);
         high.fill(0);
         let low_size = lz4_compress_with_dict(1, data, &mut low, dict);
         let high_size = lz4_compress_with_dict(9, data, &mut high, dict);
         assert!(low_size > 0);
-        assert_eq!(low_size, high_size);
-        assert_eq!(&low[..low_size as usize], &high[..high_size as usize]);
+        assert!(high_size > 0);
+        restored.fill(0);
+        assert_eq!(
+            lz4_decompress_with_dict(&low[..low_size as usize], &mut restored, dict),
+            data.len() as i32
+        );
+        assert_eq!(restored, data);
+        restored.fill(0);
+        assert_eq!(
+            lz4_decompress_with_dict(&high[..high_size as usize], &mut restored, dict),
+            data.len() as i32
+        );
+        assert_eq!(restored, data);
+    }
+
+    #[test]
+    fn known_global_codec_metadata_matches_c_registry() {
+        for (code, name) in [
+            (BLOSC_CODEC_NDLZ, "ndlz"),
+            (BLOSC_CODEC_ZFP_FIXED_ACCURACY, "zfp_acc"),
+            (BLOSC_CODEC_ZFP_FIXED_PRECISION, "zfp_prec"),
+            (BLOSC_CODEC_ZFP_FIXED_RATE, "zfp_rate"),
+            (BLOSC_CODEC_OPENHTJ2K, "openhtj2k"),
+            (BLOSC_CODEC_GROK, "grok"),
+            (BLOSC_CODEC_OPENZL, "openzl"),
+        ] {
+            assert!(is_known_global_codec(code));
+            assert!(is_registered_codec(code));
+            assert_eq!(registered_codec_name(code), Some(name));
+            assert_eq!(registered_codec_code(name), Some(code));
+            assert_eq!(registered_codec_version(code), Some(1));
+            assert_eq!(registered_codec_name_by_complib(code), Some(name));
+            assert_eq!(
+                registered_codec_complib_info(name),
+                Some((code, name, "unknown"))
+            );
+        }
+    }
+
+    #[test]
+    fn unimplemented_or_missing_plugin_codecs_return_c_support_error() {
+        let mut compressed = vec![0u8; 128];
+        let mut decompressed = vec![0u8; 128];
+
+        assert_eq!(
+            compress_block(
+                BLOSC_CODEC_ZFP_FIXED_ACCURACY,
+                5,
+                b"payload",
+                &mut compressed
+            ),
+            BLOSC2_ERROR_CODEC_SUPPORT
+        );
+        assert_eq!(
+            decompress_block(
+                BLOSC_CODEC_ZFP_FIXED_ACCURACY,
+                b"payload",
+                &mut decompressed
+            ),
+            BLOSC2_ERROR_CODEC_SUPPORT
+        );
+        assert_eq!(
+            compress_block(250, 5, b"payload", &mut compressed),
+            BLOSC2_ERROR_CODEC_SUPPORT
+        );
+        assert_eq!(
+            decompress_block(250, b"payload", &mut decompressed),
+            BLOSC2_ERROR_CODEC_SUPPORT
+        );
+    }
+
+    fn passthrough_codec_compress(_clevel: u8, _meta: u8, src: &[u8], dest: &mut [u8]) -> i32 {
+        if dest.len() < src.len() {
+            return 0;
+        }
+        dest[..src.len()].copy_from_slice(src);
+        src.len() as i32
+    }
+
+    fn passthrough_codec_decompress(_meta: u8, src: &[u8], dest: &mut [u8]) -> i32 {
+        if dest.len() < src.len() {
+            return 0;
+        }
+        dest[..src.len()].copy_from_slice(src);
+        src.len() as i32
+    }
+
+    #[test]
+    fn public_codec_registration_rejects_global_ids_like_c() {
+        let codec = Blosc2Codec {
+            compcode: 39,
+            compname: "public-global-id-rejected",
+            complib: 39,
+            version: 1,
+            encoder: passthrough_codec_compress,
+            decoder: passthrough_codec_decompress,
+        };
+        assert_eq!(blosc2_register_codec(&codec), BLOSC2_ERROR_CODEC_PARAM);
+    }
+
+    #[test]
+    fn internal_global_codec_registration_accepts_global_ids_like_c_private_path() {
+        const CODE: u8 = 40;
+        assert_eq!(
+            register_global_codec_with_metadata(
+                CODE,
+                "private-global-codec",
+                CODE,
+                1,
+                passthrough_codec_compress,
+                passthrough_codec_decompress,
+            ),
+            Ok(())
+        );
+        assert_eq!(registered_codec_name(CODE), Some("private-global-codec"));
+        assert_eq!(
+            registered_codec_complib_info("private-global-codec"),
+            Some((CODE, "private-global-codec", "unknown"))
+        );
+        assert_eq!(
+            register_global_codec_with_metadata(
+                CODE,
+                "private-global-codec",
+                CODE,
+                1,
+                passthrough_codec_compress,
+                passthrough_codec_decompress,
+            ),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1832,29 +2065,31 @@ mod tests {
     }
 
     #[test]
-    fn ndlz_literal_encoder_roundtrips_meta_4_and_8_blocks() {
+    fn ndlz_short_input_returns_c_zero_sentinel() {
+        let mut out = vec![0; 16];
+        assert_eq!(
+            decompress_block_with_meta(BLOSC_CODEC_NDLZ, 4, &[], &mut out),
+            0
+        );
+        assert_eq!(
+            decompress_block_with_meta(BLOSC_CODEC_NDLZ, 8, &[2, 0, 0, 0, 0, 0, 0], &mut out),
+            0
+        );
+        assert_eq!(
+            decompress_block_with_meta(BLOSC_CODEC_NDLZ, 4, &[2, 0, 0, 0, 0, 0, 0, 0], &mut out),
+            -1
+        );
+    }
+
+    #[test]
+    fn ndlz_literal_encoder_returns_c_fallback_for_oversized_blocks() {
         for (meta, blockshape, input) in [
             (4, [4, 4], (1..=16).collect::<Vec<_>>()),
             (8, [8, 8], (20..84).collect::<Vec<_>>()),
         ] {
             let mut encoded = vec![0; input.len() + 32];
             let cbytes = ndlz_compress_block_2d(meta, blockshape, &input, &mut encoded);
-            assert!(cbytes > 0);
-            encoded.truncate(cbytes as usize);
-
-            let mut decoded = vec![0; input.len()];
-            assert_eq!(
-                decompress_block_with_meta(BLOSC_CODEC_NDLZ, meta, &encoded, &mut decoded),
-                input.len() as i32
-            );
-            assert_eq!(decoded, input);
-
-            encoded.push(0xff);
-            assert_eq!(
-                decompress_block_with_meta(BLOSC_CODEC_NDLZ, meta, &encoded, &mut decoded),
-                input.len() as i32
-            );
-            assert_eq!(decoded, input);
+            assert_eq!(cbytes, 0);
         }
     }
 
@@ -1866,11 +2101,26 @@ mod tests {
             ndlz_compress_block_2d(4, [3, 4], &small_input, &mut encoded),
             0
         );
+        let mut no_header_space = vec![0; 8];
+        assert_eq!(
+            ndlz_compress_block_2d(4, [3, 4], &small_input, &mut no_header_space),
+            -1
+        );
 
         let input: Vec<u8> = (1..=16).collect();
+        assert_eq!(
+            ndlz_compress_block_2d(4, [4, 4], &input, &mut no_header_space),
+            -1
+        );
         let mut too_small_output = vec![0; 16];
         assert_eq!(
             ndlz_compress_block_2d(4, [4, 4], &input, &mut too_small_output),
+            0
+        );
+        assert_eq!(ndlz_compress_block_2d(4, [4, 4], &input, &mut encoded), 0);
+        let padded_input: Vec<u8> = (1..=20).collect();
+        assert_eq!(
+            ndlz_compress_block_2d(4, [4, 5], &padded_input, &mut encoded),
             0
         );
 
@@ -1966,7 +2216,7 @@ mod tests {
     fn ndlz_encoder_uses_row_match_tokens_for_4x4_cells() {
         let first_cell: Vec<u8> = (0..16).map(|i| (i + 1) as u8).collect();
 
-        let mut triple_input = Vec::with_capacity(32);
+        let mut triple_input = Vec::with_capacity(64);
         for row in 0..4 {
             triple_input.extend_from_slice(&first_cell[row * 4..row * 4 + 4]);
             let second_row = match row {
@@ -1976,11 +2226,13 @@ mod tests {
                 _ => &first_cell[12..16],
             };
             triple_input.extend_from_slice(second_row);
+            triple_input.extend_from_slice(&[7, 7, 7, 7]);
+            triple_input.extend_from_slice(&[8, 8, 8, 8]);
         }
 
         let mut encoded = vec![0; 96];
-        let cbytes = ndlz_compress_block_2d(4, [4, 8], &triple_input, &mut encoded);
-        assert_eq!(cbytes, 33);
+        let cbytes = ndlz_compress_block_2d(4, [4, 16], &triple_input, &mut encoded);
+        assert_eq!(cbytes, 37);
         assert_eq!(encoded[26], (7 << 5) | (2 << 3));
         assert_eq!(u16::from_le_bytes([encoded[27], encoded[28]]), 12);
 
@@ -1996,7 +2248,7 @@ mod tests {
         );
         assert_eq!(decoded, triple_input);
 
-        let mut pair_input = Vec::with_capacity(32);
+        let mut pair_input = Vec::with_capacity(64);
         for row in 0..4 {
             pair_input.extend_from_slice(&first_cell[row * 4..row * 4 + 4]);
             let second_row = match row {
@@ -2006,10 +2258,12 @@ mod tests {
                 _ => &[60, 61, 62, 63],
             };
             pair_input.extend_from_slice(second_row);
+            pair_input.extend_from_slice(&[7, 7, 7, 7]);
+            pair_input.extend_from_slice(&[8, 8, 8, 8]);
         }
 
-        let cbytes = ndlz_compress_block_2d(4, [4, 8], &pair_input, &mut encoded);
-        assert_eq!(cbytes, 37);
+        let cbytes = ndlz_compress_block_2d(4, [4, 16], &pair_input, &mut encoded);
+        assert_eq!(cbytes, 41);
         assert_eq!(encoded[26], (1 << 7) | (2 << 3));
         assert_eq!(u16::from_le_bytes([encoded[27], encoded[28]]), 16);
 
@@ -2024,6 +2278,40 @@ mod tests {
             pair_input.len() as i32
         );
         assert_eq!(decoded, pair_input);
+    }
+
+    #[test]
+    fn ndlz_encoder_uses_two_row_pair_match_token_for_4x4_cells() {
+        let a = [1, 2, 3, 4];
+        let b = [5, 6, 7, 8];
+        let c = [9, 10, 11, 12];
+        let d = [13, 14, 15, 16];
+        let x = [21, 22, 23, 24];
+        let y = [25, 26, 27, 28];
+        let u = [31, 32, 33, 34];
+        let v = [35, 36, 37, 38];
+
+        let rows = [[a, u, a], [b, c, b], [x, d, c], [y, v, d]];
+        let mut input = Vec::with_capacity(48);
+        for row in rows {
+            for cell_row in row {
+                input.extend_from_slice(&cell_row);
+            }
+        }
+
+        let mut encoded = vec![0; 96];
+        let cbytes = ndlz_compress_block_2d(4, [4, 12], &input, &mut encoded);
+        assert_eq!(cbytes, 48);
+        assert_eq!(encoded[43], 40);
+        assert_eq!(u16::from_le_bytes([encoded[44], encoded[45]]), 33);
+        assert_eq!(u16::from_le_bytes([encoded[46], encoded[47]]), 12);
+
+        let mut decoded = vec![0; input.len()];
+        assert_eq!(
+            decompress_block_with_meta(BLOSC_CODEC_NDLZ, 4, &encoded[..48], &mut decoded),
+            input.len() as i32
+        );
+        assert_eq!(decoded, input);
     }
 
     #[test]

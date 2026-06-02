@@ -272,7 +272,7 @@ pub const BLOSC2_DEFINED_CODECS_STOP: u8 = 31;
 pub const BLOSC2_GLOBAL_REGISTERED_CODECS_START: u8 = 32;
 /// Last codec ID reserved for globally registered Blosc2 codecs.
 pub const BLOSC2_GLOBAL_REGISTERED_CODECS_STOP: u8 = 159;
-/// Number of globally registered Blosc2 codecs in the vendored C header.
+/// Number of globally registered Blosc2 codecs in the vendored public header.
 pub const BLOSC2_GLOBAL_REGISTERED_CODECS: u8 = 5;
 /// Global plugin codec ID: NDLZ.
 pub const BLOSC_CODEC_NDLZ: u8 = 32;
@@ -484,5 +484,15 @@ pub fn compcode_to_version(compcode: u8) -> u8 {
         BLOSC_ZLIB => BLOSC_ZLIB_VERSION_FORMAT,
         BLOSC_ZSTD => BLOSC_ZSTD_VERSION_FORMAT,
         _ => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registered_codec_range_matches_public_header() {
+        assert_eq!(BLOSC_LAST_REGISTERED_CODEC, BLOSC_CODEC_OPENHTJ2K);
     }
 }
