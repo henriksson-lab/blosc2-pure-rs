@@ -144,9 +144,10 @@ pub fn blosc2_error_string(error_code: i32) -> &'static str {
     }
 }
 
-/// Convert a row-major linear index to multidimensional coordinates.
-pub fn blosc2_unidim_to_multidim(shape: &[i64], i: i64) -> Vec<i64> {
-    let ndim = shape.len();
+/// Convert a row-major linear index to multidimensional coordinates using the
+/// first `ndim` entries in `shape`.
+pub fn blosc2_unidim_to_multidim_ndim(ndim: usize, shape: &[i64], i: i64) -> Vec<i64> {
+    assert!(ndim <= shape.len());
     assert!(ndim <= crate::b2nd::B2ND_MAX_DIM);
     let mut index = vec![0; ndim];
     if ndim == 0 {
@@ -165,13 +166,24 @@ pub fn blosc2_unidim_to_multidim(shape: &[i64], i: i64) -> Vec<i64> {
     index
 }
 
+/// Convert a row-major linear index to multidimensional coordinates.
+pub fn blosc2_unidim_to_multidim(shape: &[i64], i: i64) -> Vec<i64> {
+    blosc2_unidim_to_multidim_ndim(shape.len(), shape, i)
+}
+
 /// Checked conversion from a row-major linear index to multidimensional
-/// coordinates.
-pub fn blosc2_unidim_to_multidim_checked(shape: &[i64], i: i64) -> Result<Vec<i64>, &'static str> {
+/// coordinates using the first `ndim` entries in `shape`.
+pub fn blosc2_unidim_to_multidim_ndim_checked(
+    ndim: usize,
+    shape: &[i64],
+    i: i64,
+) -> Result<Vec<i64>, &'static str> {
     if i < 0 {
         return Err("Invalid linear index");
     }
-    let ndim = shape.len();
+    if ndim > shape.len() {
+        return Err("Dimension count exceeds shape rank");
+    }
     if ndim > crate::b2nd::B2ND_MAX_DIM {
         return Err("Too many dimensions");
     }
@@ -183,6 +195,7 @@ pub fn blosc2_unidim_to_multidim_checked(shape: &[i64], i: i64) -> Result<Vec<i6
             Err("Invalid linear index")
         };
     }
+    let shape = &shape[..ndim];
     if shape.iter().any(|&dim| dim <= 0) {
         return Err("Invalid shape");
     }
@@ -203,14 +216,55 @@ pub fn blosc2_unidim_to_multidim_checked(shape: &[i64], i: i64) -> Result<Vec<i6
     Ok(index)
 }
 
+/// Checked conversion from a row-major linear index to multidimensional
+/// coordinates.
+pub fn blosc2_unidim_to_multidim_checked(shape: &[i64], i: i64) -> Result<Vec<i64>, &'static str> {
+    blosc2_unidim_to_multidim_ndim_checked(shape.len(), shape, i)
+}
+
+/// Convert multidimensional coordinates to a row-major linear index using
+/// the first `ndim` entries in the caller-provided index and strides.
+pub fn blosc2_multidim_to_unidim_ndim(ndim: usize, index: &[i64], strides: &[i64]) -> i64 {
+    assert!(ndim <= index.len());
+    assert!(ndim <= strides.len());
+    index[..ndim]
+        .iter()
+        .zip(&strides[..ndim])
+        .fold(0i64, |acc, (&idx, &stride)| {
+            acc.wrapping_add(idx.wrapping_mul(stride))
+        })
+}
+
 /// Convert multidimensional coordinates to a row-major linear index using
 /// caller-provided strides.
 pub fn blosc2_multidim_to_unidim(index: &[i64], strides: &[i64]) -> i64 {
-    index
+    blosc2_multidim_to_unidim_ndim(index.len(), index, strides)
+}
+
+/// Checked conversion from multidimensional coordinates to a row-major linear
+/// index using the first `ndim` entries in the caller-provided index and
+/// strides.
+pub fn blosc2_multidim_to_unidim_ndim_checked(
+    ndim: usize,
+    index: &[i64],
+    strides: &[i64],
+) -> Result<i64, &'static str> {
+    if ndim > index.len() {
+        return Err("Dimension count exceeds index rank");
+    }
+    if ndim > strides.len() {
+        return Err("Dimension count exceeds strides rank");
+    }
+    index[..ndim]
         .iter()
-        .zip(strides)
-        .fold(0i64, |acc, (&idx, &stride)| {
-            acc.wrapping_add(idx.wrapping_mul(stride))
+        .zip(&strides[..ndim])
+        .try_fold(0i64, |acc, (&idx, &stride)| {
+            if idx < 0 || stride < 0 {
+                return Err("Invalid index or stride");
+            }
+            idx.checked_mul(stride)
+                .and_then(|value| acc.checked_add(value))
+                .ok_or("Index overflow")
         })
 }
 
@@ -223,17 +277,7 @@ pub fn blosc2_multidim_to_unidim_checked(
     if index.len() != strides.len() {
         return Err("Index rank does not match strides rank");
     }
-    index
-        .iter()
-        .zip(strides)
-        .try_fold(0i64, |acc, (&idx, &stride)| {
-            if idx < 0 || stride < 0 {
-                return Err("Invalid index or stride");
-            }
-            idx.checked_mul(stride)
-                .and_then(|value| acc.checked_add(value))
-                .ok_or("Index overflow")
-        })
+    blosc2_multidim_to_unidim_ndim_checked(index.len(), index, strides)
 }
 
 /// Remove a directory and its direct file entries, returning a C-style status code.
@@ -246,6 +290,9 @@ pub fn blosc2_remove_dir(path: impl AsRef<std::path::Path>) -> i32 {
         #[cfg(not(windows))]
         Err(_) => return BLOSC2_ERROR_NOT_FOUND,
     };
+    // C-Blosc2's Windows implementation starts with _findfirst but iterates
+    // with _findnext, skipping the first returned entry. Rust removes every
+    // direct entry intentionally; preserving the C bug could leave stale files.
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -343,20 +390,41 @@ mod tests {
             blosc2_multidim_to_unidim_checked(&[2, 1, 2], &strides).unwrap(),
             47
         );
+        assert_eq!(blosc2_unidim_to_multidim_ndim(1, &shape, 2), vec![2]);
+        assert_eq!(
+            blosc2_unidim_to_multidim_ndim_checked(1, &[10, 0, i64::MAX], 7).unwrap(),
+            vec![7]
+        );
+        assert_eq!(blosc2_multidim_to_unidim_ndim(1, &[3, 99], &strides), 60);
+        assert_eq!(
+            blosc2_multidim_to_unidim_ndim_checked(1, &[3, -1], &[20, -5]).unwrap(),
+            60
+        );
         assert_eq!(blosc2_unidim_to_multidim(&[], 0), Vec::<i64>::new());
         assert_eq!(blosc2_unidim_to_multidim(&shape, 60), vec![3, 0, 0]);
         assert_eq!(blosc2_unidim_to_multidim(&shape, -1), vec![0, 0, -1]);
         assert_eq!(blosc2_multidim_to_unidim(&[-1, 2], &[4, 1]), -2);
-        assert_eq!(blosc2_multidim_to_unidim(&[1, 2], &[4]), 4);
         assert!(blosc2_unidim_to_multidim_checked(&[10, 0], 0).is_err());
         assert!(blosc2_unidim_to_multidim_checked(&[i64::MAX, 2], 0).is_err());
         assert!(blosc2_unidim_to_multidim_checked(&[3, 4], 12).is_err());
+        assert_eq!(
+            blosc2_unidim_to_multidim_ndim_checked(3, &[3, 4], 0),
+            Err("Dimension count exceeds shape rank")
+        );
         let too_many_dims = vec![1; crate::b2nd::B2ND_MAX_DIM + 1];
         assert_eq!(
             blosc2_unidim_to_multidim_checked(&too_many_dims, 0),
             Err("Too many dimensions")
         );
         assert!(blosc2_multidim_to_unidim_checked(&[1, 2], &[4]).is_err());
+        assert_eq!(
+            blosc2_multidim_to_unidim_ndim_checked(2, &[1], &[4, 1]),
+            Err("Dimension count exceeds index rank")
+        );
+        assert_eq!(
+            blosc2_multidim_to_unidim_ndim_checked(2, &[1, 2], &[4]),
+            Err("Dimension count exceeds strides rank")
+        );
         assert!(blosc2_multidim_to_unidim_checked(&[-1], &[1]).is_err());
         assert!(blosc2_multidim_to_unidim_checked(&[i64::MAX], &[2]).is_err());
         assert_eq!(normalize_urlpath("file:///frame.b2frame"), "frame.b2frame");

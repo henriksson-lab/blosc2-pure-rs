@@ -28,7 +28,7 @@ use crate::constants::{
     BLOSC2_ERROR_WRITE_BUFFER, BLOSC2_MAX_BUFFERSIZE, BLOSC2_MAX_METALAYERS, BLOSC2_SPECIAL_NAN,
     BLOSC2_SPECIAL_UNINIT, BLOSC2_SPECIAL_ZERO,
 };
-use crate::schunk::{FrameStorage, Schunk};
+use crate::schunk::{blosc2_schunk_to_buffer, FrameStorage, Schunk};
 use crate::utils::normalized_path;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -142,13 +142,7 @@ fn b2nd_create_ctx_impl(
 ) -> Result<B2ndContext, &'static str> {
     meta.validate()?;
     let typesize = b2nd_cparams_typesize(&cparams)?;
-    let block_nbytes = product_i32(&meta.blockshape)?
-        .checked_mul(typesize)
-        .ok_or("B2ND block too large")?;
-    if block_nbytes > i32::MAX as usize {
-        return Err("B2ND block too large");
-    }
-    cparams.blocksize = block_nbytes as i32;
+    cparams.blocksize = b2nd_c_context_blocksize(&meta.blockshape, typesize)?;
     if metalayers.len() >= BLOSC2_MAX_METALAYERS {
         return Err("Too many B2ND context metalayers");
     }
@@ -161,6 +155,74 @@ fn b2nd_create_ctx_impl(
     })
 }
 
+fn b2nd_create_ctx_impl_c(
+    mut meta: B2ndMeta,
+    mut cparams: CParams,
+    dparams: DParams,
+    metalayers: Vec<(String, Vec<u8>)>,
+    storage: B2ndStorage,
+) -> Result<B2ndContext, &'static str> {
+    let typesize = b2nd_cparams_typesize(&cparams)?;
+    if meta.dtype.is_empty() {
+        meta.dtype = format!("|S{typesize}");
+    }
+    cparams.blocksize = b2nd_c_context_blocksize(&meta.blockshape, typesize)?;
+    if metalayers.len() >= BLOSC2_MAX_METALAYERS {
+        return Err("Too many B2ND context metalayers");
+    }
+    Ok(B2ndContext {
+        meta,
+        cparams,
+        dparams,
+        metalayers,
+        storage: Some(storage),
+    })
+}
+
+fn b2nd_create_ctx_parts_impl_c(
+    shape: Vec<i64>,
+    chunkshape: Vec<i32>,
+    blockshape: Vec<i32>,
+    dtype: Option<&str>,
+    dtype_format: i8,
+    mut cparams: CParams,
+    dparams: DParams,
+    metalayers: Vec<(String, Vec<u8>)>,
+    storage: B2ndStorage,
+) -> Result<B2ndContext, &'static str> {
+    let typesize = b2nd_cparams_typesize(&cparams)?;
+    let meta = B2ndMeta {
+        shape,
+        chunkshape,
+        blockshape,
+        dtype: dtype
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("|S{typesize}")),
+        dtype_format,
+    };
+    cparams.blocksize = b2nd_c_context_blocksize(&meta.blockshape, typesize)?;
+    if metalayers.len() >= BLOSC2_MAX_METALAYERS {
+        return Err("Too many B2ND context metalayers");
+    }
+    Ok(B2ndContext {
+        meta,
+        cparams,
+        dparams,
+        metalayers,
+        storage: Some(storage),
+    })
+}
+
+fn b2nd_c_context_blocksize(blockshape: &[i32], typesize: usize) -> Result<i32, &'static str> {
+    let typesize = i32::try_from(typesize).map_err(|_| "B2ND block too large")?;
+    let block_nitems = blockshape.iter().try_fold(1i32, |acc, &dim| {
+        acc.checked_mul(dim).ok_or("B2ND block too large")
+    })?;
+    block_nitems
+        .checked_mul(typesize)
+        .ok_or("B2ND block too large")
+}
+
 /// C-style status adapter for [`b2nd_create_ctx`].
 pub fn b2nd_create_ctx_c(
     meta: B2ndMeta,
@@ -168,7 +230,7 @@ pub fn b2nd_create_ctx_c(
     dparams: DParams,
     metalayers: Vec<(String, Vec<u8>)>,
 ) -> (i32, Option<B2ndContext>) {
-    match b2nd_create_ctx(meta, cparams, dparams, metalayers) {
+    match b2nd_create_ctx_impl_c(meta, cparams, dparams, metalayers, B2ndStorage::default()) {
         Ok(ctx) => (BLOSC2_ERROR_SUCCESS, Some(ctx)),
         Err(err) => (b2nd_array_error_code(err), None),
     }
@@ -182,7 +244,7 @@ pub fn b2nd_create_ctx_with_storage_c(
     metalayers: Vec<(String, Vec<u8>)>,
     storage: B2ndStorage,
 ) -> (i32, Option<B2ndContext>) {
-    match b2nd_create_ctx_with_storage(meta, cparams, dparams, metalayers, storage) {
+    match b2nd_create_ctx_impl_c(meta, cparams, dparams, metalayers, storage) {
         Ok(ctx) => (BLOSC2_ERROR_SUCCESS, Some(ctx)),
         Err(err) => (b2nd_array_error_code(err), None),
     }
@@ -202,14 +264,18 @@ pub fn b2nd_create_ctx_parts_c(
     dparams: DParams,
     metalayers: Vec<(String, Vec<u8>)>,
 ) -> (i32, Option<B2ndContext>) {
-    let meta = match dtype {
-        Some(dtype) => B2ndMeta::new(shape, chunkshape, blockshape, dtype, dtype_format),
-        None => b2nd_cparams_typesize(&cparams).and_then(|typesize| {
-            B2ndMeta::with_default_dtype(shape, chunkshape, blockshape, typesize)
-        }),
-    };
-    match meta {
-        Ok(meta) => b2nd_create_ctx_c(meta, cparams, dparams, metalayers),
+    match b2nd_create_ctx_parts_impl_c(
+        shape,
+        chunkshape,
+        blockshape,
+        dtype,
+        dtype_format,
+        cparams,
+        dparams,
+        metalayers,
+        B2ndStorage::default(),
+    ) {
+        Ok(ctx) => (BLOSC2_ERROR_SUCCESS, Some(ctx)),
         Err(err) => (b2nd_array_error_code(err), None),
     }
 }
@@ -226,14 +292,18 @@ pub fn b2nd_create_ctx_parts_with_storage_c(
     metalayers: Vec<(String, Vec<u8>)>,
     storage: B2ndStorage,
 ) -> (i32, Option<B2ndContext>) {
-    let meta = match dtype {
-        Some(dtype) => B2ndMeta::new(shape, chunkshape, blockshape, dtype, dtype_format),
-        None => b2nd_cparams_typesize(&cparams).and_then(|typesize| {
-            B2ndMeta::with_default_dtype(shape, chunkshape, blockshape, typesize)
-        }),
-    };
-    match meta {
-        Ok(meta) => b2nd_create_ctx_with_storage_c(meta, cparams, dparams, metalayers, storage),
+    match b2nd_create_ctx_parts_impl_c(
+        shape,
+        chunkshape,
+        blockshape,
+        dtype,
+        dtype_format,
+        cparams,
+        dparams,
+        metalayers,
+        storage,
+    ) {
+        Ok(ctx) => (BLOSC2_ERROR_SUCCESS, Some(ctx)),
         Err(err) => (b2nd_array_error_code(err), None),
     }
 }
@@ -272,11 +342,11 @@ pub fn b2nd_deserialize_meta(data: &[u8]) -> Result<B2ndMeta, &'static str> {
 
 /// C-style metadata deserializer for [`B2ndMeta::deserialize`].
 pub fn b2nd_deserialize_meta_c(data: &[u8]) -> (i32, Option<B2ndMeta>) {
-    match B2ndMeta::deserialize(data) {
-        Ok(meta) => (
-            i32::try_from(data.len()).unwrap_or(BLOSC2_ERROR_INVALID_PARAM),
-            Some(meta),
-        ),
+    match B2ndMeta::deserialize_c(data) {
+        Ok(decoded) => match i32::try_from(decoded.consumed) {
+            Ok(consumed) => (consumed, Some(decoded.meta)),
+            Err(_) => (BLOSC2_ERROR_INVALID_PARAM, None),
+        },
         Err(_) => (BLOSC2_ERROR_INVALID_PARAM, None),
     }
 }
@@ -302,6 +372,48 @@ pub fn b2nd_serialize_meta_parts(
     .serialize()
 }
 
+fn b2nd_serialize_meta_parts_raw_c(
+    shape: Vec<i64>,
+    chunkshape: Vec<i32>,
+    blockshape: Vec<i32>,
+    dtype: &str,
+    dtype_format: i8,
+) -> Result<Vec<u8>, &'static str> {
+    let dtype = dtype.as_bytes();
+    if dtype.len() > i32::MAX as usize {
+        return Err("B2ND dtype too large");
+    }
+    let ndim = shape.len();
+    let mut out = Vec::with_capacity(3 + 3 * (3 + ndim * 9) + 6 + dtype.len());
+    out.push(0x90 + 7);
+    out.push(B2ND_METALAYER_VERSION);
+    out.push(ndim as u8);
+
+    write_array_header(&mut out, shape.len())?;
+    for dim in shape {
+        out.push(0xd3);
+        out.extend_from_slice(&dim.to_be_bytes());
+    }
+
+    write_array_header(&mut out, chunkshape.len())?;
+    for dim in chunkshape {
+        out.push(0xd2);
+        out.extend_from_slice(&dim.to_be_bytes());
+    }
+
+    write_array_header(&mut out, blockshape.len())?;
+    for dim in blockshape {
+        out.push(0xd2);
+        out.extend_from_slice(&dim.to_be_bytes());
+    }
+
+    out.push(dtype_format as u8);
+    out.push(0xdb);
+    out.extend_from_slice(&(dtype.len() as i32).to_be_bytes());
+    out.extend_from_slice(dtype);
+    Ok(out)
+}
+
 /// C-style metadata serializer from parts.
 pub fn b2nd_serialize_meta_parts_c(
     shape: Vec<i64>,
@@ -314,7 +426,13 @@ pub fn b2nd_serialize_meta_parts_c(
     if dtype_format < 0 {
         return BLOSC2_ERROR_FAILURE;
     }
-    match b2nd_serialize_meta_parts(shape, chunkshape, blockshape, dtype, dtype_format) {
+    match b2nd_serialize_meta_parts_raw_c(
+        shape,
+        chunkshape,
+        blockshape,
+        dtype.unwrap_or(B2ND_DEFAULT_DTYPE),
+        dtype_format,
+    ) {
         Ok(encoded) => {
             if dest.len() < encoded.len() {
                 return BLOSC2_ERROR_WRITE_BUFFER;
@@ -611,13 +729,24 @@ pub fn b2nd_to_cframe(array: &B2ndArray) -> Vec<u8> {
 }
 
 /// C-style frame writer for [`B2ndArray::to_frame`].
+///
+/// The returned `needs_free` flag mirrors `blosc2_schunk_to_buffer`, including
+/// `false` for a borrowed in-memory contiguous frame. This Rust adapter still
+/// returns a `Vec<u8>` so callers cannot observe a dangling borrowed pointer.
 pub fn b2nd_to_cframe_c(array: &B2ndArray) -> (i32, Option<Vec<u8>>, i64, bool) {
-    let frame = array.to_frame();
-    let len = match i64::try_from(frame.len()) {
-        Ok(len) => len,
-        Err(_) => return (BLOSC2_ERROR_INVALID_PARAM, None, 0, false),
+    let (len, frame, needs_free) = blosc2_schunk_to_buffer(&array.schunk);
+    if len < 0 {
+        return (len as i32, None, 0, false);
+    }
+    let Some(frame) = frame else {
+        return (BLOSC2_ERROR_INVALID_PARAM, None, 0, false);
     };
-    (BLOSC2_ERROR_SUCCESS, Some(frame), len, true)
+    (
+        BLOSC2_ERROR_SUCCESS,
+        Some(frame.into_owned()),
+        len,
+        needs_free,
+    )
 }
 
 /// Rust ownership drops arrays automatically; this consumes the value for C API parity.
@@ -658,7 +787,7 @@ pub fn b2nd_open_offset(path: impl AsRef<Path>, offset: i64) -> Result<B2ndArray
 pub fn b2nd_open_offset_c(path: impl AsRef<Path>, offset: i64) -> (i32, Option<B2ndArray>) {
     let offset = match u64::try_from(offset) {
         Ok(offset) => offset,
-        Err(_) => return (BLOSC2_ERROR_INVALID_PARAM, None),
+        Err(_) => return (BLOSC2_ERROR_NULL_POINTER, None),
     };
     match B2ndArray::open_offset(path, offset) {
         Ok(array) => (BLOSC2_ERROR_SUCCESS, Some(array)),
@@ -702,8 +831,11 @@ pub fn b2nd_to_cbuffer(array: &B2ndArray, dest: &mut [u8]) -> i32 {
         Ok(required) => required,
         Err(_) => return BLOSC2_ERROR_INVALID_PARAM,
     };
+    if required == 0 {
+        return BLOSC2_ERROR_SUCCESS;
+    }
     if dest.len() < required {
-        return BLOSC2_ERROR_WRITE_BUFFER;
+        return BLOSC2_ERROR_INVALID_PARAM;
     }
     match array.to_cbuffer() {
         Ok(buffer) => {
@@ -724,6 +856,9 @@ pub fn b2nd_to_cbuffer_c(array: &B2ndArray, dest: &mut [u8], buffersize: i64) ->
         Ok(required) => required,
         Err(_) => return BLOSC2_ERROR_INVALID_PARAM,
     };
+    if required == 0 {
+        return BLOSC2_ERROR_SUCCESS;
+    }
     if buffersize < required {
         return BLOSC2_ERROR_INVALID_PARAM;
     }
@@ -742,47 +877,69 @@ pub fn b2nd_print_meta(array: &B2ndArray) -> String {
     array.format_meta()
 }
 
-fn b2nd_meta_from_print_metalayer(array: &B2ndArray) -> Result<B2ndMeta, i32> {
+struct B2ndPrintableMeta {
+    meta: B2ndMeta,
+    dtype_present: bool,
+}
+
+fn b2nd_meta_from_print_metalayer(array: &B2ndArray) -> Result<B2ndPrintableMeta, i32> {
     let typesize =
         b2nd_cparams_typesize(&array.schunk.cparams).map_err(|_| BLOSC2_ERROR_INVALID_PARAM)?;
     if let Some(content) = array.schunk.metalayer(B2ND_METALAYER_NAME) {
-        return B2ndMeta::deserialize_legacy_optional_dtype(content, typesize)
+        return B2ndMeta::deserialize_legacy_optional_dtype_with_info(content, typesize)
+            .map(|decoded| B2ndPrintableMeta {
+                meta: decoded.meta,
+                dtype_present: decoded.dtype_present,
+            })
             .map_err(|_| BLOSC2_ERROR_INVALID_PARAM);
     }
     if let Some(content) = array.schunk.metalayer(CATERVA_METALAYER_NAME) {
-        return B2ndMeta::deserialize_caterva(content, typesize)
+        return B2ndMeta::deserialize_caterva_with_info(content, typesize)
+            .map(|decoded| B2ndPrintableMeta {
+                meta: decoded.meta,
+                dtype_present: decoded.dtype_present,
+            })
             .map_err(|_| BLOSC2_ERROR_INVALID_PARAM);
     }
     Err(BLOSC2_ERROR_METALAYER_NOT_FOUND)
 }
 
-fn b2nd_format_meta_c(meta: &B2ndMeta) -> String {
-    let shape = meta
-        .shape
-        .iter()
-        .map(i64::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let chunkshape = meta
-        .chunkshape
-        .iter()
-        .map(i32::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let blockshape = meta
-        .blockshape
-        .iter()
-        .map(i32::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "b2nd metalayer parameters:\n Ndim:       {}\n shape:      {}\n chunkshape: {}\n dtype: {}\n blockshape: {}\n",
+fn b2nd_format_meta_c(printable: &B2ndPrintableMeta) -> String {
+    let meta = &printable.meta;
+    let shape = b2nd_format_i64_dims_c(&meta.shape);
+    let chunkshape = b2nd_format_i32_dims_c(&meta.chunkshape);
+    let blockshape = b2nd_format_i32_dims_c(&meta.blockshape);
+    let mut out = format!(
+        "b2nd metalayer parameters:\n Ndim:       {}\n shape:      {}\n chunkshape: {}\n",
         meta.ndim(),
         shape,
-        chunkshape,
-        meta.dtype,
-        blockshape
-    )
+        chunkshape
+    );
+    if printable.dtype_present {
+        out.push_str(&format!(" dtype: {}\n", meta.dtype));
+    }
+    out.push_str(&format!(" blockshape: {}\n", blockshape));
+    out
+}
+
+fn b2nd_format_i64_dims_c(dims: &[i64]) -> String {
+    if dims.is_empty() {
+        return "1".to_string();
+    }
+    dims.iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn b2nd_format_i32_dims_c(dims: &[i32]) -> String {
+    if dims.is_empty() {
+        return "1".to_string();
+    }
+    dims.iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// C-style status adapter for printing B2ND metadata.
@@ -835,7 +992,7 @@ pub fn b2nd_expand_dims_final_c(
         Ok(final_dims) if final_dims <= axes.len() => final_dims,
         _ => return (BLOSC2_ERROR_INVALID_PARAM, None),
     };
-    if axes[..final_dims].iter().filter(|&&axis| !axis).count() != array.meta.ndim() {
+    if axes[..final_dims].iter().filter(|&&axis| !axis).count() > array.meta.ndim() {
         return (BLOSC2_ERROR_INVALID_PARAM, None);
     }
     b2nd_array_result_to_c(b2nd_expand_dims_view_c(array, &axes[..final_dims]))
@@ -886,16 +1043,11 @@ pub fn b2nd_copy_c(
 
 /// C-style context adapter for [`B2ndArray::copy_array_with_meta`].
 pub fn b2nd_copy_ctx_c(ctx: &mut B2ndContext, array: &B2ndArray) -> (i32, Option<B2ndArray>) {
-    let original_shape = ctx.meta.shape.clone();
     ctx.meta.shape = array.meta.shape.clone();
-    let result = b2nd_ctx_array_result_to_c(
+    b2nd_ctx_array_result_to_c(
         ctx,
         array.copy_array_with_meta(ctx.meta.clone(), ctx.cparams.clone(), ctx.dparams.clone()),
-    );
-    if result.0 != BLOSC2_ERROR_SUCCESS {
-        ctx.meta.shape = original_shape;
-    }
-    result
+    )
 }
 
 /// C-name alias for [`B2ndArray::concatenate_with_meta`] and
@@ -975,18 +1127,13 @@ pub fn b2nd_concatenate_ctx_c(
         Ok(shape) => shape,
         Err(_) => return (BLOSC2_ERROR_INVALID_PARAM, None),
     };
-    let original_shape = ctx.meta.shape.clone();
     ctx.meta.shape = array.meta.shape.clone();
     let mut meta = ctx.meta.clone();
     meta.shape = shape;
-    let result = b2nd_ctx_array_result_to_c(
+    b2nd_ctx_array_result_to_c(
         ctx,
         array.concatenate_with_meta(other, axis, meta, ctx.cparams.clone(), ctx.dparams.clone()),
-    );
-    if result.0 != BLOSC2_ERROR_SUCCESS {
-        ctx.meta.shape = original_shape;
-    }
-    result
+    )
 }
 
 /// Signed-axis C-style context adapter for [`b2nd_concatenate`].
@@ -1035,30 +1182,23 @@ pub fn b2nd_get_slice_ctx_c(
     start: &[i64],
     stop: &[i64],
 ) -> (i32, Option<B2ndArray>) {
-    let original_shape = ctx.meta.shape.clone();
+    if array.meta.nitems().unwrap_or(usize::MAX) == 0 {
+        let extents_as_i64 = match slice_extents_without_source_bounds(&array.meta, start, stop) {
+            Ok(extents_as_i64) => extents_as_i64,
+            Err(_) => return (BLOSC2_ERROR_INVALID_PARAM, None),
+        };
+        if product_i64(&extents_as_i64) == Ok(0) {
+            ctx.meta.shape = extents_as_i64;
+            return b2nd_empty_ctx_c(ctx);
+        }
+    }
     let slice = match validate_slice_bounds(&array.meta, start, stop) {
         Ok(slice) => slice,
         Err(_) => return (BLOSC2_ERROR_INVALID_PARAM, None),
     };
     ctx.meta.shape = slice.extents_as_i64.clone();
-    if array.meta.nitems().unwrap_or(usize::MAX) == 0 && product_i64(&ctx.meta.shape) == Ok(0) {
-        let metalayers = ctx.metalayer_refs();
-        let result = b2nd_ctx_array_result_to_c(
-            ctx,
-            B2ndArray::empty_with_metalayers(
-                ctx.meta.clone(),
-                ctx.cparams.clone(),
-                ctx.dparams.clone(),
-                &metalayers,
-            ),
-        );
-        if result.0 != BLOSC2_ERROR_SUCCESS {
-            ctx.meta.shape = original_shape;
-        }
-        return result;
-    }
     let metalayers = ctx.metalayer_refs();
-    let result = b2nd_ctx_array_result_to_c(
+    b2nd_ctx_array_result_to_c(
         ctx,
         array.get_slice_array_with_meta_and_metalayers(
             start,
@@ -1068,11 +1208,7 @@ pub fn b2nd_get_slice_ctx_c(
             ctx.dparams.clone(),
             &metalayers,
         ),
-    );
-    if result.0 != BLOSC2_ERROR_SUCCESS {
-        ctx.meta.shape = original_shape;
-    }
-    result
+    )
 }
 
 /// C-name alias for [`B2ndArray::get_slice_cbuffer`].
@@ -1098,7 +1234,7 @@ pub fn b2nd_get_slice_cbuffer(
         Err(err) => return b2nd_selection_error_code(err),
     };
     if dest.len() < required {
-        return BLOSC2_ERROR_WRITE_BUFFER;
+        return BLOSC2_ERROR_INVALID_PARAM;
     }
     match array.get_slice_cbuffer(start, stop, buffershape) {
         Ok(buffer) => {
@@ -1122,21 +1258,13 @@ pub fn b2nd_get_slice_cbuffer_c(
         Ok(buffersize) => buffersize,
         Err(code) => return code,
     };
+    if array.meta.nitems().unwrap_or(usize::MAX) == 0 {
+        dest[..buffersize].fill(0);
+        return BLOSC2_ERROR_SUCCESS;
+    }
     let result = (|| {
         let typesize = b2nd_cparams_typesize(&array.schunk.cparams)?;
         let slice = validate_slice_bounds(&array.meta, start, stop)?;
-        if array.meta.nitems()? == 0 {
-            if buffershape.len() != slice.extents.len() {
-                return Err("B2ND buffer rank does not match array rank");
-            }
-            for (extent, &buffer_dim) in slice.extents_as_i64.iter().zip(buffershape) {
-                if buffer_dim < *extent {
-                    return Err("B2ND buffer shape is smaller than slice shape");
-                }
-            }
-            dest[..buffersize].fill(0);
-            return Ok(());
-        }
         if buffershape.len() != slice.extents.len() {
             return Err("B2ND buffer rank does not match array rank");
         }
@@ -1222,6 +1350,9 @@ pub fn b2nd_set_slice_cbuffer_c(
     stop: &[i64],
     array: &mut B2ndArray,
 ) -> i32 {
+    if array.meta.nitems().unwrap_or(usize::MAX) == 0 {
+        return BLOSC2_ERROR_SUCCESS;
+    }
     let data = match b2nd_checked_cbuffer_prefix(data, buffersize) {
         Ok(data) => data,
         Err(code) => return code,
@@ -1547,9 +1678,25 @@ pub fn b2nd_delete(
 
 /// C-style status adapter for [`B2ndArray::delete`].
 pub fn b2nd_delete_c(array: &mut B2ndArray, axis: usize, start: i64, len: i64) -> i32 {
-    match array.delete(axis, start, len) {
+    let ndim = array.meta.ndim();
+    if axis >= ndim {
+        return BLOSC2_ERROR_INVALID_PARAM;
+    }
+    let mut new_shape = array.meta.shape.clone();
+    new_shape[axis] = match new_shape[axis].checked_sub(len) {
+        Some(dim) => dim,
+        None => return BLOSC2_ERROR_INVALID_PARAM,
+    };
+    let mut resize_start = vec![0i64; ndim];
+    resize_start[axis] = start;
+    let resize = if start == new_shape[axis] {
+        array.resize_at(new_shape, None)
+    } else {
+        array.resize_at(new_shape, Some(&resize_start))
+    };
+    match resize {
         Ok(()) => BLOSC2_ERROR_SUCCESS,
-        Err(_) => BLOSC2_ERROR_INVALID_PARAM,
+        Err(err) => b2nd_array_error_code(err),
     }
 }
 
@@ -1769,7 +1916,7 @@ fn b2nd_open_error_code(err: &str) -> i32 {
         || err.contains("No such file")
         || err.contains("Permission denied")
     {
-        BLOSC2_ERROR_FILE_OPEN
+        BLOSC2_ERROR_NULL_POINTER
     } else if matches!(
         err,
         "Schunk does not contain a B2ND metalayer"
@@ -1799,6 +1946,12 @@ pub struct B2ndMeta {
     pub dtype: String,
     /// Format of the data type string. `0` means NumPy.
     pub dtype_format: i8,
+}
+
+struct B2ndMetaDecode {
+    meta: B2ndMeta,
+    consumed: usize,
+    dtype_present: bool,
 }
 
 /// A multidimensional array of fixed-size items backed by a super-chunk.
@@ -1961,16 +2114,105 @@ impl B2ndMeta {
 
     fn deserialize_legacy_optional_dtype(
         data: &[u8],
-        _typesize: usize,
+        typesize: usize,
     ) -> Result<Self, &'static str> {
-        Self::deserialize_inner(data, Some(B2ND_DEFAULT_DTYPE.to_string()))
+        Self::deserialize_legacy_optional_dtype_with_info(data, typesize)
+            .map(|decoded| decoded.meta)
     }
 
     fn deserialize_caterva(data: &[u8], typesize: usize) -> Result<Self, &'static str> {
-        Self::deserialize_legacy_optional_dtype(data, typesize)
+        Self::deserialize_caterva_with_info(data, typesize).map(|decoded| decoded.meta)
+    }
+
+    fn deserialize_legacy_optional_dtype_with_info(
+        data: &[u8],
+        _typesize: usize,
+    ) -> Result<B2ndMetaDecode, &'static str> {
+        Self::deserialize_inner_with_info(data, Some(B2ND_DEFAULT_DTYPE.to_string()))
+    }
+
+    fn deserialize_caterva_with_info(
+        data: &[u8],
+        typesize: usize,
+    ) -> Result<B2ndMetaDecode, &'static str> {
+        Self::deserialize_legacy_optional_dtype_with_info(data, typesize)
+    }
+
+    fn deserialize_c(data: &[u8]) -> Result<B2ndMetaDecode, &'static str> {
+        if data.len() < 3 {
+            return Err("Truncated B2ND metadata");
+        }
+        let ndim = data[2] as usize;
+        if ndim > B2ND_MAX_DIM {
+            return Err("Invalid B2ND ndim");
+        }
+        let mut pos = 3usize;
+
+        skip_byte(data, &mut pos)?;
+        let mut shape = Vec::with_capacity(ndim);
+        for _ in 0..ndim {
+            expect_byte(data, &mut pos, 0xd3)?;
+            shape.push(read_i64(data, &mut pos)?);
+        }
+
+        skip_byte(data, &mut pos)?;
+        let mut chunkshape = Vec::with_capacity(ndim);
+        for _ in 0..ndim {
+            expect_byte(data, &mut pos, 0xd2)?;
+            chunkshape.push(read_i32(data, &mut pos)?);
+        }
+
+        skip_byte(data, &mut pos)?;
+        let mut blockshape = Vec::with_capacity(ndim);
+        for _ in 0..ndim {
+            expect_byte(data, &mut pos, 0xd2)?;
+            blockshape.push(read_i32(data, &mut pos)?);
+        }
+
+        let (dtype, dtype_format, dtype_present) = if pos == data.len() {
+            (String::new(), DTYPE_NUMPY_FORMAT, false)
+        } else {
+            let dtype_format = *data.get(pos).ok_or("Truncated B2ND metadata")? as i8;
+            pos += 1;
+            expect_byte(data, &mut pos, 0xdb)?;
+            let dtype_len = read_i32(data, &mut pos)?;
+            if dtype_len < 0 {
+                return Err("Invalid B2ND dtype length");
+            }
+            let dtype_len = dtype_len as usize;
+            let end = pos
+                .checked_add(dtype_len)
+                .ok_or("Invalid B2ND dtype length")?;
+            if end > data.len() {
+                return Err("Invalid B2ND metadata length");
+            }
+            let dtype = String::from_utf8_lossy(&data[pos..end]).into_owned();
+            pos = end;
+            (dtype, dtype_format, true)
+        };
+
+        let meta = Self {
+            shape,
+            chunkshape,
+            blockshape,
+            dtype,
+            dtype_format,
+        };
+        Ok(B2ndMetaDecode {
+            meta,
+            consumed: pos,
+            dtype_present,
+        })
     }
 
     fn deserialize_inner(data: &[u8], legacy_dtype: Option<String>) -> Result<Self, &'static str> {
+        Self::deserialize_inner_with_info(data, legacy_dtype).map(|decoded| decoded.meta)
+    }
+
+    fn deserialize_inner_with_info(
+        data: &[u8],
+        legacy_dtype: Option<String>,
+    ) -> Result<B2ndMetaDecode, &'static str> {
         let mut pos = 0usize;
         let fields = read_array_header(data, &mut pos)?;
         if fields != 7 && !(fields == 5 && legacy_dtype.is_some()) {
@@ -2006,12 +2248,12 @@ impl B2ndMeta {
             blockshape.push(read_i32(data, &mut pos)?);
         }
 
-        let (dtype, dtype_format) = match legacy_dtype {
+        let (dtype, dtype_format, dtype_present) = match legacy_dtype {
             Some(dtype) if pos == data.len() || fields == 5 => {
                 if pos != data.len() {
                     return Err("Invalid B2ND metadata length");
                 }
-                (dtype, DTYPE_NUMPY_FORMAT)
+                (dtype, DTYPE_NUMPY_FORMAT, false)
             }
             _ => {
                 let dtype_format = read_fixint(data, &mut pos)? as i8;
@@ -2034,11 +2276,16 @@ impl B2ndMeta {
                 if pos != data.len() {
                     return Err("Invalid B2ND metadata length");
                 }
-                (dtype, dtype_format)
+                (dtype, dtype_format, true)
             }
         };
 
-        Self::new(shape, chunkshape, blockshape, dtype, dtype_format)
+        let meta = Self::new(shape, chunkshape, blockshape, dtype, dtype_format)?;
+        Ok(B2ndMetaDecode {
+            meta,
+            consumed: pos,
+            dtype_present,
+        })
     }
 }
 
@@ -2536,12 +2783,6 @@ impl B2ndArray {
                 if self.meta.shape[axis] != 1 {
                     return Err("Cannot squeeze a non-singleton B2ND dimension");
                 }
-                let has_retained_prefix = axes[..axis].iter().any(|&squeeze| !squeeze);
-                if has_retained_prefix
-                    && (self.meta.chunkshape[axis] != 1 || self.meta.blockshape[axis] != 1)
-                {
-                    return Err("B2ND squeeze metadata is not layout-compatible");
-                }
             } else {
                 meta.shape.push(self.meta.shape[axis]);
                 meta.chunkshape.push(self.meta.chunkshape[axis]);
@@ -2664,7 +2905,7 @@ impl B2ndArray {
         dparams: DParams,
     ) -> Result<Self, &'static str> {
         meta.shape = self.meta.shape.clone();
-        if meta == self.meta {
+        if meta.chunkshape == self.meta.chunkshape && meta.blockshape == self.meta.blockshape {
             return Ok(Self::from_parts(
                 meta,
                 self.schunk.copy_schunk_with_params(cparams, dparams)?,
@@ -3878,6 +4119,11 @@ impl B2ndArray {
         for axis in 0..ndim {
             let coord = coords[axis][idx[axis]];
             let chunk = self.meta.chunkshape[axis] as usize;
+            // C adapters accept coord == shape. If that lands beyond the
+            // chunk grid, Rust represents the one-past cell as virtual padding.
+            if coord / chunk >= chunk_grid[axis] {
+                return Ok(());
+            }
             chunk_index[axis] = coord / chunk;
             local_idx[axis] = coord % chunk;
         }
@@ -4243,6 +4489,29 @@ fn validate_slice_bounds(
     })
 }
 
+fn slice_extents_without_source_bounds(
+    meta: &B2ndMeta,
+    start: &[i64],
+    stop: &[i64],
+) -> Result<Vec<i64>, &'static str> {
+    let ndim = meta.ndim();
+    if start.len() != ndim || stop.len() != ndim {
+        return Err("B2ND slice rank does not match array rank");
+    }
+    let mut extents = Vec::with_capacity(ndim);
+    for dim in 0..ndim {
+        let extent = stop[dim]
+            .checked_sub(start[dim])
+            .ok_or("Invalid B2ND slice bounds")?;
+        if extent < 0 {
+            return Err("Invalid B2ND slice bounds");
+        }
+        extents.push(extent);
+    }
+    product_i64(&extents)?;
+    Ok(extents)
+}
+
 fn collect_slice_chunks(
     dim: usize,
     first: &[usize],
@@ -4276,6 +4545,9 @@ fn validate_orthogonal_selection(
     for (dim, dim_selection) in selection.iter().enumerate() {
         let mut dim_coords = Vec::with_capacity(dim_selection.len());
         for &coord in dim_selection {
+            // C may pass coord == shape into padded-chunk reads. The Rust
+            // adapter rejects it to avoid treating an out-of-bounds logical
+            // coordinate as an in-bounds dense offset.
             if coord < 0 || coord >= meta.shape[dim] {
                 return Err("Invalid B2ND selection coordinate");
             }
@@ -4310,7 +4582,7 @@ fn validate_orthogonal_selection_c(
             if coord < 0 || coord > meta.shape[dim] {
                 return Err("Invalid B2ND selection coordinate");
             }
-            if coord as usize >= padded_stop {
+            if coord as usize > padded_stop {
                 return Err("B2ND selection chunk index out of range");
             }
             dim_coords.push(coord as usize);
@@ -4405,6 +4677,11 @@ fn collect_orthogonal_chunk_reads(
     for axis in 0..ndim {
         let coord = coords[axis][idx[axis]];
         let chunk = meta.chunkshape[axis] as usize;
+        // C adapters accept coord == shape. If that lands beyond the chunk
+        // grid, Rust represents the one-past cell as virtual padding.
+        if coord / chunk >= chunk_grid[axis] {
+            return Ok(());
+        }
         chunk_index[axis] = coord / chunk;
         local_idx[axis] = coord % chunk;
     }
@@ -4422,6 +4699,13 @@ fn collect_orthogonal_chunk_reads(
         local_idx,
         dst_offset,
     });
+    Ok(())
+}
+
+/// Consume one byte from `data` at `pos` and check it matches `expected`.
+fn skip_byte(data: &[u8], pos: &mut usize) -> Result<(), &'static str> {
+    data.get(*pos).ok_or("Truncated B2ND metadata")?;
+    *pos += 1;
     Ok(())
 }
 
@@ -4660,7 +4944,9 @@ fn dense_region_required_len(
 ///
 /// This is the Rust equivalent of C-Blosc2 `b2nd_copy_buffer2`. `src_stop`
 /// is exclusive, coordinates are measured in items, and `itemsize` is measured
-/// in bytes.
+/// in bytes. C treats bounds as caller preconditions; this Rust implementation
+/// validates slice extents and buffer lengths to avoid unchecked out-of-bounds
+/// memory access.
 pub fn copy_buffer2(
     src: &[u8],
     src_pad_shape: &[i64],
@@ -5646,11 +5932,57 @@ mod tests {
             b2nd_deserialize_meta_c(&encoded),
             (encoded.len() as i32, Some(meta.clone()))
         );
+        let mut c_lenient_encoded = encoded.clone();
+        c_lenient_encoded[0] = 0x91;
+        c_lenient_encoded[1] = 127;
+        assert_eq!(
+            B2ndMeta::deserialize(&c_lenient_encoded).err(),
+            Some("Invalid B2ND metadata")
+        );
+        assert_eq!(
+            b2nd_deserialize_meta_c(&c_lenient_encoded),
+            (c_lenient_encoded.len() as i32, Some(meta.clone()))
+        );
+        let dtype_start = 3 + 1 + 2 * 9 + 1 + 2 * 5 + 1 + 2 * 5;
+        let legacy_without_dtype = encoded[..dtype_start].to_vec();
+        assert_eq!(
+            B2ndMeta::deserialize(&legacy_without_dtype).err(),
+            Some("Truncated B2ND metadata")
+        );
+        let c_legacy_meta = B2ndMeta {
+            shape: vec![10, 20],
+            chunkshape: vec![4, 5],
+            blockshape: vec![2, 5],
+            dtype: String::new(),
+            dtype_format: DTYPE_NUMPY_FORMAT,
+        };
+        assert_eq!(
+            b2nd_deserialize_meta_c(&legacy_without_dtype),
+            (legacy_without_dtype.len() as i32, Some(c_legacy_meta))
+        );
+        let mut c_raw_meta_encoded = encoded.clone();
+        c_raw_meta_encoded[3 + 1 + 2 * 9] = 0x92;
+        let chunk_start = 3 + 1 + 2 * 9 + 1;
+        c_raw_meta_encoded[chunk_start] = 0xd2;
+        c_raw_meta_encoded[chunk_start + 1..chunk_start + 5]
+            .copy_from_slice(&(-4i32).to_be_bytes());
+        let dtype_format_pos = dtype_start;
+        c_raw_meta_encoded[dtype_format_pos] = 0xff;
+        let dtype_payload_pos = dtype_format_pos + 1 + 1 + 4;
+        c_raw_meta_encoded[dtype_payload_pos] = 0xff;
+        assert!(B2ndMeta::deserialize(&c_raw_meta_encoded).is_err());
+        let (raw_rc, raw_meta) = b2nd_deserialize_meta_c(&c_raw_meta_encoded);
+        assert_eq!(raw_rc, c_raw_meta_encoded.len() as i32);
+        let raw_meta = raw_meta.unwrap();
+        assert_eq!(raw_meta.shape, vec![10, 20]);
+        assert_eq!(raw_meta.chunkshape, vec![-4, 5]);
+        assert_eq!(raw_meta.dtype_format, -1);
+        assert!(raw_meta.dtype.starts_with('\u{fffd}'));
         let mut invalid_encoded = encoded.clone();
         invalid_encoded.push(0xff);
         assert_eq!(
             b2nd_deserialize_meta_c(&invalid_encoded),
-            (BLOSC2_ERROR_INVALID_PARAM, None)
+            (encoded.len() as i32, Some(meta.clone()))
         );
 
         let default_dtype_encoded = b2nd_serialize_meta_parts(
@@ -5678,6 +6010,23 @@ mod tests {
             default_dtype_encoded.len() as i32
         );
         assert_eq!(default_dtype_dest, default_dtype_encoded);
+        let mut raw_dest = vec![0u8; 64];
+        let raw_len = b2nd_serialize_meta_parts_c(
+            vec![10],
+            vec![-4],
+            vec![0],
+            Some("<i4"),
+            DTYPE_NUMPY_FORMAT,
+            &mut raw_dest,
+        );
+        assert!(raw_len > 0);
+        let raw_meta = b2nd_deserialize_meta_c(&raw_dest[..raw_len as usize])
+            .1
+            .unwrap();
+        assert_eq!(raw_meta.shape, vec![10]);
+        assert_eq!(raw_meta.chunkshape, vec![-4]);
+        assert_eq!(raw_meta.blockshape, vec![0]);
+        assert_eq!(raw_meta.dtype, "<i4");
         assert_eq!(
             b2nd_serialize_meta_parts_c(
                 vec![10, 20],
@@ -6597,6 +6946,20 @@ mod tests {
         assert_eq!(same_layout_threaded.schunk.cparams.nthreads, 4);
         assert_eq!(same_layout_threaded.to_cbuffer().unwrap(), raw_data);
 
+        let dtype_only_changed = array
+            .copy_array_with_meta(
+                B2ndMeta::new(vec![0, 0], vec![2, 2], vec![1, 2], "|S1", 0).unwrap(),
+                cparams.clone(),
+                DParams::default(),
+            )
+            .unwrap();
+        assert_eq!(dtype_only_changed.meta.dtype, "|S1");
+        assert_eq!(
+            dtype_only_changed.schunk.compressed_chunk(0).unwrap(),
+            replacement.as_slice()
+        );
+        assert_eq!(dtype_only_changed.to_cbuffer().unwrap(), raw_data);
+
         let dst_meta = B2ndMeta::new(vec![99, 99], vec![1, 3], vec![1, 1], "|u1", 0).unwrap();
         let copied = array
             .copy_array_with_meta(dst_meta, cparams.clone(), DParams::default())
@@ -7155,9 +7518,17 @@ mod tests {
             DParams::default(),
         )
         .unwrap();
+        let squeezed = b2nd_squeeze(&array).unwrap();
+        assert_eq!(squeezed.shape(), &[2]);
+        assert_eq!(squeezed.chunkshape(), &[2]);
+        assert_eq!(squeezed.blockshape(), &[1]);
+        assert_eq!(squeezed.to_cbuffer().unwrap(), vec![11, 0]);
         assert_eq!(
-            array.squeeze_index_view(&[false, true]).err(),
-            Some("B2ND squeeze metadata is not layout-compatible")
+            b2nd_squeeze_index(&array, &[false, true])
+                .unwrap()
+                .to_cbuffer()
+                .unwrap(),
+            vec![11, 0]
         );
     }
 
@@ -7678,6 +8049,55 @@ mod tests {
         );
         assert_eq!(parts_ctx_rc, BLOSC2_ERROR_SUCCESS);
         assert_eq!(parts_ctx.unwrap().meta.dtype, "|S2");
+        let (invalid_parts_ctx_rc, invalid_parts_ctx) = b2nd_create_ctx_parts_c(
+            vec![2],
+            vec![2],
+            vec![-2],
+            Some("|u1"),
+            -1,
+            cparams.clone(),
+            DParams::default(),
+            Vec::new(),
+        );
+        assert_eq!(invalid_parts_ctx_rc, BLOSC2_ERROR_SUCCESS);
+        let invalid_parts_ctx = invalid_parts_ctx.unwrap();
+        assert_eq!(invalid_parts_ctx.meta.blockshape, vec![-2]);
+        assert_eq!(invalid_parts_ctx.meta.dtype_format, -1);
+        assert_eq!(invalid_parts_ctx.cparams.blocksize, -2);
+        assert_eq!(
+            b2nd_zeros_ctx_c(&invalid_parts_ctx).0,
+            BLOSC2_ERROR_INVALID_PARAM
+        );
+        let (invalid_storage_ctx_rc, invalid_storage_ctx) = b2nd_create_ctx_parts_with_storage_c(
+            vec![2],
+            vec![2],
+            vec![1],
+            Some("|u1"),
+            -1,
+            cparams.clone(),
+            DParams::default(),
+            Vec::new(),
+            B2ndStorage::in_memory(true),
+        );
+        assert_eq!(invalid_storage_ctx_rc, BLOSC2_ERROR_SUCCESS);
+        assert_eq!(invalid_storage_ctx.unwrap().meta.dtype_format, -1);
+        let (invalid_meta_ctx_rc, invalid_meta_ctx) = b2nd_create_ctx_c(
+            B2ndMeta {
+                shape: vec![2],
+                chunkshape: vec![2],
+                blockshape: vec![-1],
+                dtype: String::new(),
+                dtype_format: -1,
+            },
+            cparams.clone(),
+            DParams::default(),
+            Vec::new(),
+        );
+        assert_eq!(invalid_meta_ctx_rc, BLOSC2_ERROR_SUCCESS);
+        let invalid_meta_ctx = invalid_meta_ctx.unwrap();
+        assert_eq!(invalid_meta_ctx.meta.dtype, "|S1");
+        assert_eq!(invalid_meta_ctx.meta.dtype_format, -1);
+        assert_eq!(invalid_meta_ctx.cparams.blocksize, -1);
         let (ctx_zeros_rc, ctx_zeros) = b2nd_zeros_ctx_c(&ctx);
         assert_eq!(ctx_zeros_rc, BLOSC2_ERROR_SUCCESS);
         assert_eq!(
@@ -7798,7 +8218,7 @@ mod tests {
         );
         assert_eq!(
             b2nd_to_cbuffer(&array, &mut dense_dest[..data.len() - 1]),
-            BLOSC2_ERROR_WRITE_BUFFER
+            BLOSC2_ERROR_INVALID_PARAM
         );
         let frame = b2nd_to_cframe(&array);
         let (frame_rc, frame_c, frame_len, needs_free) = b2nd_to_cframe_c(&array);
@@ -7809,6 +8229,13 @@ mod tests {
         let from_frame = b2nd_from_cframe(&frame, true).unwrap();
         assert_eq!(from_frame.meta, meta);
         assert_eq!(b2nd_to_cbuffer_vec(&from_frame).unwrap(), data);
+        let from_borrowed_frame = b2nd_from_cframe(&frame, false).unwrap();
+        let (borrowed_frame_rc, borrowed_frame_c, borrowed_frame_len, borrowed_needs_free) =
+            b2nd_to_cframe_c(&from_borrowed_frame);
+        assert_eq!(borrowed_frame_rc, BLOSC2_ERROR_SUCCESS);
+        assert_eq!(borrowed_frame_c.as_ref().unwrap(), &frame);
+        assert_eq!(borrowed_frame_len, frame.len() as i64);
+        assert!(!borrowed_needs_free);
         let (from_frame_rc, from_frame_c) =
             b2nd_from_cframe_c(&[frame.as_slice(), &[0]].concat(), frame.len() as i64, true);
         assert_eq!(from_frame_rc, BLOSC2_ERROR_SUCCESS);
@@ -7881,9 +8308,17 @@ mod tests {
             data
         );
         assert_eq!(b2nd_open_c(&path).0, BLOSC2_ERROR_SUCCESS);
+        assert_eq!(
+            b2nd_open_c(dir.path().join("missing.b2frame")).0,
+            BLOSC2_ERROR_NULL_POINTER
+        );
         let opened_negative_offset = b2nd_open_offset_c(&append_path, -1);
-        assert_eq!(opened_negative_offset.0, BLOSC2_ERROR_INVALID_PARAM);
+        assert_eq!(opened_negative_offset.0, BLOSC2_ERROR_NULL_POINTER);
         assert!(opened_negative_offset.1.is_none());
+        assert_eq!(
+            b2nd_open_offset_c(dir.path().join("missing.b2frame"), 0).0,
+            BLOSC2_ERROR_NULL_POINTER
+        );
         assert_eq!(
             b2nd_open_offset_c(&append_path, offset).0,
             BLOSC2_ERROR_SUCCESS
@@ -7982,7 +8417,7 @@ mod tests {
                 &mut slice_dest[..slice.len() - 1],
                 &[3, 5]
             ),
-            BLOSC2_ERROR_WRITE_BUFFER
+            BLOSC2_ERROR_INVALID_PARAM
         );
 
         let dst_meta = B2ndMeta::new(vec![99, 99], vec![3, 2], vec![1, 1], "|u1", 0).unwrap();
@@ -8050,24 +8485,24 @@ mod tests {
         );
         let existing_ctx_path = dir.path().join("ctx-existing.b2frame");
         std::fs::write(&existing_ctx_path, b"exists").unwrap();
-        let previous_ctx_shape = ctx.meta.shape.clone();
+        ctx.meta.shape = vec![1, 1];
         ctx.storage = Some(B2ndStorage::contiguous_urlpath(&existing_ctx_path));
         assert_eq!(
             b2nd_copy_ctx_c(&mut ctx, &source_ctx_array).0,
             BLOSC2_ERROR_FILE_WRITE
         );
-        assert_eq!(ctx.meta.shape, previous_ctx_shape);
+        assert_eq!(ctx.meta.shape, vec![4, 6]);
         assert_eq!(
             b2nd_get_slice_ctx_c(&mut ctx, &array, &[0, 0], &[0, 5]).0,
             BLOSC2_ERROR_FILE_WRITE
         );
-        assert_eq!(ctx.meta.shape, previous_ctx_shape);
+        assert_eq!(ctx.meta.shape, vec![0, 5]);
         let mut storage_fail_concat_left = source_ctx_array.clone();
         assert_eq!(
             b2nd_concatenate_ctx_c(&mut ctx, &mut storage_fail_concat_left, &array, 0, true).0,
             BLOSC2_ERROR_FILE_WRITE
         );
-        assert_eq!(ctx.meta.shape, previous_ctx_shape);
+        assert_eq!(ctx.meta.shape, vec![4, 6]);
         ctx.storage = None;
         let mut concat_left = source_ctx_array.clone();
         let (ctx_concat_rc, ctx_concat) =
@@ -8492,7 +8927,7 @@ mod tests {
                 &[1, 1],
                 1,
             ),
-            BLOSC2_ERROR_INVALID_PARAM
+            BLOSC2_ERROR_SUCCESS
         );
         assert_eq!(edge_dest, vec![0xff]);
         let edge_before = edge_target.to_cbuffer().unwrap();
@@ -8504,7 +8939,7 @@ mod tests {
                 &[99],
                 1,
             ),
-            BLOSC2_ERROR_INVALID_PARAM
+            BLOSC2_ERROR_SUCCESS
         );
         assert_eq!(edge_target.to_cbuffer().unwrap(), edge_before);
 
@@ -8512,13 +8947,17 @@ mod tests {
             .1
             .unwrap();
         assert_eq!(expanded.shape(), &[1, 4, 6]);
+        let partial_expanded = b2nd_expand_dims_final_c(&array, &[true, false], 2)
+            .1
+            .unwrap();
+        assert_eq!(partial_expanded.shape(), &[1, 4]);
         assert_eq!(
             b2nd_expand_dims_final_c(&array, &[true, false, false, true], 3).0,
             BLOSC2_ERROR_SUCCESS
         );
         assert_eq!(
             b2nd_expand_dims_final_c(&array, &[false], 1).0,
-            BLOSC2_ERROR_INVALID_PARAM
+            BLOSC2_ERROR_SUCCESS
         );
         assert_eq!(
             b2nd_expand_dims_final_c(&array, &[true, false], 3).0,
@@ -8635,6 +9074,22 @@ mod tests {
             b2nd_delete_c(&mut one_d, 0, -1, 1),
             BLOSC2_ERROR_INVALID_PARAM
         );
+        let mut grow_by_delete = b2nd_from_cbuffer(
+            B2ndMeta::new(vec![4], vec![2], vec![1], "|u1", 0).unwrap(),
+            &[1, 2, 3, 4],
+            cparams.clone(),
+            DParams::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            b2nd_delete_c(&mut grow_by_delete, 0, 6, -2),
+            BLOSC2_ERROR_SUCCESS
+        );
+        assert_eq!(grow_by_delete.shape(), &[6]);
+        assert_eq!(
+            b2nd_to_cbuffer_vec(&grow_by_delete).unwrap(),
+            vec![1, 2, 3, 4, 0, 0]
+        );
         assert_eq!(
             b2nd_resize_c(&mut one_d, vec![4], None),
             BLOSC2_ERROR_SUCCESS
@@ -8720,6 +9175,20 @@ mod tests {
             ),
             BLOSC2_ERROR_WRITE_BUFFER
         );
+        assert_eq!(
+            b2nd_copy_buffer2(
+                2,
+                1,
+                &data[..8],
+                &[4, 6],
+                &[1, 1],
+                &[3, 4],
+                &mut copied_region,
+                &[3, 3],
+                &[0, 0],
+            ),
+            BLOSC2_ERROR_WRITE_BUFFER
+        );
         assert!(b2nd_copy_buffer2_result(
             1,
             1,
@@ -8757,7 +9226,23 @@ mod tests {
         assert!(meta_text.contains("b2nd metalayer parameters:"));
         assert!(meta_text.contains("Ndim:       2"));
         assert!(meta_text.contains("shape:      4, 6"));
+        assert!(meta_text.contains("dtype: |u1"));
         assert!(!meta_text.contains("dtype_format"));
+        let mut legacy_no_dtype = array.clone();
+        let legacy_content = legacy_no_dtype
+            .schunk
+            .remove_metalayer(B2ND_METALAYER_NAME)
+            .unwrap();
+        let dtype_start = legacy_content.len() - (1 + 1 + 4 + array.meta.dtype.len());
+        legacy_no_dtype
+            .schunk
+            .add_metalayer(CATERVA_METALAYER_NAME, &legacy_content[..dtype_start])
+            .unwrap();
+        let legacy_meta_len = b2nd_print_meta_to_buffer_c(&legacy_no_dtype, &mut meta_dest, 128);
+        assert!(legacy_meta_len > 0);
+        let legacy_meta_text = std::str::from_utf8(&meta_dest[..legacy_meta_len as usize]).unwrap();
+        assert!(!legacy_meta_text.contains("dtype:"));
+        assert!(legacy_meta_text.contains("blockshape: 1, 3"));
         let mut no_meta = array.clone();
         no_meta.schunk.remove_metalayer(B2ND_METALAYER_NAME);
         assert_eq!(
@@ -8776,6 +9261,15 @@ mod tests {
             DParams::default(),
         )
         .unwrap();
+        let mut scalar_meta_dest = vec![0u8; 128];
+        let scalar_meta_len = b2nd_print_meta_to_buffer_c(&scalar, &mut scalar_meta_dest, 128);
+        assert!(scalar_meta_len > 0);
+        let scalar_meta_text =
+            std::str::from_utf8(&scalar_meta_dest[..scalar_meta_len as usize]).unwrap();
+        assert!(scalar_meta_text.contains("Ndim:       0"));
+        assert!(scalar_meta_text.contains("shape:      1"));
+        assert!(scalar_meta_text.contains("chunkshape: 1"));
+        assert!(scalar_meta_text.contains("blockshape: 1"));
         assert_eq!(
             b2nd_get_slice(
                 &scalar,
@@ -9411,7 +9905,7 @@ mod tests {
     }
 
     #[test]
-    fn test_b2nd_c_zero_item_slice_validates_bounds() {
+    fn test_b2nd_c_zero_item_slice_returns_before_source_bounds() {
         let meta = B2ndMeta::new(vec![0, 5], vec![0, 5], vec![0, 1], "|u1", 0).unwrap();
         let cparams = CParams {
             compcode: BLOSC_LZ4,
@@ -9425,12 +9919,25 @@ mod tests {
             B2ndArray::from_cbuffer(meta.clone(), &[], cparams.clone(), DParams::default())
                 .unwrap();
         let mut dest = vec![0xff; 4];
+        let mut dense_dest = vec![0xff; 4];
+
+        assert_eq!(
+            b2nd_to_cbuffer(&array, &mut dense_dest),
+            BLOSC2_ERROR_SUCCESS
+        );
+        assert_eq!(dense_dest, vec![0xff; 4]);
+        assert_eq!(
+            b2nd_to_cbuffer_c(&array, &mut dense_dest, 4),
+            BLOSC2_ERROR_SUCCESS
+        );
+        assert_eq!(dense_dest, vec![0xff; 4]);
 
         assert_eq!(
             b2nd_get_slice_cbuffer_c(&array, &[0, 100], &[0, 101], &mut dest, &[0, 1], 4),
-            BLOSC2_ERROR_INVALID_PARAM
+            BLOSC2_ERROR_SUCCESS
         );
-        assert_eq!(dest, vec![0xff; 4]);
+        assert_eq!(dest, vec![0; 4]);
+        dest.fill(0xff);
         assert_eq!(
             b2nd_get_slice_cbuffer_c(&array, &[0, 0], &[0, 5], &mut dest, &[0, 5], 4),
             BLOSC2_ERROR_SUCCESS
@@ -9438,7 +9945,7 @@ mod tests {
         assert_eq!(dest, vec![0; 4]);
         assert_eq!(
             b2nd_set_slice_cbuffer_c(&[], 0, &[0, 1], &[0, 100], &[0, 101], &mut array),
-            BLOSC2_ERROR_INVALID_PARAM
+            BLOSC2_ERROR_SUCCESS
         );
         assert_eq!(
             b2nd_set_slice_cbuffer_c(&[], 0, &[0, 5], &[0, 0], &[0, 5], &mut array),
@@ -9454,9 +9961,12 @@ mod tests {
         assert_eq!(ctx_rc, BLOSC2_ERROR_SUCCESS);
         let mut ctx = ctx.unwrap();
         let (slice_rc, slice) = b2nd_get_slice_ctx_c(&mut ctx, &array, &[0, 100], &[0, 101]);
-        assert_eq!(slice_rc, BLOSC2_ERROR_INVALID_PARAM);
-        assert!(slice.is_none());
-        assert_eq!(ctx.meta.shape, vec![0, 5]);
+        assert_eq!(slice_rc, BLOSC2_ERROR_SUCCESS);
+        let slice = slice.unwrap();
+        assert_eq!(ctx.meta.shape, vec![0, 1]);
+        assert_eq!(slice.shape(), &[0, 1]);
+        assert_eq!(slice.to_cbuffer().unwrap(), Vec::<u8>::new());
+        assert_eq!(slice.schunk.metalayer("owner"), Some(&b"ctx"[..]));
 
         let (slice_rc, slice) = b2nd_get_slice_ctx_c(&mut ctx, &array, &[0, 0], &[0, 5]);
         assert_eq!(slice_rc, BLOSC2_ERROR_SUCCESS);

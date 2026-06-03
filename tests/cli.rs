@@ -122,7 +122,7 @@ fn decompress_help_documents_nthreads_default() {
     let help = run(["decompress", "--help"]);
     assert_stdout_contains(help, "-n, --nthreads <NTHREADS>");
     let help = run(["decompress", "--help"]);
-    assert_stdout_contains(help, "[default: 4]");
+    assert_stdout_contains(help, "defaults to the value stored in the frame");
 }
 
 #[test]

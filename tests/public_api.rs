@@ -202,7 +202,7 @@ const API_MATRIX: &[ApiRow] = &[
     covered!("b2nd_copy_buffer"),
     covered!("b2nd_copy_buffer2"),
     partial!("blosc2_register_codec", "Rust registry exists, but not the C callback ABI."),
-    partial!("blosc2_register_filter", "Rust registry exists, but callbacks are Rust-shaped and not ABI-compatible."),
+    covered!("blosc2_register_filter"),
     partial!("blosc2_schunk_new" => "blosc2_schunk_new_c", "Rust helper uses owned storage parameters, not blosc2_storage ABI."),
     partial!("blosc2_schunk_copy", "Rust copies supported data but not all C storage/plugin semantics."),
     partial!("blosc2_schunk_append_chunk", "Implemented, but exact C precompressed chunk validation/storage semantics remain incomplete."),

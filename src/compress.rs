@@ -202,9 +202,6 @@ pub fn blosc2_compcode_to_compname_c(code: u8) -> (i32, Option<&'static str>) {
 
 /// C-return variant for signed C `int` compressor codes.
 pub fn blosc2_compcode_to_compname_int_c(code: i32) -> (i32, Option<&'static str>) {
-    if code >= BLOSC_LAST_CODEC as i32 {
-        return (code, None);
-    }
     let code_u8 = match u8::try_from(code) {
         Ok(code) => code,
         Err(_) => return (-1, None),
@@ -329,12 +326,15 @@ pub fn blosc1_set_compressor_code(code: u8) -> u8 {
 }
 
 /// Get the process-wide default codec currently used by `blosc1_compress`.
-pub fn blosc1_get_compressor() -> &'static str {
+/// Mirrors C `blosc1_get_compressor`: invalid global compressor state is NULL.
+pub fn blosc1_get_compressor() -> Option<&'static str> {
     let code = GLOBAL_COMPRESSOR.load(Ordering::Relaxed);
-    u8::try_from(code)
-        .ok()
-        .and_then(compressor_code_to_name)
-        .unwrap_or("unknown")
+    u8::try_from(code).ok().and_then(compressor_code_to_name)
+}
+
+/// Ergonomic string-returning variant of [`blosc1_get_compressor`].
+pub fn blosc1_get_compressor_or_unknown() -> &'static str {
+    blosc1_get_compressor().unwrap_or("unknown")
 }
 
 /// Get the current process-wide compressor code.
@@ -349,6 +349,10 @@ fn blosc1_get_compressor_code_i32() -> i32 {
 /// Blosc1-style getitem adapter. Mirrors C `blosc1_getitem`, returning bytes
 /// written or a negative `BLOSC2_ERROR_*` code.
 pub fn blosc1_getitem(chunk: &[u8], start: i32, nitems: i32, dest: &mut [u8]) -> i32 {
+    let chunk = match checked_c_declared_chunk(chunk, i32::MAX) {
+        Ok(chunk) => chunk,
+        Err(code) => return code,
+    };
     getitem_c(chunk, start, nitems, dest)
 }
 
@@ -404,14 +408,11 @@ pub fn blosc2_set_nthreads(nthreads: i16) -> i16 {
     let previous = GLOBAL_NTHREADS.load(Ordering::Relaxed);
     if nthreads != previous {
         GLOBAL_NTHREADS.store(nthreads, Ordering::Relaxed);
+        if previous <= 0 || nthreads < 0 {
+            return BLOSC2_ERROR_INVALID_PARAM as i16;
+        }
     }
-    if previous <= 0 {
-        BLOSC2_ERROR_INVALID_PARAM as i16
-    } else if nthreads <= 0 {
-        nthreads
-    } else {
-        previous
-    }
+    previous
 }
 
 /// Get the current thread count used by `blosc1_compress`. Mirrors `blosc2_get_nthreads`.
@@ -847,6 +848,7 @@ fn filter_cparams_context(cparams: &CParams) -> filters::FilterCParamsContext {
         compcode: cparams.compcode,
         compcode_meta: cparams.compcode_meta,
         clevel: cparams.clevel,
+        use_dict: cparams.use_dict,
         typesize: cparams.typesize,
         blocksize: cparams.blocksize,
         splitmode: cparams.splitmode,
@@ -855,6 +857,10 @@ fn filter_cparams_context(cparams: &CParams) -> filters::FilterCParamsContext {
         nthreads: cparams.nthreads,
         nchunk: cparams.nchunk,
         user_data: cparams.prefilter_user_data,
+        preparams: cparams.prefilter_user_data,
+        tuner_id: 0,
+        instr_codec: false,
+        codec_params: 0,
     }
 }
 
@@ -864,6 +870,7 @@ fn filter_dparams_context(dparams: &DParams) -> filters::FilterDParamsContext {
         typesize: dparams.typesize,
         nchunk: dparams.nchunk,
         user_data: dparams.postfilter_user_data,
+        postparams: dparams.postfilter_user_data,
     }
 }
 
@@ -1214,19 +1221,13 @@ impl DContext {
 
     /// Decompress every block in a variable-length-block chunk.
     pub fn vldecompress(&self, chunk: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
-        let dparams = self.one_shot_dparams();
-        if dparams.block_maskout.is_some() {
-            return Err("Maskout is not supported for VL-block chunks");
-        }
+        let dparams = self.dparams();
         vldecompress_with_params(chunk, &dparams)
     }
 
     /// Decompress one block from a variable-length-block chunk.
     pub fn vldecompress_block(&self, chunk: &[u8], nblock: usize) -> Result<Vec<u8>, &'static str> {
-        let dparams = self.one_shot_dparams();
-        if dparams.block_maskout.is_some() {
-            return Err("Maskout is not supported for VL-block chunks");
-        }
+        let dparams = self.dparams();
         vldecompress_block_with_params(chunk, nblock, &dparams)
     }
 
@@ -1308,18 +1309,23 @@ pub fn blosc2_decompress_ctx(
     dest: &mut [u8],
     destsize: i32,
 ) -> i32 {
-    if destsize < 0 {
-        return BLOSC2_ERROR_INVALID_PARAM;
-    }
-    let srcsize = match checked_c_chunk_src_len(srcsize, src.len()) {
-        Ok(srcsize) => srcsize,
+    let dparams = ctx.one_shot_dparams();
+    let chunk = match checked_c_declared_chunk(src, srcsize) {
+        Ok(chunk) => chunk,
         Err(code) => return code,
     };
+    if destsize < 0 {
+        return BLOSC2_ERROR_WRITE_BUFFER;
+    }
     let destsize = destsize as usize;
     if destsize > dest.len() {
         return BLOSC2_ERROR_INVALID_PARAM;
     }
-    result_len_to_c(ctx.decompress_into(&src[..srcsize], &mut dest[..destsize]))
+    result_len_to_c(decompress_into_with_dparams(
+        chunk,
+        &mut dest[..destsize],
+        &dparams,
+    ))
 }
 
 /// C-style context VL-block decompression adapter.
@@ -1328,11 +1334,11 @@ pub fn blosc2_vldecompress_ctx(
     src: &[u8],
     srcsize: i32,
 ) -> (i32, Option<Vec<Vec<u8>>>) {
-    let srcsize = match checked_c_chunk_src_len(srcsize, src.len()) {
-        Ok(srcsize) => srcsize,
+    let chunk = match checked_c_declared_chunk(src, srcsize) {
+        Ok(chunk) => chunk,
         Err(code) => return (code, None),
     };
-    match ctx.vldecompress(&src[..srcsize]) {
+    match ctx.vldecompress(chunk) {
         Ok(blocks) => (
             i32::try_from(blocks.len()).unwrap_or(BLOSC2_ERROR_INVALID_PARAM),
             Some(blocks),
@@ -1350,6 +1356,9 @@ pub fn blosc2_vldecompress_ctx_c(
     block_sizes: &mut [i32],
     nblocks: i32,
 ) -> i32 {
+    if nblocks <= 0 {
+        return BLOSC2_ERROR_INVALID_PARAM;
+    }
     let nblocks = match checked_c_buffer_len(nblocks, blocks.len()) {
         Ok(nblocks) => nblocks,
         Err(code) => return code,
@@ -1357,57 +1366,126 @@ pub fn blosc2_vldecompress_ctx_c(
     if block_sizes.len() < nblocks {
         return BLOSC2_ERROR_INVALID_PARAM;
     }
-    let srcsize = match checked_c_chunk_src_len(srcsize, src.len()) {
-        Ok(srcsize) => srcsize,
+    let chunk = match checked_c_declared_chunk(src, srcsize) {
+        Ok(chunk) => chunk,
         Err(code) => return code,
     };
-    match vlchunk_get_nblocks(&src[..srcsize]) {
-        Ok(count) if count > nblocks => return BLOSC2_ERROR_INVALID_PARAM,
-        Ok(_) => {}
-        Err(err) => return blosc2_error_code(err),
+    let header = match ChunkHeader::read(chunk) {
+        Ok(header) => normalize_regular_header_blocksize(header),
+        Err(err) => return cbuffer_header_error_code(err),
+    };
+    if let Err(err) = validate_header(&header, chunk.len()) {
+        return blosc2_error_code(err);
     }
-    match blosc2_vldecompress_ctx(ctx, src, srcsize as i32) {
-        (count, Some(decoded)) if count >= 0 => {
-            let count = count as usize;
-            if count > nblocks {
-                return BLOSC2_ERROR_INVALID_PARAM;
-            }
-            for (idx, block) in decoded.into_iter().enumerate() {
-                block_sizes[idx] = i32::try_from(block.len()).unwrap_or(BLOSC2_ERROR_2GB_LIMIT);
-                if block_sizes[idx] < 0 {
-                    return block_sizes[idx];
-                }
+    if !header.vl_blocks() {
+        return blosc2_error_code("Chunk does not use VL-blocks");
+    }
+    if let Err(err) = validate_vl_layout(chunk, &header) {
+        return blosc2_error_code(err);
+    }
+    let count = header.blocksize as usize;
+    if count > nblocks {
+        return BLOSC2_ERROR_INVALID_PARAM;
+    }
+    let dparams = ctx.dparams();
+    let maskout = match validated_block_maskout(&dparams, count) {
+        Ok(maskout) => maskout,
+        Err(err) => return blosc2_error_code(err),
+    };
+    for idx in 0..count {
+        let block_size = match vl_block_uncompressed_size(chunk, idx) {
+            Ok(size) => size,
+            Err(err) => return blosc2_error_code(err),
+        };
+        block_sizes[idx] = i32::try_from(block_size).unwrap_or(BLOSC2_ERROR_2GB_LIMIT);
+        if block_sizes[idx] < 0 {
+            return block_sizes[idx];
+        }
+        blocks[idx].clear();
+        blocks[idx].resize(block_size, 0);
+        if block_is_masked(maskout, idx) {
+            // C leaves malloc-backed masked block contents indeterminate.
+            // Vec cannot safely expose uninitialized bytes, so this adapter
+            // claims only size parity and returns deterministic zeroes.
+            continue;
+        }
+        match vldecompress_block_with_params(chunk, idx, &dparams) {
+            Ok(block) => {
                 blocks[idx] = block;
             }
-            count as i32
+            Err(err) => return blosc2_error_code(err),
         }
-        (code, _) => code,
+    }
+    count as i32
+}
+
+/// C-name context VL-block single-block decompression adapter.
+///
+/// C-Blosc2 allocates storage for the decompressed block and returns it to the
+/// caller via an out pointer. The Rust C-name adapter mirrors that ownership
+/// shape with `Option<Vec<u8>>`; the status is the block size on success.
+pub fn blosc2_vldecompress_block_ctx(
+    ctx: &DContext,
+    src: &[u8],
+    srcsize: i32,
+    nblock: usize,
+) -> (i32, Option<Vec<u8>>) {
+    let chunk = match checked_c_declared_chunk(src, srcsize) {
+        Ok(chunk) => chunk,
+        Err(code) => return (code, None),
+    };
+    let bsize = match vl_block_uncompressed_size(chunk, nblock) {
+        Ok(size) => size,
+        Err(err) => return (blosc2_error_code(err), None),
+    };
+    let dparams = ctx.dparams();
+    let header = match ChunkHeader::read(chunk) {
+        Ok(header) => normalize_regular_header_blocksize(header),
+        Err(err) => return (cbuffer_header_error_code(err), None),
+    };
+    let maskout = match validated_block_maskout(&dparams, header.blocksize as usize) {
+        Ok(maskout) => maskout,
+        Err(err) => return (blosc2_error_code(err), None),
+    };
+    if block_is_masked(maskout, nblock) {
+        return (usize_to_c_return(bsize), Some(vec![0; bsize]));
+    }
+    match vldecompress_block_with_params(chunk, nblock, &dparams) {
+        Ok(block) => (usize_to_c_return(block.len()), Some(block)),
+        Err(err) => (blosc2_error_code(err), None),
     }
 }
 
-/// C-style context VL-block single-block decompression adapter.
-pub fn blosc2_vldecompress_block_ctx(
+/// Caller-buffer VL-block single-block decompression adapter.
+pub fn blosc2_vldecompress_block_ctx_into(
     ctx: &DContext,
     src: &[u8],
     srcsize: i32,
     nblock: usize,
     dest: &mut [u8],
 ) -> i32 {
-    let srcsize = match checked_c_chunk_src_len(srcsize, src.len()) {
-        Ok(srcsize) => srcsize,
+    let chunk = match checked_c_declared_chunk(src, srcsize) {
+        Ok(chunk) => chunk,
         Err(code) => return code,
     };
-    let chunk = &src[..srcsize];
     let bsize = match vl_block_uncompressed_size(chunk, nblock) {
         Ok(size) => size,
         Err(err) => return blosc2_error_code(err),
     };
-    let dparams = ctx.one_shot_dparams();
-    if dparams.block_maskout.is_some() {
-        return blosc2_error_code("Maskout is not supported for VL-block chunks");
-    }
+    let dparams = ctx.dparams();
+    let header = match ChunkHeader::read(chunk) {
+        Ok(header) => normalize_regular_header_blocksize(header),
+        Err(err) => return cbuffer_header_error_code(err),
+    };
+    let maskout = match validated_block_maskout(&dparams, header.blocksize as usize) {
+        Ok(maskout) => maskout,
+        Err(err) => return blosc2_error_code(err),
+    };
     if dest.len() < bsize {
         return BLOSC2_ERROR_WRITE_BUFFER;
+    }
+    if block_is_masked(maskout, nblock) {
+        return usize_to_c_return(bsize);
     }
     match vldecompress_block_with_params(chunk, nblock, &dparams) {
         Ok(block) => {
@@ -1434,7 +1512,7 @@ pub fn blosc2_vldecompress_block_ctx_c(
         Ok(size) => size,
         Err(code) => return code,
     };
-    blosc2_vldecompress_block_ctx(ctx, src, srcsize, nblock as usize, &mut dest[..destsize])
+    blosc2_vldecompress_block_ctx_into(ctx, src, srcsize, nblock as usize, &mut dest[..destsize])
 }
 
 /// C-style compression-context parameter getter.
@@ -2326,16 +2404,49 @@ fn special_chunk_c(
     repeated_value: Option<&[u8]>,
 ) -> i32 {
     if nbytes < 0 {
-        if special_type != BLOSC2_SPECIAL_ZERO {
+        if cparams.typesize <= 0 {
             return BLOSC2_ERROR_DATA;
         }
-        if destsize < BLOSC_EXTENDED_HEADER_LENGTH as i32 {
+        let raw_typesize = cparams.typesize as usize;
+        let min_dest = BLOSC_EXTENDED_HEADER_LENGTH
+            + if special_type == BLOSC2_SPECIAL_VALUE {
+                raw_typesize
+            } else {
+                0
+            };
+        if destsize < i32::try_from(min_dest).unwrap_or(i32::MAX) {
             return BLOSC2_ERROR_DATA;
         }
         let destsize = destsize as usize;
         if destsize > dest.len() {
             return BLOSC2_ERROR_INVALID_PARAM;
         }
+        let raw_item_size = if special_type == BLOSC2_SPECIAL_VALUE {
+            raw_typesize
+        } else {
+            cparams.typesize as usize
+        };
+        if special_type != BLOSC2_SPECIAL_ZERO
+            && (raw_item_size == 0 || nbytes % raw_item_size as i32 != 0)
+        {
+            return BLOSC2_ERROR_DATA;
+        }
+
+        let repeated_prefix;
+        let repeated_value = if special_type == BLOSC2_SPECIAL_VALUE {
+            let value = match repeated_value {
+                Some(value) => value,
+                None => return BLOSC2_ERROR_DATA,
+            };
+            if value.len() < raw_typesize {
+                return BLOSC2_ERROR_DATA;
+            }
+            repeated_prefix = &value[..raw_typesize];
+            Some(repeated_prefix)
+        } else {
+            None
+        };
+
         let cparams = match apply_context_env_to_cparams(cparams) {
             Ok(cparams) => cparams,
             Err(err) => return blosc2_error_code(err),
@@ -2343,21 +2454,29 @@ fn special_chunk_c(
         if validate_cctx_create_filters(&cparams).is_err() {
             return BLOSC2_ERROR_NULL_POINTER;
         }
+        let typesize = normalized_typesize(cparams.typesize);
+        if typesize <= 0 || typesize as usize > BLOSC_MAX_TYPESIZE {
+            return BLOSC2_ERROR_DATA;
+        }
+        let cbytes = min_dest;
         let header = ChunkHeader {
             version: BLOSC2_VERSION_FORMAT_STABLE,
             versionlz: BLOSC_BLOSCLZ_VERSION_FORMAT,
             flags: BLOSC_DOSHUFFLE | BLOSC_DOBITSHUFFLE,
-            typesize: normalized_typesize(cparams.typesize) as u8,
+            typesize: typesize as u8,
             nbytes,
             blocksize: 1,
-            cbytes: BLOSC_EXTENDED_HEADER_LENGTH as i32,
-            blosc2_flags: BLOSC2_SPECIAL_ZERO << 4,
+            cbytes: cbytes as i32,
+            blosc2_flags: special_type << 4,
             ..Default::default()
         };
-        if let Err(err) = header.try_write(&mut dest[..BLOSC_EXTENDED_HEADER_LENGTH]) {
+        if let Err(err) = header.try_write(&mut dest[..cbytes]) {
             return blosc2_error_code(err);
         }
-        return BLOSC_EXTENDED_HEADER_LENGTH as i32;
+        if let Some(value) = repeated_value {
+            dest[BLOSC_EXTENDED_HEADER_LENGTH..cbytes].copy_from_slice(value);
+        }
+        return cbytes as i32;
     }
     let min_dest = BLOSC_EXTENDED_HEADER_LENGTH
         + if special_type == BLOSC2_SPECIAL_VALUE {
@@ -5171,14 +5290,11 @@ pub(crate) fn vldecompress_block_with_params(
         return Err("Chunk does not use VL-blocks");
     }
     validate_vl_layout(chunk, &header)?;
-
-    #[cfg(feature = "_ffi")]
-    if ffi_zstd_dict_chunk(&header) && dparams.postfilter.is_none() {
-        if let Ok(block) = vldecompress_block_with_c_blosc2(chunk, &header, nblock, dparams) {
-            return Ok(block);
-        }
+    let nblocks = header.blocksize as usize;
+    let maskout = validated_block_maskout(dparams, nblocks)?;
+    if nblock >= nblocks {
+        return Err("VL-block index out of range");
     }
-
     let span = vl_block_span(chunk, &header, nblock)?;
     if span.len() < 4 {
         return Err("VL-block span too small");
@@ -5188,6 +5304,20 @@ pub(crate) fn vldecompress_block_with_params(
         return Err("Invalid VL-block uncompressed size");
     }
     let bsize = bsize_i32 as usize;
+    if block_is_masked(maskout, nblock) {
+        // C allocates the full VL block and leaves masked contents
+        // indeterminate. Safe Rust returns deterministic zero bytes, while
+        // preserving the C-visible block size.
+        return Ok(vec![0; bsize]);
+    }
+
+    #[cfg(feature = "_ffi")]
+    if ffi_zstd_dict_chunk(&header) && dparams.postfilter.is_none() {
+        if let Ok(block) = vldecompress_block_with_c_blosc2(chunk, &header, nblock, dparams) {
+            return Ok(block);
+        }
+    }
+
     let payload = &span[4..];
     let typesize = header.typesize as usize;
     let dict = embedded_dictionary(chunk, &header)?;
@@ -5297,6 +5427,7 @@ fn vldecompress_with_params(chunk: &[u8], dparams: &DParams) -> Result<Vec<Vec<u
     }
 
     let nblocks = header.blocksize as usize;
+    validated_block_maskout(dparams, nblocks)?;
     (0..nblocks)
         .map(|nblock| vldecompress_block_with_params(chunk, nblock, dparams))
         .collect()
@@ -5995,6 +6126,38 @@ fn checked_c_chunk_src_len(srcsize: i32, available: usize) -> Result<usize, i32>
     Ok(srcsize)
 }
 
+fn checked_c_declared_chunk(src: &[u8], srcsize: i32) -> Result<&[u8], i32> {
+    if srcsize < 0 {
+        return Err(BLOSC2_ERROR_READ_BUFFER);
+    }
+    let declared = srcsize as usize;
+    if declared < BLOSC_MIN_HEADER_LENGTH {
+        return Err(BLOSC2_ERROR_READ_BUFFER);
+    }
+    let minimal = match ChunkHeader::read_minimal(src) {
+        Ok(header) => header,
+        Err(err) => return Err(cbuffer_header_error_code(err)),
+    };
+    if minimal.is_extended() && declared < BLOSC_EXTENDED_HEADER_LENGTH {
+        return Err(BLOSC2_ERROR_READ_BUFFER);
+    }
+    let header = match ChunkHeader::read(src) {
+        Ok(header) => header,
+        Err(err) => return Err(cbuffer_header_error_code(err)),
+    };
+    if header.cbytes < BLOSC_MIN_HEADER_LENGTH as i32 {
+        return Err(BLOSC2_ERROR_INVALID_HEADER);
+    }
+    let cbytes = header.cbytes as usize;
+    if cbytes > declared {
+        return Err(BLOSC2_ERROR_INVALID_HEADER);
+    }
+    if cbytes > src.len() {
+        return Err(BLOSC2_ERROR_READ_BUFFER);
+    }
+    Ok(&src[..cbytes])
+}
+
 /// C-style compression adapter: returns bytes written, or a negative
 /// `BLOSC2_ERROR_*` code on failure.
 pub fn blosc1_compress_c(
@@ -6055,18 +6218,18 @@ pub fn blosc1_decompress_c(src: &[u8], dest: &mut [u8]) -> i32 {
 
 /// C-style non-context Blosc2 decompression adapter with explicit buffer sizes.
 pub fn blosc2_decompress(src: &[u8], srcsize: i32, dest: &mut [u8], destsize: i32) -> i32 {
-    let srcsize = match checked_c_chunk_src_len(srcsize, src.len()) {
-        Ok(size) => size,
+    let chunk = match checked_c_declared_chunk(src, srcsize) {
+        Ok(chunk) => chunk,
         Err(code) => return code,
     };
     if destsize < 0 {
-        return BLOSC2_ERROR_INVALID_PARAM;
+        return BLOSC2_ERROR_WRITE_BUFFER;
     }
     let destsize = match checked_c_buffer_len(destsize, dest.len()) {
         Ok(size) => size,
         Err(code) => return code,
     };
-    result_len_to_c(blosc1_decompress(&src[..srcsize], &mut dest[..destsize]))
+    result_len_to_c(blosc1_decompress(chunk, &mut dest[..destsize]))
 }
 
 /// C-style chunk validation adapter: returns `BLOSC2_ERROR_SUCCESS` on success,
@@ -6100,6 +6263,11 @@ pub fn getitem_c(chunk: &[u8], start: i32, nitems: i32, dest: &mut [u8]) -> i32 
             return BLOSC2_ERROR_WRITE_BUFFER;
         }
     }
+    match getitem_special_uninit_len_c(chunk, start as usize, nitems as usize) {
+        Ok(Some(len)) => return usize_to_c_return(len),
+        Ok(None) => {}
+        Err(err) => return blosc2_error_code(err),
+    }
     match getitem(chunk, start as usize, nitems as usize) {
         Ok(items) => {
             if dest.len() < items.len() {
@@ -6117,19 +6285,54 @@ fn getitem_zero_items_c(chunk: &[u8]) -> i32 {
         Ok(header) => header,
         Err(err) => return cbuffer_header_error_code(err),
     };
-    if let Err(err) = validate_header(&header, chunk.len()) {
-        return cbuffer_header_error_code(err);
-    }
     if header.vl_blocks() {
         return blosc2_error_code("getitem is not supported for VL-block chunks");
     }
     0
 }
 
+fn checked_getitem_c_header(chunk: &[u8]) -> Result<(), i32> {
+    let header = ChunkHeader::read(chunk).map_err(cbuffer_header_error_code)?;
+    if header.vl_blocks() {
+        return Err(blosc2_error_code(
+            "getitem is not supported for VL-block chunks",
+        ));
+    }
+    Ok(())
+}
+
 fn getitem_required_dest_len(chunk: &[u8], nitems: usize) -> Option<usize> {
     let header = ChunkHeader::read_minimal(chunk).ok()?;
     validate_minimal_header(&header).ok()?;
     (header.typesize as usize).checked_mul(nitems)
+}
+
+fn getitem_special_uninit_len_c(
+    chunk: &[u8],
+    start: usize,
+    nitems: usize,
+) -> Result<Option<usize>, &'static str> {
+    let header = normalize_header_for_regular_decompression(ChunkHeader::read(chunk)?);
+    validate_header(&header, chunk.len())?;
+    if header.vl_blocks() {
+        return Err("getitem is not supported for VL-block chunks");
+    }
+    if header.special_type() != BLOSC2_SPECIAL_UNINIT {
+        return Ok(None);
+    }
+    let typesize = header.typesize as usize;
+    if typesize == 0 {
+        return Err("Invalid typesize");
+    }
+    let byte_start = start.checked_mul(typesize).ok_or("Item range overflow")?;
+    let byte_len = nitems.checked_mul(typesize).ok_or("Item range overflow")?;
+    let byte_end = byte_start
+        .checked_add(byte_len)
+        .ok_or("Item range overflow")?;
+    if byte_end > header.nbytes as usize {
+        return Err("Item range out of bounds");
+    }
+    Ok(Some(byte_len))
 }
 
 /// C-style `blosc2_getitem` adapter with explicit source and destination sizes.
@@ -6141,29 +6344,35 @@ pub fn blosc2_getitem_c(
     dest: &mut [u8],
     destsize: i32,
 ) -> i32 {
-    if destsize < 0 || nitems < 0 {
+    if nitems < 0 {
         return BLOSC2_ERROR_INVALID_PARAM;
     }
-    let srcsize = match checked_c_chunk_src_len(srcsize, chunk.len()) {
-        Ok(size) => size,
+    let chunk = match checked_c_declared_chunk(chunk, srcsize) {
+        Ok(chunk) => chunk,
         Err(code) => return code,
     };
+    if let Err(code) = checked_getitem_c_header(chunk) {
+        return code;
+    }
+    if nitems == 0 {
+        return 0;
+    }
+    if destsize < 0 {
+        return BLOSC2_ERROR_WRITE_BUFFER;
+    }
     let destsize = destsize as usize;
     if destsize > dest.len() {
         return BLOSC2_ERROR_INVALID_PARAM;
     }
-    if nitems == 0 {
-        return getitem_zero_items_c(&chunk[..srcsize]);
-    }
-    if start < 0 {
-        return BLOSC2_ERROR_INVALID_PARAM;
-    }
-    if let Some(required) = getitem_required_dest_len(&chunk[..srcsize], nitems as usize) {
+    if let Some(required) = getitem_required_dest_len(chunk, nitems as usize) {
         if destsize < required {
             return BLOSC2_ERROR_WRITE_BUFFER;
         }
     }
-    getitem_c(&chunk[..srcsize], start, nitems, &mut dest[..destsize])
+    if start < 0 {
+        return BLOSC2_ERROR_INVALID_PARAM;
+    }
+    getitem_c(chunk, start, nitems, &mut dest[..destsize])
 }
 
 /// C-style `blosc2_getitem_ctx` adapter with explicit source and destination sizes.
@@ -6176,30 +6385,41 @@ pub fn blosc2_getitem_ctx_c(
     dest: &mut [u8],
     destsize: i32,
 ) -> i32 {
-    if destsize < 0 || nitems < 0 {
+    if nitems < 0 {
         return BLOSC2_ERROR_INVALID_PARAM;
     }
-    let srcsize = match checked_c_chunk_src_len(srcsize, chunk.len()) {
-        Ok(size) => size,
+    let chunk = match checked_c_declared_chunk(chunk, srcsize) {
+        Ok(chunk) => chunk,
         Err(code) => return code,
     };
+    if let Err(code) = checked_getitem_c_header(chunk) {
+        return code;
+    }
+    if nitems == 0 {
+        return 0;
+    }
+    if destsize < 0 {
+        return BLOSC2_ERROR_WRITE_BUFFER;
+    }
     let destsize = destsize as usize;
     if destsize > dest.len() {
         return BLOSC2_ERROR_INVALID_PARAM;
     }
-    if nitems == 0 {
-        return getitem_zero_items_c(&chunk[..srcsize]);
-    }
-    if start < 0 {
-        return BLOSC2_ERROR_INVALID_PARAM;
-    }
-    if let Some(required) = getitem_required_dest_len(&chunk[..srcsize], nitems as usize) {
+    if let Some(required) = getitem_required_dest_len(chunk, nitems as usize) {
         if destsize < required {
             return BLOSC2_ERROR_WRITE_BUFFER;
         }
     }
+    if start < 0 {
+        return BLOSC2_ERROR_INVALID_PARAM;
+    }
+    match getitem_special_uninit_len_c(chunk, start as usize, nitems as usize) {
+        Ok(Some(len)) => return usize_to_c_return(len),
+        Ok(None) => {}
+        Err(err) => return blosc2_error_code(err),
+    }
     result_len_to_c(dctx.getitem_into(
-        &chunk[..srcsize],
+        chunk,
         start as usize,
         nitems as usize,
         &mut dest[..destsize],
@@ -6364,13 +6584,25 @@ fn decompress_into_with_header(
     }
 
     if header.vl_blocks() {
-        if dparams.block_maskout.is_some() {
-            return Err("Maskout is not supported for VL-block chunks");
-        }
-        let blocks = vldecompress_with_params(chunk, dparams)?;
+        let nblocks = header.blocksize as usize;
+        let maskout = validated_block_maskout(dparams, nblocks)?;
         let mut output_len = 0usize;
-        for block in blocks {
-            let end = output_len + block.len();
+        for nblock in 0..nblocks {
+            let bsize = vl_block_uncompressed_size(chunk, nblock)?;
+            let end = output_len
+                .checked_add(bsize)
+                .ok_or("VL-block sizes do not add up to chunk nbytes")?;
+            if end > nbytes {
+                return Err("VL-block sizes do not add up to chunk nbytes");
+            }
+            if block_is_masked(maskout, nblock) {
+                output_len = end;
+                continue;
+            }
+            let block = vldecompress_block_with_params(chunk, nblock, dparams)?;
+            if block.len() != bsize {
+                return Err("VL-block sizes do not add up to chunk nbytes");
+            }
             dest[output_len..end].copy_from_slice(&block);
             output_len = end;
         }
@@ -7186,6 +7418,22 @@ mod tests {
             getitem_c(&vlchunk, 0, 0, &mut zero_dest),
             BLOSC2_ERROR_INVALID_PARAM
         );
+        assert_eq!(
+            blosc2_getitem_c(&vlchunk, vlchunk.len() as i32, 0, 0, &mut zero_dest, -1),
+            BLOSC2_ERROR_INVALID_PARAM
+        );
+        assert_eq!(
+            blosc2_getitem_ctx_c(
+                &dctx,
+                &vlchunk,
+                vlchunk.len() as i32,
+                0,
+                1,
+                &mut zero_dest,
+                -1
+            ),
+            BLOSC2_ERROR_INVALID_PARAM
+        );
 
         let mut truncated = compressed.clone();
         truncated.truncate(truncated.len() - 1);
@@ -7339,7 +7587,7 @@ mod tests {
         );
         assert_eq!(
             blosc2_decompress(&compressed2, csize2, &mut restored2, -1),
-            BLOSC2_ERROR_INVALID_PARAM
+            BLOSC2_ERROR_WRITE_BUFFER
         );
         assert_eq!(cbuffer_validate_c(chunk), BLOSC2_ERROR_SUCCESS);
         let strict_chunk = compress(
@@ -7435,6 +7683,17 @@ mod tests {
             ),
             BLOSC2_ERROR_WRITE_BUFFER
         );
+        assert_eq!(
+            blosc2_getitem_c(
+                chunk,
+                chunk.len() as i32,
+                -1,
+                8,
+                &mut items,
+                item_destsize - 1
+            ),
+            BLOSC2_ERROR_WRITE_BUFFER
+        );
 
         let dctx = DContext::new(DParams::default());
         items.fill(0);
@@ -7451,6 +7710,18 @@ mod tests {
             item_destsize
         );
         assert_eq!(items, data[10 * 4..18 * 4]);
+        assert_eq!(
+            blosc2_getitem_ctx_c(
+                &dctx,
+                chunk,
+                chunk.len() as i32,
+                -1,
+                8,
+                &mut items,
+                item_destsize - 1,
+            ),
+            BLOSC2_ERROR_WRITE_BUFFER
+        );
 
         let mut short_items = vec![0u8; items.len() - 1];
         assert_eq!(
@@ -7475,6 +7746,40 @@ mod tests {
             getitem_c(chunk, 10_000, 1, &mut too_short_for_oob),
             BLOSC2_ERROR_WRITE_BUFFER
         );
+
+        let uninit = blosc2_chunk_uninit(data.len(), 4).unwrap();
+        let mut uninit_items = vec![0xA5; 8 * 4];
+        let uninit_items_len = uninit_items.len() as i32;
+        assert_eq!(
+            getitem_c(&uninit, 10, 8, &mut uninit_items),
+            uninit_items_len
+        );
+        assert_eq!(uninit_items, vec![0xA5; 8 * 4]);
+        assert_eq!(
+            blosc2_getitem_c(
+                &uninit,
+                uninit.len() as i32,
+                10,
+                8,
+                &mut uninit_items,
+                item_destsize,
+            ),
+            item_destsize
+        );
+        assert_eq!(uninit_items, vec![0xA5; 8 * 4]);
+        assert_eq!(
+            blosc2_getitem_ctx_c(
+                &dctx,
+                &uninit,
+                uninit.len() as i32,
+                10,
+                8,
+                &mut uninit_items,
+                item_destsize,
+            ),
+            item_destsize
+        );
+        assert_eq!(uninit_items, vec![0xA5; 8 * 4]);
 
         let mut truncated = chunk.to_vec();
         truncated.truncate(BLOSC_MIN_HEADER_LENGTH - 1);
@@ -7540,6 +7845,64 @@ mod tests {
         let short = vec![0u8; BLOSC_MIN_HEADER_LENGTH - 1];
 
         assert_eq!(
+            blosc2_decompress(&chunk, i32::MAX, &mut dest, dest_len),
+            dest_len
+        );
+        assert_eq!(dest, data);
+        dest.fill(0);
+        assert_eq!(
+            blosc2_decompress_ctx(&dctx, &chunk, i32::MAX, &mut dest, dest_len),
+            dest_len
+        );
+        assert_eq!(dest, data);
+        item_dest.fill(0);
+        assert_eq!(
+            blosc2_getitem_c(&chunk, i32::MAX, 0, 4, &mut item_dest, item_dest_len),
+            item_dest_len
+        );
+        assert_eq!(item_dest, data[..item_dest.len()]);
+        item_dest.fill(0);
+        assert_eq!(
+            blosc2_getitem_ctx_c(&dctx, &chunk, i32::MAX, 0, 4, &mut item_dest, item_dest_len),
+            item_dest_len
+        );
+        assert_eq!(item_dest, data[..item_dest.len()]);
+        item_dest.fill(0);
+        assert_eq!(blosc1_getitem(&chunk, 0, 4, &mut item_dest), item_dest_len);
+        assert_eq!(item_dest, data[..item_dest.len()]);
+        assert_eq!(
+            blosc2_decompress(&chunk, chunk.len() as i32 - 1, &mut dest, dest_len),
+            BLOSC2_ERROR_INVALID_HEADER
+        );
+        assert_eq!(
+            blosc2_decompress_ctx(&dctx, &chunk, chunk.len() as i32 - 1, &mut dest, dest_len,),
+            BLOSC2_ERROR_INVALID_HEADER
+        );
+        assert_eq!(
+            blosc2_getitem_c(
+                &chunk,
+                chunk.len() as i32 - 1,
+                0,
+                4,
+                &mut item_dest,
+                item_dest_len,
+            ),
+            BLOSC2_ERROR_INVALID_HEADER
+        );
+        assert_eq!(
+            blosc2_getitem_ctx_c(
+                &dctx,
+                &chunk,
+                chunk.len() as i32 - 1,
+                0,
+                4,
+                &mut item_dest,
+                item_dest_len,
+            ),
+            BLOSC2_ERROR_INVALID_HEADER
+        );
+
+        assert_eq!(
             blosc2_decompress(&chunk, -1, &mut dest, dest_len),
             BLOSC2_ERROR_READ_BUFFER
         );
@@ -7549,7 +7912,7 @@ mod tests {
         );
         assert_eq!(
             blosc2_decompress(&short, BLOSC_MIN_HEADER_LENGTH as i32, &mut dest, dest_len),
-            BLOSC2_ERROR_INVALID_PARAM
+            BLOSC2_ERROR_READ_BUFFER
         );
         assert_eq!(
             blosc2_decompress_ctx(&dctx, &short, short.len() as i32, &mut dest, dest_len),
@@ -7563,11 +7926,15 @@ mod tests {
                 &mut dest,
                 dest_len,
             ),
-            BLOSC2_ERROR_INVALID_PARAM
+            BLOSC2_ERROR_READ_BUFFER
         );
         assert_eq!(
             blosc2_decompress(&chunk, chunk.len() as i32, &mut dest, -1),
-            BLOSC2_ERROR_INVALID_PARAM
+            BLOSC2_ERROR_WRITE_BUFFER
+        );
+        assert_eq!(
+            blosc2_decompress_ctx(&dctx, &chunk, chunk.len() as i32, &mut dest, -1),
+            BLOSC2_ERROR_WRITE_BUFFER
         );
 
         assert_eq!(
@@ -7594,7 +7961,7 @@ mod tests {
                 &mut item_dest,
                 item_dest_len,
             ),
-            BLOSC2_ERROR_INVALID_PARAM
+            BLOSC2_ERROR_READ_BUFFER
         );
         assert_eq!(
             blosc2_getitem_c(
@@ -7620,7 +7987,19 @@ mod tests {
         );
         assert_eq!(
             blosc2_getitem_c(&chunk, chunk.len() as i32, 0, 1, &mut item_dest, -1),
-            BLOSC2_ERROR_INVALID_PARAM
+            BLOSC2_ERROR_WRITE_BUFFER
+        );
+        assert_eq!(
+            blosc2_getitem_c(&chunk, chunk.len() as i32, 0, 0, &mut item_dest, -1),
+            0
+        );
+        assert_eq!(
+            blosc2_getitem_ctx_c(&dctx, &chunk, chunk.len() as i32, 0, 1, &mut item_dest, -1),
+            BLOSC2_ERROR_WRITE_BUFFER
+        );
+        assert_eq!(
+            blosc2_getitem_ctx_c(&dctx, &chunk, chunk.len() as i32, 0, 0, &mut item_dest, -1),
+            0
         );
 
         assert_eq!(
@@ -7645,7 +8024,7 @@ mod tests {
                 &mut item_dest,
                 item_dest_len,
             ),
-            BLOSC2_ERROR_INVALID_PARAM
+            BLOSC2_ERROR_READ_BUFFER
         );
 
         assert_eq!(
@@ -7663,6 +8042,95 @@ mod tests {
 
         let mut blocks = vec![Vec::new()];
         let mut block_sizes = vec![0i32];
+        let vl_input: [&[u8]; 2] = [b"alpha", b"bravo-bravo"];
+        let vlchunk = vlcompress(
+            &vl_input,
+            &CParams {
+                compcode: BLOSC_LZ4,
+                clevel: 5,
+                typesize: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut vl_blocks = vec![Vec::new(), Vec::new()];
+        let mut vl_block_sizes = vec![0i32; 2];
+        assert_eq!(
+            blosc2_vldecompress_ctx(&dctx, &vlchunk, i32::MAX).0,
+            vl_input.len() as i32
+        );
+        assert_eq!(
+            blosc2_vldecompress_ctx_c(
+                &dctx,
+                &vlchunk,
+                i32::MAX,
+                &mut vl_blocks,
+                &mut vl_block_sizes,
+                vl_input.len() as i32,
+            ),
+            vl_input.len() as i32
+        );
+        assert_eq!(vl_blocks, vec![b"alpha".to_vec(), b"bravo-bravo".to_vec()]);
+        assert_eq!(vl_block_sizes, vec![5, 11]);
+        assert_eq!(
+            blosc2_vldecompress_block_ctx(&dctx, &vlchunk, i32::MAX, 1),
+            (b"bravo-bravo".len() as i32, Some(b"bravo-bravo".to_vec()))
+        );
+        item_dest.fill(0);
+        assert_eq!(
+            blosc2_vldecompress_block_ctx_c(
+                &dctx,
+                &vlchunk,
+                i32::MAX,
+                1,
+                &mut item_dest,
+                item_dest_len,
+            ),
+            b"bravo-bravo".len() as i32
+        );
+        assert_eq!(&item_dest[..b"bravo-bravo".len()], b"bravo-bravo");
+        assert_eq!(
+            blosc2_vldecompress_ctx(&dctx, &vlchunk, vlchunk.len() as i32 - 1).0,
+            BLOSC2_ERROR_INVALID_HEADER
+        );
+        assert_eq!(
+            blosc2_vldecompress_ctx_c(
+                &dctx,
+                &vlchunk,
+                vlchunk.len() as i32 - 1,
+                &mut vl_blocks,
+                &mut vl_block_sizes,
+                vl_input.len() as i32,
+            ),
+            BLOSC2_ERROR_INVALID_HEADER
+        );
+        assert_eq!(
+            blosc2_vldecompress_block_ctx(&dctx, &vlchunk, vlchunk.len() as i32 - 1, 1).0,
+            BLOSC2_ERROR_INVALID_HEADER
+        );
+        assert_eq!(
+            blosc2_vldecompress_block_ctx_c(
+                &dctx,
+                &vlchunk,
+                vlchunk.len() as i32 - 1,
+                1,
+                &mut item_dest,
+                item_dest_len,
+            ),
+            BLOSC2_ERROR_INVALID_HEADER
+        );
+
+        assert_eq!(
+            blosc2_vldecompress_ctx_c(
+                &dctx,
+                &short,
+                short.len() as i32,
+                &mut blocks,
+                &mut block_sizes,
+                0,
+            ),
+            BLOSC2_ERROR_INVALID_PARAM
+        );
         assert_eq!(
             blosc2_vldecompress_ctx(&dctx, &short, short.len() as i32).0,
             BLOSC2_ERROR_READ_BUFFER
@@ -7679,7 +8147,7 @@ mod tests {
             BLOSC2_ERROR_READ_BUFFER
         );
         assert_eq!(
-            blosc2_vldecompress_block_ctx(&dctx, &short, short.len() as i32, 0, &mut item_dest),
+            blosc2_vldecompress_block_ctx(&dctx, &short, short.len() as i32, 0).0,
             BLOSC2_ERROR_READ_BUFFER
         );
         assert_eq!(
@@ -7941,8 +8409,19 @@ mod tests {
             blosc2_compcode_to_compname_int_c(BLOSC_ZSTD as i32),
             (BLOSC_ZSTD as i32, Some("zstd"))
         );
+        codecs::register_named_codec(
+            210,
+            "int-codec-lookup-user-codec",
+            sequence_codec_compress,
+            sequence_codec_decompress,
+        )
+        .unwrap();
+        assert_eq!(
+            blosc2_compcode_to_compname_int_c(210),
+            (210, Some("int-codec-lookup-user-codec"))
+        );
         assert_eq!(blosc2_compcode_to_compname_int_c(-1), (-1, None));
-        assert_eq!(blosc2_compcode_to_compname_int_c(256), (256, None));
+        assert_eq!(blosc2_compcode_to_compname_int_c(256), (-1, None));
         assert_eq!(blosc2_get_version_string(), "3.0.0.dev");
         assert!(blosc1_set_compressor("LZ4").is_err());
         assert_eq!(blosc1_get_compressor_code(), 255);
@@ -8448,18 +8927,11 @@ mod tests {
             dctx.vldecompress_block(&vlchunk, 1).unwrap(),
             b"second-block"
         );
-        let mut block_dest = vec![0u8; 16];
         assert_eq!(
-            blosc2_vldecompress_block_ctx(
-                &dctx_c,
-                &vlchunk,
-                vlchunk.len() as i32,
-                1,
-                &mut block_dest
-            ),
-            b"second-block".len() as i32
+            blosc2_vldecompress_block_ctx(&dctx_c, &vlchunk, vlchunk.len() as i32, 1),
+            (b"second-block".len() as i32, Some(b"second-block".to_vec()))
         );
-        assert_eq!(&block_dest[..b"second-block".len()], b"second-block");
+        let mut block_dest = vec![0u8; 16];
         block_dest.fill(0);
         let block_dest_len = block_dest.len() as i32;
         assert_eq!(
@@ -8508,10 +8980,7 @@ mod tests {
             BLOSC2_ERROR_WRITE_BUFFER
         );
         assert!(blosc2_vldecompress_ctx(&dctx_c, &chunk, chunk.len() as i32).0 < 0);
-        assert!(
-            blosc2_vldecompress_block_ctx(&dctx_c, &chunk, chunk.len() as i32, 0, &mut block_dest)
-                < 0
-        );
+        assert!(blosc2_vldecompress_block_ctx(&dctx_c, &chunk, chunk.len() as i32, 0).0 < 0);
         blosc2_free_ctx(cctx_c);
         blosc2_free_ctx(dctx_c);
         blosc2_set_delta_enabled(prev_delta);
@@ -8647,6 +9116,54 @@ mod tests {
     }
 
     #[test]
+    fn test_blosc2_decompress_ctx_consumes_maskout_on_error_returns() {
+        let data: Vec<u8> = (0..512u32).map(|i| (i & 0xff) as u8).collect();
+        let chunk = compress(
+            &data,
+            &CParams {
+                compcode: BLOSC_LZ4,
+                clevel: 5,
+                typesize: 1,
+                blocksize: 128,
+                splitmode: BLOSC_NEVER_SPLIT,
+                filters: [0; BLOSC2_MAX_FILTERS],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let dctx = DContext::new(DParams::default());
+        let mut dest = vec![0xA5; data.len()];
+        let dest_len = dest.len() as i32;
+
+        dctx.set_maskout(&[true, false, false, false]).unwrap();
+        assert_eq!(
+            blosc2_decompress_ctx(&dctx, &chunk, -1, &mut dest, dest_len),
+            BLOSC2_ERROR_READ_BUFFER
+        );
+        assert!(dctx.dparams().block_maskout.is_none());
+
+        dctx.set_maskout(&[true, false, false, false]).unwrap();
+        assert_eq!(
+            blosc2_decompress_ctx(&dctx, &chunk, chunk.len() as i32, &mut dest, -1),
+            BLOSC2_ERROR_WRITE_BUFFER
+        );
+        assert!(dctx.dparams().block_maskout.is_none());
+
+        dctx.set_maskout(&[true, false, false, false]).unwrap();
+        assert_eq!(
+            blosc2_decompress_ctx(&dctx, &chunk, chunk.len() as i32, &mut dest, dest_len + 1,),
+            BLOSC2_ERROR_INVALID_PARAM
+        );
+        assert!(dctx.dparams().block_maskout.is_none());
+
+        assert_eq!(
+            blosc2_decompress_ctx(&dctx, &chunk, chunk.len() as i32, &mut dest, dest_len),
+            dest_len
+        );
+        assert_eq!(dest, data);
+    }
+
+    #[test]
     fn test_maskout_direct_params_serial_parallel_special_and_memcpy() {
         let data: Vec<u8> = (0..512u32).map(|i| (i & 0xff) as u8).collect();
         let maskout = vec![false, true, false, true];
@@ -8748,7 +9265,7 @@ mod tests {
     }
 
     #[test]
-    fn test_maskout_rejects_wrong_length_and_vlblocks() {
+    fn test_maskout_rejects_wrong_length() {
         let data: Vec<u8> = (0..512u32).map(|i| (i & 0xff) as u8).collect();
         let chunk = compress(
             &data,
@@ -8776,17 +9293,10 @@ mod tests {
             blosc2_error_code("Maskout length must match the number of blocks"),
             BLOSC2_ERROR_DATA
         );
-
-        let blocks: [&[u8]; 2] = [b"alpha", b"beta"];
-        let vlchunk = vlcompress(&blocks, &CParams::default()).unwrap();
-        assert_eq!(
-            decompress_with_dparams(&vlchunk, &dparams),
-            Err("Maskout is not supported for VL-block chunks")
-        );
     }
 
     #[test]
-    fn test_vl_context_calls_consume_maskout_state() {
+    fn test_vl_context_calls_honor_maskout_without_consuming_state() {
         let data: Vec<u8> = (0..128u32).map(|i| (i & 0xff) as u8).collect();
         let regular = compress(
             &data,
@@ -8803,43 +9313,145 @@ mod tests {
         .unwrap();
         let blocks: [&[u8]; 2] = [b"alpha-block", b"beta-block"];
         let vlchunk = vlcompress(&blocks, &CParams::default()).unwrap();
+        let vl_dparams = DParams {
+            block_maskout: Some(vec![true, false]),
+            ..Default::default()
+        };
+        let mut vl_dest = vec![0xA5; b"alpha-block".len() + b"beta-block".len()];
+        let vl_dest_len = vl_dest.len();
+        assert_eq!(
+            decompress_into_with_dparams(&vlchunk, &mut vl_dest, &vl_dparams).unwrap(),
+            vl_dest_len
+        );
+        assert_eq!(&vl_dest[..b"alpha-block".len()], &[0xA5; 11]);
+        assert_eq!(&vl_dest[b"alpha-block".len()..], b"beta-block");
+        let vl_allocated = decompress_with_dparams(&vlchunk, &vl_dparams).unwrap();
+        assert_eq!(&vl_allocated[..b"alpha-block".len()], &[0; 11]);
+        assert_eq!(&vl_allocated[b"alpha-block".len()..], b"beta-block");
 
         let dctx = DContext::new(DParams::default());
-        dctx.set_maskout(&[true]).unwrap();
+        dctx.set_maskout(&[true, false]).unwrap();
         assert_eq!(
-            dctx.vldecompress(&vlchunk),
-            Err("Maskout is not supported for VL-block chunks")
+            dctx.vldecompress(&vlchunk).unwrap(),
+            vec![vec![0; b"alpha-block".len()], b"beta-block".to_vec()]
         );
-        assert!(dctx.dparams().block_maskout.is_none());
+        assert_eq!(dctx.dparams().block_maskout, Some(vec![true, false]));
+        dctx.set_maskout(&[false]).unwrap();
         assert_eq!(dctx.decompress(&regular).unwrap(), data);
-
-        dctx.set_maskout(&[true]).unwrap();
-        assert_eq!(
-            dctx.vldecompress_block(&vlchunk, 0),
-            Err("Maskout is not supported for VL-block chunks")
-        );
         assert!(dctx.dparams().block_maskout.is_none());
 
-        dctx.set_maskout(&[true]).unwrap();
+        dctx.set_maskout(&[true, false]).unwrap();
+        assert_eq!(
+            dctx.vldecompress_block(&vlchunk, 0).unwrap(),
+            vec![0; b"alpha-block".len()]
+        );
+        assert_eq!(dctx.dparams().block_maskout, Some(vec![true, false]));
+
         assert_eq!(
             blosc2_vldecompress_ctx(&dctx, &vlchunk, vlchunk.len() as i32).0,
-            BLOSC2_ERROR_DATA
+            2
         );
-        assert!(dctx.dparams().block_maskout.is_none());
+        assert_eq!(dctx.dparams().block_maskout, Some(vec![true, false]));
 
-        dctx.set_maskout(&[true]).unwrap();
-        let mut short_dest = vec![0u8; 1];
         assert_eq!(
-            blosc2_vldecompress_block_ctx(
+            blosc2_vldecompress_block_ctx(&dctx, &vlchunk, vlchunk.len() as i32, 0,),
+            (
+                b"alpha-block".len() as i32,
+                Some(vec![0; b"alpha-block".len()])
+            )
+        );
+        assert_eq!(dctx.dparams().block_maskout, Some(vec![true, false]));
+
+        let mut block_dest = vec![0xA5; b"alpha-block".len()];
+        assert_eq!(
+            blosc2_vldecompress_block_ctx_into(
                 &dctx,
                 &vlchunk,
                 vlchunk.len() as i32,
                 0,
-                &mut short_dest,
+                &mut block_dest,
             ),
-            BLOSC2_ERROR_DATA
+            b"alpha-block".len() as i32
         );
-        assert!(dctx.dparams().block_maskout.is_none());
+        assert_eq!(block_dest, vec![0xA5; b"alpha-block".len()]);
+
+        let mut blocks_out = vec![b"keep-alpha".to_vec(), b"keep-beta".to_vec()];
+        let mut block_sizes = vec![111, 222];
+        assert_eq!(
+            blosc2_vldecompress_ctx_c(
+                &dctx,
+                &vlchunk,
+                vlchunk.len() as i32,
+                &mut blocks_out,
+                &mut block_sizes,
+                2,
+            ),
+            2
+        );
+        assert_eq!(blocks_out[0], vec![0; b"alpha-block".len()]);
+        assert_eq!(block_sizes[0], b"alpha-block".len() as i32);
+        assert_eq!(blocks_out[1], b"beta-block".to_vec());
+        assert_eq!(block_sizes[1], b"beta-block".len() as i32);
+        assert_eq!(dctx.dparams().block_maskout, Some(vec![true, false]));
+    }
+
+    #[test]
+    fn test_masked_vl_decompress_returns_full_block_sizes() {
+        let blocks: [&[u8]; 3] = [b"a", b"masked-variable-block", b"tail"];
+        let vlchunk = vlcompress(
+            &blocks,
+            &CParams {
+                compcode: BLOSC_LZ4,
+                clevel: 5,
+                typesize: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let dparams = DParams {
+            block_maskout: Some(vec![false, true, false]),
+            ..Default::default()
+        };
+
+        let decoded = vldecompress_with_params(&vlchunk, &dparams).unwrap();
+        assert_eq!(
+            decoded.iter().map(Vec::len).collect::<Vec<_>>(),
+            blocks.iter().map(|block| block.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(decoded[1], vec![0; blocks[1].len()]);
+        assert_eq!(
+            vldecompress_block_with_params(&vlchunk, 1, &dparams).unwrap(),
+            vec![0; blocks[1].len()]
+        );
+
+        let dctx = DContext::new(dparams);
+        let (count, ctx_blocks) = blosc2_vldecompress_ctx(&dctx, &vlchunk, vlchunk.len() as i32);
+        assert_eq!(count, blocks.len() as i32);
+        let ctx_blocks = ctx_blocks.unwrap();
+        assert_eq!(ctx_blocks[1].len(), blocks[1].len());
+        assert_eq!(ctx_blocks[1], vec![0; blocks[1].len()]);
+
+        let mut blocks_out = vec![Vec::new(), Vec::new(), Vec::new()];
+        let mut block_sizes = vec![0; 3];
+        assert_eq!(
+            blosc2_vldecompress_ctx_c(
+                &dctx,
+                &vlchunk,
+                vlchunk.len() as i32,
+                &mut blocks_out,
+                &mut block_sizes,
+                3,
+            ),
+            3
+        );
+        assert_eq!(
+            block_sizes,
+            blocks
+                .iter()
+                .map(|block| block.len() as i32)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(blocks_out[1], vec![0; blocks[1].len()]);
     }
 
     #[test]
@@ -9184,6 +9796,9 @@ mod tests {
         );
         assert_eq!(blosc1_set_compressor_c("missing-codec"), -1);
         assert_eq!(blosc1_get_compressor_code(), 255);
+        assert_eq!(blosc1_get_compressor(), None);
+        assert_eq!(blosc_get_compressor(), None);
+        assert_eq!(blosc1_get_compressor_or_unknown(), "unknown");
         blosc1_set_compressor_code(prev);
     }
 
@@ -9193,7 +9808,8 @@ mod tests {
         let prev = blosc1_get_compressor_code();
         let selected = blosc1_set_compressor("lz4").unwrap();
         assert_eq!(selected, BLOSC_LZ4);
-        assert_eq!(blosc1_get_compressor(), "lz4");
+        assert_eq!(blosc1_get_compressor(), Some("lz4"));
+        assert_eq!(blosc1_get_compressor_or_unknown(), "lz4");
         blosc1_set_compressor_code(prev);
     }
 
@@ -9877,7 +10493,7 @@ mod tests {
 
         let compressor0 = blosc1_get_compressor_code();
         assert_eq!(blosc_set_compressor("lz4"), BLOSC_LZ4 as i32);
-        assert_eq!(blosc_get_compressor(), "lz4");
+        assert_eq!(blosc_get_compressor(), Some("lz4"));
         assert_eq!(blosc_compname_to_compcode("zstd"), Some(BLOSC_ZSTD));
         assert_eq!(blosc_compcode_to_compname(BLOSC_ZLIB), Some("zlib"));
         assert!(blosc_list_compressors().contains("blosclz"));
@@ -9895,16 +10511,18 @@ mod tests {
         );
         assert_eq!(restored, sample);
 
-        // C applies the attempted nonpositive value through check_nthreads:
-        // a positive-to-zero/negative transition returns the attempted value,
-        // and a later call while the context is already invalid returns an error.
+        // C stores zero from a valid state and returns the previous value.
         let current = blosc2_get_nthreads();
         assert!(current > 0);
-        assert_eq!(blosc2_set_nthreads(0), 0);
+        assert_eq!(blosc2_set_nthreads(1), current);
+        assert_eq!(blosc2_set_nthreads(0), 1);
         assert_eq!(blosc2_get_nthreads(), 0);
+        // Once the simulated context is already invalid, C returns
+        // check_nthreads' invalid-parameter result while still storing the
+        // attempted process-wide value.
         assert_eq!(blosc2_set_nthreads(-1), BLOSC2_ERROR_INVALID_PARAM as i16);
         assert_eq!(blosc2_get_nthreads(), -1);
-        blosc2_set_nthreads(n0);
+        let _ = blosc2_set_nthreads(n0);
 
         let default_cparams = blosc2_get_blosc2_cparams_defaults();
         assert_eq!(default_cparams.compcode, CParams::default().compcode);
@@ -10664,6 +11282,34 @@ mod tests {
             blosc2_chunk_repeatval_c(cparams.clone(), -1, &mut dest, 36, &repeated),
             BLOSC2_ERROR_DATA
         );
+        let negative_uninit_len = blosc2_chunk_uninit_c(cparams.clone(), -4, &mut dest, 32);
+        assert_eq!(negative_uninit_len, BLOSC_EXTENDED_HEADER_LENGTH as i32);
+        let negative_uninit_header =
+            ChunkHeader::read_minimal(&dest[..negative_uninit_len as usize])
+                .expect("negative uninit special header should be written");
+        assert_eq!(negative_uninit_header.nbytes, -4);
+        assert_eq!(dest[BLOSC2_CHUNK_BLOSC2_FLAGS], BLOSC2_SPECIAL_UNINIT << 4);
+        let negative_nan_len = blosc2_chunk_nans_c(cparams.clone(), -4, &mut dest, 32);
+        assert_eq!(negative_nan_len, BLOSC_EXTENDED_HEADER_LENGTH as i32);
+        let negative_nan_header = ChunkHeader::read_minimal(&dest[..negative_nan_len as usize])
+            .expect("negative NaN special header should be written");
+        assert_eq!(negative_nan_header.nbytes, -4);
+        assert_eq!(dest[BLOSC2_CHUNK_BLOSC2_FLAGS], BLOSC2_SPECIAL_NAN << 4);
+        let negative_repeat_len =
+            blosc2_chunk_repeatval_c(cparams.clone(), -4, &mut dest, 36, &repeated);
+        assert_eq!(
+            negative_repeat_len,
+            (BLOSC_EXTENDED_HEADER_LENGTH + repeated.len()) as i32
+        );
+        let negative_repeat_header =
+            ChunkHeader::read_minimal(&dest[..negative_repeat_len as usize])
+                .expect("negative repeat-value special header should be written");
+        assert_eq!(negative_repeat_header.nbytes, -4);
+        assert_eq!(dest[BLOSC2_CHUNK_BLOSC2_FLAGS], BLOSC2_SPECIAL_VALUE << 4);
+        assert_eq!(
+            &dest[BLOSC_EXTENDED_HEADER_LENGTH..negative_repeat_len as usize],
+            repeated
+        );
         assert_eq!(
             blosc2_chunk_repeatval_c(cparams.clone(), 16, &mut dest, 36, &[1, 2]),
             BLOSC2_ERROR_DATA
@@ -11281,6 +11927,7 @@ mod tests {
             compcode: BLOSC_BLOSCLZ,
             compcode_meta: 0,
             clevel: 5,
+            use_dict: false,
             typesize: 1,
             blocksize: 16,
             splitmode: BLOSC_NEVER_SPLIT,
@@ -11289,12 +11936,17 @@ mod tests {
             nthreads: 1,
             nchunk: 11,
             user_data: 0x55,
+            preparams: 0x55,
+            tuner_id: 0,
+            instr_codec: false,
+            codec_params: 0,
         };
         let dparams_context = filters::FilterDParamsContext {
             nthreads: 1,
             typesize: 1,
             nchunk: 12,
             user_data: 0x66,
+            postparams: 0x66,
         };
         let chunk_context = filters::FilterChunkContext {
             schunk: 0,

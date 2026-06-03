@@ -2,7 +2,8 @@
 //!
 //! Provides `compress` and `decompress` subcommands that read and write Blosc2 frame files
 //! (`.b2frame`). Compression parameters (codec, level, type size, block size, split mode,
-//! filter, thread count) are exposed as flags; decompression only needs a thread count.
+//! filter, thread count) are exposed as flags; decompression can optionally override the frame
+//! thread count.
 
 use blosc2_pure_rs::compress::{CParams, DParams};
 use blosc2_pure_rs::constants::*;
@@ -64,9 +65,9 @@ enum Commands {
         input: PathBuf,
         /// Output file path
         output: PathBuf,
-        /// Number of threads
-        #[arg(short, long, default_value_t = 4, value_parser = clap::value_parser!(i16).range(1..))]
-        nthreads: i16,
+        /// Number of threads; defaults to the value stored in the frame
+        #[arg(short, long, value_parser = clap::value_parser!(i16).range(1..))]
+        nthreads: Option<i16>,
     },
 }
 
@@ -156,8 +157,8 @@ fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::R
         frame::write_frame_to_writer(&schunk, &mut writer)?;
         writer.flush()?;
     }
-    let cbytes = frame_equivalent_cbytes(output)?;
     let elapsed = start.elapsed().as_secs_f64();
+    let cbytes = frame_equivalent_cbytes(output)?;
 
     print_compression_stats(nbytes, cbytes, elapsed);
 
@@ -182,10 +183,10 @@ fn read_next_chunk<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize>
 /// the concatenated result directly to `output`. Empty frames produce an empty output file.
 /// Like the C example, mid-stream decompression failures can leave the chunks already written.
 /// Prints ratio and throughput statistics on completion.
-fn decompress_file(input: &Path, output: &Path, nthreads: i16) -> io::Result<()> {
+fn decompress_file(input: &Path, output: &Path, nthreads: Option<i16>) -> io::Result<()> {
     let mut schunk = Schunk::open_offset(input, 0)
         .map_err(|e| io::Error::other(format!("Failed to open frame: {e}")))?;
-    schunk.dparams.nthreads = nthreads;
+    apply_decompression_nthreads_override(&mut schunk, nthreads);
 
     let start = Instant::now();
     write_decompressed_chunks_direct(&schunk, output)?;
@@ -199,12 +200,20 @@ fn decompress_file(input: &Path, output: &Path, nthreads: i16) -> io::Result<()>
     Ok(())
 }
 
+fn apply_decompression_nthreads_override(schunk: &mut Schunk, nthreads: Option<i16>) {
+    if let Some(nthreads) = nthreads {
+        schunk.dparams.nthreads = nthreads;
+    }
+}
+
 fn write_decompressed_chunks_direct(schunk: &Schunk, output: &Path) -> io::Result<()> {
     let mut foutput = File::create(output)?;
     for i in 0..schunk.nchunks() {
         let data = schunk
             .decompress_chunk(i)
             .map_err(|e| io::Error::other(format!("Decompression error: {e}")))?;
+        // Intentional Rust divergence from the C example: C ignores fwrite's result, while the
+        // CLI reports checked write failures instead of silently producing truncated output.
         foutput.write_all(&data)?;
     }
     foutput.flush()?;
@@ -242,9 +251,9 @@ fn c_general_3(value: f64) -> String {
 
     let sign = if value.is_sign_negative() { "-" } else { "" };
     let abs = value.abs();
-    let exponent = abs.log10().floor() as i32;
+    let exponent = rounded_scientific_exponent(abs);
 
-    let mut formatted = if !(-4..3).contains(&exponent) {
+    let mut formatted = if exponent < -4 || exponent >= 3 {
         trim_general_number(format!("{abs:.2e}"))
     } else {
         let decimals = (2 - exponent).max(0) as usize;
@@ -255,6 +264,15 @@ fn c_general_3(value: f64) -> String {
         formatted.insert_str(0, sign);
     }
     formatted
+}
+
+fn rounded_scientific_exponent(abs: f64) -> i32 {
+    let scientific = format!("{abs:.2e}");
+    let exponent = scientific
+        .find(['e', 'E'])
+        .map(|idx| &scientific[idx + 1..])
+        .unwrap_or("0");
+    exponent.parse::<i32>().unwrap_or(0)
 }
 
 fn trim_general_number(mut value: String) -> String {
@@ -389,6 +407,46 @@ mod tests {
     }
 
     #[test]
+    fn decompression_nthreads_override_is_optional() {
+        let mut schunk = Schunk::new(CParams::default(), DParams::default());
+        schunk.dparams.nthreads = 7;
+
+        apply_decompression_nthreads_override(&mut schunk, None);
+        assert_eq!(schunk.dparams.nthreads, 7);
+
+        apply_decompression_nthreads_override(&mut schunk, Some(3));
+        assert_eq!(schunk.dparams.nthreads, 3);
+    }
+
+    #[test]
+    fn decompress_cli_leaves_nthreads_unset_by_default() {
+        let cli = Cli::try_parse_from(["blosc2", "decompress", "in.b2frame", "out.bin"]).unwrap();
+
+        match cli.command {
+            Commands::Decompress { nthreads, .. } => assert_eq!(nthreads, None),
+            _ => panic!("expected decompress command"),
+        }
+    }
+
+    #[test]
+    fn decompress_cli_accepts_explicit_nthreads_override() {
+        let cli = Cli::try_parse_from([
+            "blosc2",
+            "decompress",
+            "in.b2frame",
+            "out.bin",
+            "--nthreads",
+            "3",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Decompress { nthreads, .. } => assert_eq!(nthreads, Some(3)),
+            _ => panic!("expected decompress command"),
+        }
+    }
+
+    #[test]
     fn stats_byte_counts_use_c_float_precision() {
         let (ratio_line, time_line) = compression_stats_lines(16_777_217, 1, 1.0);
 
@@ -404,7 +462,10 @@ mod tests {
         assert_eq!(c_general_3(0.0), "0");
         assert_eq!(c_general_3(0.0185), "0.0185");
         assert_eq!(c_general_3(12.345), "12.3");
+        assert_eq!(c_general_3(999.5), "1e+03");
         assert_eq!(c_general_3(1234.0), "1.23e+03");
+        assert_eq!(c_general_3(0.00009995), "0.0001");
+        assert_eq!(c_general_3(0.00009994), "9.99e-05");
     }
 
     #[test]
@@ -520,7 +581,7 @@ mod tests {
         assert_eq!(schunk.nbytes, 0);
         assert!(schunk.cbytes > 0);
 
-        decompress_file(&output, &restored, 1).unwrap();
+        decompress_file(&output, &restored, Some(1)).unwrap();
         assert_eq!(std::fs::read(restored).unwrap(), b"");
     }
 
@@ -538,7 +599,7 @@ mod tests {
         let schunk = Schunk::open_offset(&output, 0).unwrap();
         assert_eq!(schunk.nbytes, data.len() as i64);
 
-        decompress_file(&output, &restored, 1).unwrap();
+        decompress_file(&output, &restored, Some(1)).unwrap();
         assert_eq!(std::fs::read(restored).unwrap(), data);
     }
 }
@@ -587,9 +648,10 @@ fn main() {
 
     // Set rayon global thread pool based on nthreads from first subcommand
     let nthreads = match &cli.command {
-        Commands::Compress { nthreads, .. } | Commands::Decompress { nthreads, .. } => *nthreads,
+        Commands::Compress { nthreads, .. } => Some(*nthreads),
+        Commands::Decompress { nthreads, .. } => *nthreads,
     };
-    if nthreads > 1 {
+    if let Some(nthreads) = nthreads.filter(|nthreads| *nthreads > 1) {
         rayon::ThreadPoolBuilder::new()
             .num_threads(nthreads as usize)
             .build_global()

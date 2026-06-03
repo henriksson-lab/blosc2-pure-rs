@@ -46,7 +46,13 @@ pub use compress::{
     blosc2_getitem_ctx_c, blosc2_getitem_ctx_c as blosc2_getitem_ctx, blosc2_list_compressors,
     blosc2_set_delta, blosc2_set_maskout, blosc2_set_nthreads, blosc2_vlchunk_get_nblocks_c,
     blosc2_vlchunk_get_nblocks_c as blosc2_vlchunk_get_nblocks, blosc2_vlcompress_ctx,
-    blosc2_vldecompress_block_ctx, blosc2_vldecompress_ctx, CContext, CParams, DContext, DParams,
+    blosc2_vldecompress_block_ctx, blosc2_vldecompress_ctx, blosc_cbuffer_complib,
+    blosc_cbuffer_metainfo, blosc_cbuffer_sizes, blosc_cbuffer_validate, blosc_cbuffer_versions,
+    blosc_compcode_to_compname, blosc_compname_to_compcode, blosc_compress, blosc_decompress,
+    blosc_get_blocksize, blosc_get_complib_info, blosc_get_compressor, blosc_get_nthreads,
+    blosc_get_version_string, blosc_getitem, blosc_list_compressors, blosc_set_blocksize,
+    blosc_set_compressor, blosc_set_nthreads, blosc_set_splitmode, CContext, CParams, DContext,
+    DParams,
 };
 pub use constants::{
     BLOSC1_VERSION_FORMAT, BLOSC1_VERSION_FORMAT_PRE1, BLOSC2_BIGENDIAN, BLOSC2_CHUNK_BLOCKSIZE,
@@ -120,15 +126,16 @@ pub use schunk::{
     blosc2_schunk_delete_chunk, blosc2_schunk_fill_special, blosc2_schunk_frame_len,
     blosc2_schunk_free_c, blosc2_schunk_free_c as blosc2_schunk_free, blosc2_schunk_from_buffer,
     blosc2_schunk_get_chunk, blosc2_schunk_get_cparams, blosc2_schunk_get_dparams,
-    blosc2_schunk_get_lazychunk_c, blosc2_schunk_get_slice_buffer, blosc2_schunk_get_vlblock,
-    blosc2_schunk_insert_chunk, blosc2_schunk_new_c, blosc2_schunk_new_c as blosc2_schunk_new,
-    blosc2_schunk_open, blosc2_schunk_open_offset, blosc2_schunk_reorder_offsets,
-    blosc2_schunk_set_slice_buffer, blosc2_schunk_to_buffer, blosc2_schunk_to_file,
-    blosc2_schunk_update_chunk, blosc2_vlmeta_add, blosc2_vlmeta_delete, blosc2_vlmeta_exists,
-    blosc2_vlmeta_get, blosc2_vlmeta_get_names, blosc2_vlmeta_update, Schunk,
+    blosc2_schunk_get_lazychunk_c, blosc2_schunk_get_lazychunk_c as blosc2_schunk_get_lazychunk,
+    blosc2_schunk_get_slice_buffer, blosc2_schunk_get_vlblock, blosc2_schunk_insert_chunk,
+    blosc2_schunk_new_c, blosc2_schunk_new_c as blosc2_schunk_new, blosc2_schunk_open,
+    blosc2_schunk_open_offset, blosc2_schunk_reorder_offsets, blosc2_schunk_set_slice_buffer,
+    blosc2_schunk_to_buffer, blosc2_schunk_to_file, blosc2_schunk_update_chunk, blosc2_vlmeta_add,
+    blosc2_vlmeta_delete, blosc2_vlmeta_exists, blosc2_vlmeta_get, blosc2_vlmeta_get_names,
+    blosc2_vlmeta_update, Schunk,
 };
 pub use utils::{
     blosc2_destroy, blosc2_error_string, blosc2_free_resources, blosc2_init,
     blosc2_multidim_to_unidim, blosc2_remove_dir, blosc2_remove_urlpath, blosc2_rename_urlpath,
-    blosc2_unidim_to_multidim,
+    blosc2_unidim_to_multidim, blosc_destroy, blosc_free_resources, blosc_init,
 };
