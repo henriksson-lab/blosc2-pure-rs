@@ -1,6 +1,6 @@
 #[cfg(feature = "compare-blosc2-rs")]
 mod enabled {
-    use blosc2::{self, CLevel, Codec, Filter};
+    use blosc2::{self, Blosc2Guard, CLevel, Codec, Context, DParams, Filter};
     use blosc2_pure_rs::compress::{self, CParams as RustCParams};
     use blosc2_pure_rs::constants::{
         BLOSC2_MAX_FILTERS, BLOSC_BLOSCLZ, BLOSC_FORWARD_COMPAT_SPLIT, BLOSC_LZ4, BLOSC_NOFILTER,
@@ -11,6 +11,11 @@ mod enabled {
 
     const DATA_SIZE: usize = 10 * 1024 * 1024;
     const ITERS: usize = 20;
+
+    extern "C" {
+        fn blosc1_set_blocksize(blocksize: usize);
+        fn blosc1_set_splitmode(splitmode: i32);
+    }
 
     fn iterations() -> usize {
         env::var("BLOSC2_COMPARE_ITERS")
@@ -82,6 +87,28 @@ mod enabled {
         }
     }
 
+    fn c_dparams(nthreads: usize) -> DParams {
+        DParams::default().set_nthreads(nthreads)
+    }
+
+    fn c_compress(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> Vec<u8> {
+        blosc2::set_nthreads(nthreads);
+        unsafe {
+            blosc1_set_blocksize(0);
+            blosc1_set_splitmode(BLOSC_FORWARD_COMPAT_SPLIT);
+        }
+        // blosc2-rs compress_ctx multiplies &[u8] length by CParams::typesize,
+        // so the high-level byte API is the safe public wrapper for typesize=4.
+        blosc2::compress(
+            data,
+            Some(4),
+            Some(CLevel::Five),
+            Some(c_filter(filter)),
+            Some(c_codec(codec)),
+        )
+        .unwrap()
+    }
+
     fn bench_rust(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> (usize, f64, f64) {
         let cparams = rust_cparams(codec, filter, nthreads);
         let compressed = compress::compress(data, &cparams).unwrap();
@@ -133,6 +160,36 @@ mod enabled {
     fn rust_compressed(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> Vec<u8> {
         let cparams = rust_cparams(codec, filter, nthreads);
         compress::compress(data, &cparams).unwrap()
+    }
+
+    fn bench_rust_compress_speed(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> f64 {
+        let cparams = rust_cparams(codec, filter, nthreads);
+        let iters = iterations();
+        let mut c_times = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let start = Instant::now();
+            let out = compress::compress(data, &cparams).unwrap();
+            c_times.push(start.elapsed().as_secs_f64());
+            std::hint::black_box(out);
+        }
+        mib_per_s(data.len(), median(c_times))
+    }
+
+    fn bench_rust_decompress_chunk(data: &[u8], compressed: &[u8], nthreads: usize) -> f64 {
+        let restored =
+            compress::decompress_with_threads(compressed, nthreads.try_into().unwrap()).unwrap();
+        assert_eq!(restored, data);
+
+        let iters = iterations();
+        let mut d_times = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let start = Instant::now();
+            let out = compress::decompress_with_threads(compressed, nthreads.try_into().unwrap())
+                .unwrap();
+            d_times.push(start.elapsed().as_secs_f64());
+            std::hint::black_box(out);
+        }
+        mib_per_s(data.len(), median(d_times))
     }
 
     fn bench_rust_into(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> (usize, f64) {
@@ -190,17 +247,10 @@ mod enabled {
     }
 
     fn bench_c(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> (usize, f64, f64) {
-        blosc2::set_nthreads(nthreads);
-        let compressed = blosc2::compress(
-            data,
-            Some(4),
-            Some(CLevel::Five),
-            Some(c_filter(filter)),
-            Some(c_codec(codec)),
-        )
-        .unwrap();
+        let compressed = c_compress(data, codec, filter, nthreads);
         if !compress_only() {
-            let restored = blosc2::decompress::<u8>(&compressed).unwrap();
+            let mut ctx = Context::from(c_dparams(nthreads));
+            let restored = blosc2::decompress_ctx::<u8>(&compressed, &mut ctx).unwrap();
             assert_eq!(restored, data);
         }
 
@@ -209,14 +259,7 @@ mod enabled {
         if !decompress_only() {
             for _ in 0..iters {
                 let start = Instant::now();
-                let out = blosc2::compress(
-                    data,
-                    Some(4),
-                    Some(CLevel::Five),
-                    Some(c_filter(filter)),
-                    Some(c_codec(codec)),
-                )
-                .unwrap();
+                let out = c_compress(data, codec, filter, nthreads);
                 c_times.push(start.elapsed().as_secs_f64());
                 std::hint::black_box(out);
             }
@@ -225,8 +268,9 @@ mod enabled {
         let mut d_times = Vec::with_capacity(iters);
         if !compress_only() {
             for _ in 0..iters {
+                let mut ctx = Context::from(c_dparams(nthreads));
                 let start = Instant::now();
-                let out = blosc2::decompress::<u8>(&compressed).unwrap();
+                let out = blosc2::decompress_ctx::<u8>(&compressed, &mut ctx).unwrap();
                 d_times.push(start.elapsed().as_secs_f64());
                 std::hint::black_box(out);
             }
@@ -248,34 +292,136 @@ mod enabled {
     }
 
     fn c_compressed(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> Vec<u8> {
-        blosc2::set_nthreads(nthreads);
-        blosc2::compress(
-            data,
-            Some(4),
-            Some(CLevel::Five),
-            Some(c_filter(filter)),
-            Some(c_codec(codec)),
-        )
-        .unwrap()
+        c_compress(data, codec, filter, nthreads)
     }
 
-    fn compressed_parity(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> (bool, bool) {
-        let rust = rust_compressed(data, codec, filter, nthreads);
-        let c = c_compressed(data, codec, filter, nthreads);
+    fn bench_c_compress_speed(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> f64 {
+        let iters = iterations();
+        let mut c_times = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let start = Instant::now();
+            let out = c_compress(data, codec, filter, nthreads);
+            c_times.push(start.elapsed().as_secs_f64());
+            std::hint::black_box(out);
+        }
+        mib_per_s(data.len(), median(c_times))
+    }
+
+    fn bench_c_decompress_chunk(data: &[u8], compressed: &[u8], nthreads: usize) -> f64 {
+        let mut ctx = Context::from(c_dparams(nthreads));
+        let restored = blosc2::decompress_ctx::<u8>(compressed, &mut ctx).unwrap();
+        assert_eq!(restored, data);
+
+        let iters = iterations();
+        let mut d_times = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let mut ctx = Context::from(c_dparams(nthreads));
+            let start = Instant::now();
+            let out = blosc2::decompress_ctx::<u8>(compressed, &mut ctx).unwrap();
+            d_times.push(start.elapsed().as_secs_f64());
+            std::hint::black_box(out);
+        }
+        mib_per_s(data.len(), median(d_times))
+    }
+
+    #[derive(Clone, Copy)]
+    enum DecodeCheck {
+        Ok,
+        Mismatch,
+        Error,
+    }
+
+    impl DecodeCheck {
+        fn is_ok(self) -> bool {
+            matches!(self, DecodeCheck::Ok)
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                DecodeCheck::Ok => "ok",
+                DecodeCheck::Mismatch => "mismatch",
+                DecodeCheck::Error => "error",
+            }
+        }
+    }
+
+    struct CrossDecodeReport {
+        pure_chunk_by_pure: DecodeCheck,
+        c_chunk_by_pure: DecodeCheck,
+        pure_chunk_by_c: DecodeCheck,
+        c_chunk_by_c: DecodeCheck,
+    }
+
+    impl CrossDecodeReport {
+        fn all_ok(&self) -> bool {
+            self.pure_chunk_by_pure.is_ok()
+                && self.c_chunk_by_pure.is_ok()
+                && self.pure_chunk_by_c.is_ok()
+                && self.c_chunk_by_c.is_ok()
+        }
+
+        fn format(&self) -> String {
+            format!(
+                "ok={} pure->pure={} c->pure={} pure->c={} c->c={}",
+                self.all_ok(),
+                self.pure_chunk_by_pure.label(),
+                self.c_chunk_by_pure.label(),
+                self.pure_chunk_by_c.label(),
+                self.c_chunk_by_c.label()
+            )
+        }
+    }
+
+    fn rust_decode_check(data: &[u8], compressed: &[u8], nthreads: usize) -> DecodeCheck {
+        match compress::decompress_with_threads(compressed, nthreads.try_into().unwrap()) {
+            Ok(restored) if restored == data => DecodeCheck::Ok,
+            Ok(_) => DecodeCheck::Mismatch,
+            Err(_) => DecodeCheck::Error,
+        }
+    }
+
+    fn c_decode_check(data: &[u8], compressed: &[u8], nthreads: usize) -> DecodeCheck {
+        let mut ctx = Context::from(c_dparams(nthreads));
+        match blosc2::decompress_ctx::<u8>(compressed, &mut ctx) {
+            Ok(restored) if restored == data => DecodeCheck::Ok,
+            Ok(_) => DecodeCheck::Mismatch,
+            Err(_) => DecodeCheck::Error,
+        }
+    }
+
+    fn rust_decodes_to(data: &[u8], compressed: &[u8], nthreads: usize) -> bool {
+        rust_decode_check(data, compressed, nthreads).is_ok()
+    }
+
+    fn c_decodes_to(data: &[u8], compressed: &[u8], nthreads: usize) -> bool {
+        c_decode_check(data, compressed, nthreads).is_ok()
+    }
+
+    fn compressed_parity(
+        data: &[u8],
+        rust: &[u8],
+        c: &[u8],
+        nthreads: usize,
+    ) -> (bool, Option<CrossDecodeReport>) {
         let same_compressed = rust == c;
         if compress_only() {
-            return (same_compressed, true);
+            return (same_compressed, None);
         }
-        let rust_decoded =
-            compress::decompress_with_threads(&rust, nthreads.try_into().unwrap()).unwrap() == data;
-        let c_decoded_by_rust =
-            compress::decompress_with_threads(&c, nthreads.try_into().unwrap()).unwrap() == data;
-        let rust_decoded_by_c = blosc2::decompress::<u8>(&rust).unwrap() == data;
-        let c_decoded = blosc2::decompress::<u8>(&c).unwrap() == data;
         (
             same_compressed,
-            rust_decoded && c_decoded_by_rust && rust_decoded_by_c && c_decoded,
+            Some(CrossDecodeReport {
+                pure_chunk_by_pure: rust_decode_check(data, rust, nthreads),
+                c_chunk_by_pure: rust_decode_check(data, c, nthreads),
+                pure_chunk_by_c: c_decode_check(data, rust, nthreads),
+                c_chunk_by_c: c_decode_check(data, c, nthreads),
+            }),
         )
+    }
+
+    fn format_speed(speed: Option<f64>) -> String {
+        speed
+            .map(|speed| format!("{speed:.1}"))
+            .unwrap_or_else(|| "n/a".to_string())
     }
 
     fn run_case(label: &str, data: &[u8], codec: u8, filter: u8, nthreads: usize) {
@@ -329,20 +475,49 @@ mod enabled {
             return;
         }
 
-        let (rust_size, rust_c, rust_d) = bench_rust(data, codec, filter, nthreads);
-        let (c_size, c_c, c_d) = bench_c(data, codec, filter, nthreads);
-        let (same_compressed, same_decompressed) = compressed_parity(data, codec, filter, nthreads);
+        let rust_chunk = rust_compressed(data, codec, filter, nthreads);
+        let c_chunk = c_compressed(data, codec, filter, nthreads);
+        let rust_size = rust_chunk.len();
+        let c_size = c_chunk.len();
+        let (same_compressed, cross_decode_report) =
+            compressed_parity(data, &rust_chunk, &c_chunk, nthreads);
+        let rust_c = if decompress_only() {
+            0.0
+        } else {
+            bench_rust_compress_speed(data, codec, filter, nthreads)
+        };
+        let c_c = if decompress_only() {
+            0.0
+        } else {
+            bench_c_compress_speed(data, codec, filter, nthreads)
+        };
+        let rust_d = if !compress_only() && rust_decodes_to(data, &rust_chunk, nthreads) {
+            Some(bench_rust_decompress_chunk(data, &rust_chunk, nthreads))
+        } else {
+            None
+        };
+        let c_d = if !compress_only() && c_decodes_to(data, &c_chunk, nthreads) {
+            Some(bench_c_decompress_chunk(data, &c_chunk, nthreads))
+        } else {
+            None
+        };
         if compress_only() {
             println!(
                 "{label} @ {nthreads} thread(s): csize pure={rust_size} blosc2-rs={c_size}; same compressed bytes={same_compressed}; compress MB/s pure={rust_c:.1} blosc2-rs={c_c:.1}"
             );
         } else if decompress_only() {
+            let rust_d = format_speed(rust_d);
+            let c_d = format_speed(c_d);
+            let cross_decode_report = cross_decode_report.unwrap().format();
             println!(
-                "{label} @ {nthreads} thread(s): csize pure={rust_size} blosc2-rs={c_size}; same compressed bytes={same_compressed}; same decompressed bytes={same_decompressed}; decompress MB/s pure={rust_d:.1} blosc2-rs={c_d:.1}"
+                "{label} @ {nthreads} thread(s): csize pure={rust_size} blosc2-rs={c_size}; same compressed bytes={same_compressed}; cross-decode {cross_decode_report}; decompress MB/s pure={rust_d} blosc2-rs={c_d}"
             );
         } else {
+            let rust_d = format_speed(rust_d);
+            let c_d = format_speed(c_d);
+            let cross_decode_report = cross_decode_report.unwrap().format();
             println!(
-                "{label} @ {nthreads} thread(s): csize pure={rust_size} blosc2-rs={c_size}; same compressed bytes={same_compressed}; same decompressed bytes={same_decompressed}; compress MB/s pure={rust_c:.1} blosc2-rs={c_c:.1}; decompress MB/s pure={rust_d:.1} blosc2-rs={c_d:.1}"
+                "{label} @ {nthreads} thread(s): csize pure={rust_size} blosc2-rs={c_size}; same compressed bytes={same_compressed}; cross-decode {cross_decode_report}; compress MB/s pure={rust_c:.1} blosc2-rs={c_c:.1}; decompress MB/s pure={rust_d} blosc2-rs={c_d}"
             );
         }
         if !compress_only()
@@ -418,6 +593,7 @@ mod enabled {
     }
 
     pub fn main() {
+        let _guard = Blosc2Guard::get_or_init();
         let data = signal_f32_bytes(DATA_SIZE);
         for nthreads in [1, 4] {
             if case_enabled("blosclz/nofilter", nthreads) {

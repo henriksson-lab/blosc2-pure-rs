@@ -29,34 +29,34 @@ fn random_bytes(len: usize) -> Vec<u8> {
     out
 }
 
-fn cparams(compcode: u8, typesize: i32) -> CParams {
+fn cparams(compcode: u8, typesize: i32, nthreads: i16) -> CParams {
     CParams {
         compcode,
         compcode_meta: 0,
-        clevel: 9,
+        clevel: 5,
         typesize,
         blocksize: 0,
         splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
         filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
         filters_meta: [0; BLOSC2_MAX_FILTERS],
         use_dict: false,
-        nthreads: 4,
+        nthreads,
         ..Default::default()
     }
 }
 
-fn cparams_nofilter(compcode: u8, typesize: i32) -> CParams {
+fn cparams_nofilter(compcode: u8, typesize: i32, nthreads: i16) -> CParams {
     CParams {
         compcode,
         compcode_meta: 0,
-        clevel: 9,
+        clevel: 5,
         typesize,
         blocksize: 0,
         splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
         filters: [0; BLOSC2_MAX_FILTERS],
         filters_meta: [0; BLOSC2_MAX_FILTERS],
         use_dict: false,
-        nthreads: 4,
+        nthreads,
         ..Default::default()
     }
 }
@@ -73,11 +73,22 @@ fn run_compress(label: &str, data: &[u8], params: &CParams, iterations: usize) {
 
 fn run_decompress(label: &str, data: &[u8], params: &CParams, iterations: usize) {
     let compressed = compress::compress(data, params).unwrap();
+    let mut decompressed = vec![0u8; data.len()];
+    let written =
+        compress::decompress_into_with_threads(&compressed, &mut decompressed, params.nthreads)
+            .unwrap();
+    assert_eq!(written, data.len());
+    assert_eq!(decompressed, data);
+
     let mut total = 0usize;
     for _ in 0..iterations {
-        let decompressed =
-            compress::decompress_with_threads(black_box(&compressed), params.nthreads).unwrap();
-        total = total.wrapping_add(decompressed.len());
+        let written = compress::decompress_into_with_threads(
+            black_box(&compressed),
+            black_box(&mut decompressed),
+            params.nthreads,
+        )
+        .unwrap();
+        total = total.wrapping_add(written);
         black_box(&decompressed);
     }
     eprintln!("{label}: {iterations} decompress iterations, checksum={total}");
@@ -114,49 +125,49 @@ fn main() {
         "blosclz-t4-signal-compress" => run_compress(
             &case,
             &signal_f32_bytes(DATA_SIZE),
-            &cparams(BLOSC_BLOSCLZ, 4),
+            &cparams(BLOSC_BLOSCLZ, 4, 4),
             iterations,
         ),
         "lz4-t4-signal-compress" => run_compress(
             &case,
             &signal_f32_bytes(DATA_SIZE),
-            &cparams(BLOSC_LZ4, 4),
+            &cparams(BLOSC_LZ4, 4, 4),
             iterations,
         ),
         "zlib-t4-signal-compress" => run_compress(
             &case,
             &signal_f32_bytes(DATA_SIZE),
-            &cparams(BLOSC_ZLIB, 4),
+            &cparams(BLOSC_ZLIB, 4, 4),
             iterations,
         ),
         "random-blosclz-t1-compress" => run_compress(
             &case,
             &random_bytes(DATA_SIZE),
-            &cparams(BLOSC_BLOSCLZ, 1),
+            &cparams(BLOSC_BLOSCLZ, 1, 1),
             iterations,
         ),
         "random-lz4-t4-compress" => run_compress(
             &case,
             &random_bytes(DATA_SIZE),
-            &cparams(BLOSC_LZ4, 4),
+            &cparams(BLOSC_LZ4, 1, 4),
             iterations,
         ),
         "blosclz-t4-signal-decompress" => run_decompress(
             &case,
             &signal_f32_bytes(DATA_SIZE),
-            &cparams(BLOSC_BLOSCLZ, 4),
+            &cparams(BLOSC_BLOSCLZ, 4, 4),
             iterations,
         ),
         "blosclz-t4-signal-nofilter-decompress" => run_decompress(
             &case,
             &signal_f32_bytes(DATA_SIZE),
-            &cparams_nofilter(BLOSC_BLOSCLZ, 4),
+            &cparams_nofilter(BLOSC_BLOSCLZ, 4, 4),
             iterations,
         ),
         "lz4-t4-signal-decompress" => run_decompress(
             &case,
             &signal_f32_bytes(DATA_SIZE),
-            &cparams(BLOSC_LZ4, 4),
+            &cparams(BLOSC_LZ4, 4, 4),
             iterations,
         ),
         _ => {

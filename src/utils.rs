@@ -290,9 +290,14 @@ pub fn blosc2_remove_dir(path: impl AsRef<std::path::Path>) -> i32 {
         #[cfg(not(windows))]
         Err(_) => return BLOSC2_ERROR_NOT_FOUND,
     };
-    // C-Blosc2's Windows implementation starts with _findfirst but iterates
-    // with _findnext, skipping the first returned entry. Rust removes every
-    // direct entry intentionally; preserving the C bug could leave stale files.
+    // C-Blosc2's Windows loop calls `_findfirst` and then starts removal with
+    // `_findnext`, so it skips the first matched entry.
+    #[cfg(windows)]
+    let entries = {
+        let mut entries = entries;
+        let _ = entries.next();
+        entries
+    };
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,

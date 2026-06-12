@@ -1197,54 +1197,55 @@ fn known_global_filter_by_id(filter_id: u8) -> Option<KnownGlobalFilter> {
         .find(|filter| filter.filter_id == filter_id)
 }
 
+fn known_global_filter_descriptor(filter_id: u8) -> Option<UserFilter> {
+    let filter = known_global_filter_by_id(filter_id)?;
+    let (forward, backward) = match filter.filter_id {
+        BLOSC_FILTER_NDCELL => (
+            UserFilterForward::Context(ndcell_forward_impl),
+            UserFilterBackward::Context(ndcell_backward_impl),
+        ),
+        BLOSC_FILTER_NDMEAN => (
+            UserFilterForward::Context(ndmean_forward_impl),
+            UserFilterBackward::Context(ndmean_backward_impl),
+        ),
+        BLOSC_FILTER_BYTEDELTA_BUGGY => (
+            UserFilterForward::Context(bytedelta_buggy_forward_impl),
+            UserFilterBackward::Context(bytedelta_buggy_backward_impl),
+        ),
+        BLOSC_FILTER_BYTEDELTA => (
+            UserFilterForward::Context(bytedelta_forward_impl),
+            UserFilterBackward::Context(bytedelta_backward_impl),
+        ),
+        BLOSC_FILTER_INT_TRUNC => (
+            UserFilterForward::Context(int_trunc_context_forward_impl),
+            UserFilterBackward::Context(int_trunc_context_backward_impl),
+        ),
+        _ => (
+            UserFilterForward::Fallible(unsupported_known_global_filter),
+            UserFilterBackward::Fallible(unsupported_known_global_filter),
+        ),
+    };
+    Some(UserFilter {
+        name: Some(filter.name),
+        version: Some(filter.version),
+        forward,
+        backward,
+    })
+}
+
 fn ensure_known_global_filters_registered() {
     KNOWN_GLOBAL_FILTERS_REGISTERED.get_or_init(|| {
         for filter in KNOWN_GLOBAL_FILTERS {
-            let registered = match filter.filter_id {
-                BLOSC_FILTER_NDCELL => register_global_context_filter_with_metadata(
-                    filter.filter_id,
-                    filter.name,
-                    filter.version,
-                    ndcell_forward_impl,
-                    ndcell_backward_impl,
-                ),
-                BLOSC_FILTER_NDMEAN => register_global_context_filter_with_metadata(
-                    filter.filter_id,
-                    filter.name,
-                    filter.version,
-                    ndmean_forward_impl,
-                    ndmean_backward_impl,
-                ),
-                BLOSC_FILTER_BYTEDELTA_BUGGY => register_global_context_filter_with_metadata(
-                    filter.filter_id,
-                    filter.name,
-                    filter.version,
-                    bytedelta_buggy_forward_impl,
-                    bytedelta_buggy_backward_impl,
-                ),
-                BLOSC_FILTER_BYTEDELTA => register_global_context_filter_with_metadata(
-                    filter.filter_id,
-                    filter.name,
-                    filter.version,
-                    bytedelta_forward_impl,
-                    bytedelta_backward_impl,
-                ),
-                BLOSC_FILTER_INT_TRUNC => register_global_context_filter_with_metadata(
-                    filter.filter_id,
-                    filter.name,
-                    filter.version,
-                    int_trunc_context_forward_impl,
-                    int_trunc_context_backward_impl,
-                ),
-                _ => register_global_fallible_filter_with_metadata(
-                    filter.filter_id,
-                    filter.name,
-                    filter.version,
-                    unsupported_known_global_filter,
-                    unsupported_known_global_filter,
-                ),
+            let Some(descriptor) = known_global_filter_descriptor(filter.filter_id) else {
+                continue;
             };
-            let _ = registered;
+            let _ = register_named_filter_inner(
+                filter.filter_id,
+                descriptor,
+                BLOSC2_GLOBAL_REGISTERED_FILTERS_START..=BLOSC2_GLOBAL_REGISTERED_FILTERS_STOP,
+                "Global plugin filter IDs must be in 32..=159",
+                "Global plugin filter ID already registered",
+            );
         }
     });
 }
@@ -1460,6 +1461,13 @@ fn register_filter_inner(
     if !valid_range.contains(&filter_id) {
         return Err(range_error);
     }
+    if let Some(known_filter) = known_global_filter_descriptor(filter_id) {
+        return if known_filter.same_callbacks(filter) {
+            Ok(())
+        } else {
+            Err(duplicate_error)
+        };
+    }
     let mut filters = user_filters()
         .write()
         .map_err(|_| "Filter registry poisoned")?;
@@ -1483,6 +1491,16 @@ fn register_named_filter_inner(
 ) -> Result<(), &'static str> {
     if !valid_range.contains(&filter_id) {
         return Err(range_error);
+    }
+    if let Some(known_filter) = known_global_filter_descriptor(filter_id) {
+        if filter.name != known_filter.name {
+            return Err(duplicate_error);
+        }
+        let mut filters = user_filters()
+            .write()
+            .map_err(|_| "Filter registry poisoned")?;
+        filters.entry(filter_id).or_insert(known_filter);
+        return Ok(());
     }
     let mut filters = user_filters()
         .write()
@@ -1826,7 +1844,7 @@ pub fn unshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) {
     }
 }
 
-fn validate_raw_filter_args(
+fn validate_raw_shuffle_filter_args(
     typesize: i32,
     blocksize: i32,
     src_len: usize,
@@ -1842,13 +1860,46 @@ fn validate_raw_filter_args(
     Ok(blocksize)
 }
 
+fn validate_raw_bitshuffle_filter_args(
+    typesize: i32,
+    blocksize: i32,
+    src_len: usize,
+    dest_len: usize,
+) -> Result<usize, i32> {
+    if !(1..=256).contains(&typesize) || blocksize < 0 {
+        return Err(BLOSC2_ERROR_INVALID_PARAM);
+    }
+    let blocksize = blocksize as usize;
+    if src_len < blocksize || dest_len < blocksize {
+        return Err(BLOSC2_ERROR_INVALID_PARAM);
+    }
+    Ok(blocksize)
+}
+
+fn validate_raw_bitunshuffle_filter_args(
+    typesize: i32,
+    blocksize: i32,
+    src_len: usize,
+    dest_len: usize,
+) -> Result<usize, i32> {
+    if typesize < 1 || blocksize < 0 {
+        return Err(BLOSC2_ERROR_INVALID_PARAM);
+    }
+    let blocksize = blocksize as usize;
+    if src_len < blocksize || dest_len < blocksize {
+        return Err(BLOSC2_ERROR_INVALID_PARAM);
+    }
+    Ok(blocksize)
+}
+
 /// C-style raw shuffle wrapper: returns `blocksize` on success or a negative
 /// `BLOSC2_ERROR_*` code on invalid parameters.
 pub fn blosc2_shuffle(typesize: i32, blocksize: i32, src: &[u8], dest: &mut [u8]) -> i32 {
-    let blocksize = match validate_raw_filter_args(typesize, blocksize, src.len(), dest.len()) {
-        Ok(blocksize) => blocksize,
-        Err(code) => return code,
-    };
+    let blocksize =
+        match validate_raw_shuffle_filter_args(typesize, blocksize, src.len(), dest.len()) {
+            Ok(blocksize) => blocksize,
+            Err(code) => return code,
+        };
     shuffle(typesize as usize, &src[..blocksize], &mut dest[..blocksize]);
     blocksize as i32
 }
@@ -1856,10 +1907,11 @@ pub fn blosc2_shuffle(typesize: i32, blocksize: i32, src: &[u8], dest: &mut [u8]
 /// C-style raw unshuffle wrapper: returns `blocksize` on success or a negative
 /// `BLOSC2_ERROR_*` code on invalid parameters.
 pub fn blosc2_unshuffle(typesize: i32, blocksize: i32, src: &[u8], dest: &mut [u8]) -> i32 {
-    let blocksize = match validate_raw_filter_args(typesize, blocksize, src.len(), dest.len()) {
-        Ok(blocksize) => blocksize,
-        Err(code) => return code,
-    };
+    let blocksize =
+        match validate_raw_shuffle_filter_args(typesize, blocksize, src.len(), dest.len()) {
+            Ok(blocksize) => blocksize,
+            Err(code) => return code,
+        };
     unshuffle(typesize as usize, &src[..blocksize], &mut dest[..blocksize]);
     blocksize as i32
 }
@@ -3044,10 +3096,11 @@ pub fn bitunshuffle(typesize: usize, src: &[u8], dest: &mut [u8]) -> i64 {
 /// C-style raw bitshuffle wrapper: returns `blocksize` on success or a
 /// negative `BLOSC2_ERROR_*` code on invalid parameters.
 pub fn blosc2_bitshuffle(typesize: i32, blocksize: i32, src: &[u8], dest: &mut [u8]) -> i32 {
-    let blocksize = match validate_raw_filter_args(typesize, blocksize, src.len(), dest.len()) {
-        Ok(blocksize) => blocksize,
-        Err(code) => return code,
-    };
+    let blocksize =
+        match validate_raw_bitshuffle_filter_args(typesize, blocksize, src.len(), dest.len()) {
+            Ok(blocksize) => blocksize,
+            Err(code) => return code,
+        };
     if bitshuffle(typesize as usize, &src[..blocksize], &mut dest[..blocksize]) == blocksize as i64
     {
         blocksize as i32
@@ -3059,10 +3112,11 @@ pub fn blosc2_bitshuffle(typesize: i32, blocksize: i32, src: &[u8], dest: &mut [
 /// C-style raw bitunshuffle wrapper: returns `blocksize` on success or a
 /// negative `BLOSC2_ERROR_*` code on invalid parameters.
 pub fn blosc2_bitunshuffle(typesize: i32, blocksize: i32, src: &[u8], dest: &mut [u8]) -> i32 {
-    let blocksize = match validate_raw_filter_args(typesize, blocksize, src.len(), dest.len()) {
-        Ok(blocksize) => blocksize,
-        Err(code) => return code,
-    };
+    let blocksize =
+        match validate_raw_bitunshuffle_filter_args(typesize, blocksize, src.len(), dest.len()) {
+            Ok(blocksize) => blocksize,
+            Err(code) => return code,
+        };
     if bitunshuffle(typesize as usize, &src[..blocksize], &mut dest[..blocksize])
         == blocksize as i64
     {
@@ -3372,10 +3426,22 @@ pub fn pipeline_forward_with_context(
                 } else {
                     filters_meta[i] as usize
                 };
-                shuffle(ts, inp, out);
+                let Ok(ts_i32) = i32::try_from(ts) else {
+                    return 0;
+                };
+                let Ok(bsize_i32) = i32::try_from(bsize) else {
+                    return 0;
+                };
+                let _ = blosc2_shuffle(ts_i32, bsize_i32, inp, out);
             }
             BLOSC_BITSHUFFLE => {
-                if bitshuffle(typesize, inp, out) != bsize as i64 {
+                let Ok(typesize_i32) = i32::try_from(typesize) else {
+                    return 0;
+                };
+                let Ok(bsize_i32) = i32::try_from(bsize) else {
+                    return 0;
+                };
+                if blosc2_bitshuffle(typesize_i32, bsize_i32, inp, out) < 0 {
                     return 0;
                 }
             }
@@ -3394,6 +3460,9 @@ pub fn pipeline_forward_with_context(
                 if !trunc_prec_forward(inp, out, typesize, prec) {
                     return 0;
                 }
+            }
+            _ if is_blosc_defined_filter(filter) => {
+                return 0;
             }
             _ => {
                 if let Some(user_filter) = registered_filter(filter) {
@@ -3538,19 +3607,36 @@ pub fn pipeline_backward_with_context(
                 } else {
                     filters_meta[i] as usize
                 };
-                unshuffle(ts, inp, out);
+                let Ok(ts_i32) = i32::try_from(ts) else {
+                    return 0;
+                };
+                let Ok(bsize_i32) = i32::try_from(bsize) else {
+                    return 0;
+                };
+                let _ = blosc2_unshuffle(ts_i32, bsize_i32, inp, out);
             }
             BLOSC_BITSHUFFLE => {
-                if bitunshuffle_with_format_version(typesize, inp, out, format_version)
-                    != bsize as i64
-                {
+                let ok = if format_version == BLOSC2_VERSION_FORMAT {
+                    let Ok(typesize_i32) = i32::try_from(typesize) else {
+                        return 0;
+                    };
+                    let Ok(bsize_i32) = i32::try_from(bsize) else {
+                        return 0;
+                    };
+                    blosc2_bitunshuffle(typesize_i32, bsize_i32, inp, out) >= 0
+                } else {
+                    bitunshuffle_with_format_version(typesize, inp, out, format_version)
+                        == bsize as i64
+                };
+                if !ok {
                     return 0;
                 }
             }
             BLOSC_DELTA => {
                 // Delta decode: copy data to output, then decode in-place
                 out.copy_from_slice(inp);
-                delta_decode(dref, block_offset, bsize, typesize, out);
+                let actual_dref = if block_offset == 0 { None } else { dref };
+                delta_decode(actual_dref, block_offset, bsize, typesize, out);
             }
             BLOSC_TRUNC_PREC => {
                 // Truncation is lossy. C leaves the current buffer untouched
@@ -3952,6 +4038,28 @@ mod tests {
             512
         );
         assert_eq!(wide_restored, wide_data);
+
+        let data257: Vec<u8> = (0..64).map(|idx| (idx * 3 + 1) as u8).collect();
+        let mut tmp257 = vec![0u8; data257.len()];
+        let mut restored257 = vec![0u8; data257.len()];
+        assert_eq!(
+            blosc2_shuffle(257, data257.len() as i32, &data257, &mut tmp257),
+            BLOSC2_ERROR_INVALID_PARAM
+        );
+        assert_eq!(
+            blosc2_unshuffle(257, data257.len() as i32, &data257, &mut tmp257),
+            BLOSC2_ERROR_INVALID_PARAM
+        );
+        assert_eq!(
+            blosc2_bitshuffle(257, data257.len() as i32, &data257, &mut tmp257),
+            BLOSC2_ERROR_INVALID_PARAM
+        );
+        assert_eq!(
+            blosc2_bitunshuffle(257, data257.len() as i32, &tmp257, &mut restored257),
+            data257.len() as i32
+        );
+        assert_eq!(restored257, tmp257);
+
         assert_eq!(
             blosc2_bitshuffle(4, -1, &data, &mut tmp),
             BLOSC2_ERROR_INVALID_PARAM
@@ -4006,8 +4114,18 @@ mod tests {
             register_blosc2_filter(&same_id_different_name),
             BLOSC2_ERROR_FAILURE
         );
+        let global_c_filter = Blosc2Filter {
+            id: BLOSC2_GLOBAL_REGISTERED_FILTERS_START + 90,
+            name: "global-c-copy",
+            ..c_filter
+        };
+        assert_eq!(
+            register_blosc2_filter(&global_c_filter),
+            BLOSC2_ERROR_FAILURE
+        );
         let invalid_c_filter = Blosc2Filter {
             id: BLOSC2_GLOBAL_REGISTERED_FILTERS_START,
+            name: "other-ndcell",
             ..c_filter
         };
         assert_eq!(
@@ -4067,9 +4185,34 @@ mod tests {
             blosc2_register_filter(std::ptr::null()),
             BLOSC2_ERROR_INVALID_PARAM
         );
+        let global_name = CString::new("global-c-abi-copy").unwrap();
+        let global = Blosc2FilterAbi {
+            id: BLOSC2_GLOBAL_REGISTERED_FILTERS_START + 91,
+            name: global_name.as_ptr(),
+            version: 1,
+            forward: Some(c_abi_forward_filter),
+            backward: Some(c_abi_backward_filter),
+        };
+        assert_eq!(
+            blosc2_register_filter(&global as *const Blosc2FilterAbi),
+            BLOSC2_ERROR_FAILURE
+        );
+        let known_name = CString::new("ndcell").unwrap();
+        let known = Blosc2FilterAbi {
+            id: BLOSC_FILTER_NDCELL,
+            name: known_name.as_ptr(),
+            version: 9,
+            forward: Some(c_abi_forward_filter),
+            backward: Some(c_abi_backward_filter),
+        };
+        assert_eq!(
+            blosc2_register_filter(&known as *const Blosc2FilterAbi),
+            BLOSC2_ERROR_FAILURE
+        );
+        let invalid_name = CString::new("other-ndcell").unwrap();
         let invalid = Blosc2FilterAbi {
-            id: BLOSC2_GLOBAL_REGISTERED_FILTERS_START,
-            name: name.as_ptr(),
+            id: BLOSC_FILTER_NDCELL,
+            name: invalid_name.as_ptr(),
             version: 1,
             forward: Some(c_abi_forward_filter),
             backward: Some(c_abi_backward_filter),
@@ -4411,6 +4554,130 @@ mod tests {
         }
         assert!(!is_known_global_filter(BLOSC_FILTER_INT_TRUNC + 1));
         assert_eq!(known_global_filter_info(BLOSC_FILTER_INT_TRUNC + 1), None);
+    }
+
+    #[test]
+    fn test_known_global_filter_ids_cannot_be_preempted_before_lazy_registration() {
+        assert_eq!(
+            register_filter(BLOSC_FILTER_NDCELL, copy_filter, copy_filter),
+            Err("User-defined filter IDs must be >= 160")
+        );
+        assert_eq!(
+            register_fallible_filter(
+                BLOSC_FILTER_NDCELL,
+                copy_fallible_filter,
+                copy_fallible_filter
+            ),
+            Err("User-defined filter IDs must be >= 160")
+        );
+        assert_eq!(
+            register_context_filter(
+                BLOSC_FILTER_NDCELL,
+                ndmean_forward_impl,
+                ndmean_backward_impl
+            ),
+            Err("User-defined filter IDs must be >= 160")
+        );
+
+        assert_eq!(
+            register_global_filter(BLOSC_FILTER_NDCELL, copy_filter, copy_filter),
+            Err("Global plugin filter ID already registered")
+        );
+        assert_eq!(
+            register_named_global_filter(
+                BLOSC_FILTER_NDCELL,
+                "ndcell",
+                reverse_filter,
+                reverse_filter
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            register_named_global_context_filter(
+                BLOSC_FILTER_NDCELL,
+                "other-ndcell",
+                ndcell_forward_impl,
+                ndcell_backward_impl
+            ),
+            Err("Global plugin filter ID already registered")
+        );
+        assert_eq!(
+            register_global_filter_with_metadata(
+                BLOSC_FILTER_NDCELL,
+                "ndcell",
+                9,
+                copy_filter,
+                copy_filter
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            registered_filter_info(BLOSC_FILTER_NDCELL),
+            Some(("ndcell", 1))
+        );
+        assert_eq!(
+            register_global_fallible_filter(
+                BLOSC_FILTER_NDCELL,
+                copy_fallible_filter,
+                copy_fallible_filter
+            ),
+            Err("Global plugin filter ID already registered")
+        );
+        assert_eq!(
+            register_named_global_fallible_filter(
+                BLOSC_FILTER_NDCELL,
+                "ndcell",
+                copy_fallible_filter,
+                copy_fallible_filter
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            register_global_fallible_filter_with_metadata(
+                BLOSC_FILTER_NDCELL,
+                "ndcell",
+                9,
+                copy_fallible_filter,
+                copy_fallible_filter
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            registered_filter_info(BLOSC_FILTER_NDCELL),
+            Some(("ndcell", 1))
+        );
+        assert_eq!(
+            register_global_context_filter(
+                BLOSC_FILTER_NDCELL,
+                ndmean_forward_impl,
+                ndmean_backward_impl
+            ),
+            Err("Global plugin filter ID already registered")
+        );
+        assert_eq!(
+            register_named_global_context_filter(
+                BLOSC_FILTER_NDCELL,
+                "ndcell",
+                ndmean_forward_impl,
+                ndmean_backward_impl
+            ),
+            Ok(())
+        );
+
+        assert_eq!(
+            register_global_context_filter_with_metadata(
+                BLOSC_FILTER_NDCELL,
+                "ndcell",
+                1,
+                ndcell_forward_impl,
+                ndcell_backward_impl
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            registered_filter_info(BLOSC_FILTER_NDCELL),
+            Some(("ndcell", 1))
+        );
     }
 
     #[test]
@@ -5223,6 +5490,87 @@ mod tests {
     }
 
     #[test]
+    fn test_reserved_defined_filter_ids_fail_forward_dispatch() {
+        let src = [1u8, 2, 3, 4];
+        let mut buf1 = [0u8; 4];
+        let mut buf2 = [0u8; 4];
+        let mut filters = [BLOSC_NOFILTER; BLOSC2_MAX_FILTERS];
+        let meta = [0u8; BLOSC2_MAX_FILTERS];
+
+        filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_LAST_FILTER;
+        assert_eq!(
+            pipeline_forward(&src, &mut buf1, &mut buf2, &filters, &meta, 1, 0, None),
+            0
+        );
+    }
+
+    #[test]
+    fn test_pipeline_forward_bitshuffle_rejects_raw_c_invalid_typesize() {
+        let src = vec![1u8; 1024];
+        let mut buf1 = vec![0u8; src.len()];
+        let mut buf2 = vec![0u8; src.len()];
+        let mut filters = [BLOSC_NOFILTER; BLOSC2_MAX_FILTERS];
+        let filters_meta = [0u8; BLOSC2_MAX_FILTERS];
+        filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_BITSHUFFLE;
+
+        assert_eq!(
+            pipeline_forward(
+                &src,
+                &mut buf1,
+                &mut buf2,
+                &filters,
+                &filters_meta,
+                257,
+                0,
+                None
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn test_pipeline_shuffle_uses_raw_c_invalid_typesize_noop() {
+        let src = vec![1u8; 1024];
+        let mut buf1 = vec![0xA5; src.len()];
+        let mut buf2 = vec![0x5A; src.len()];
+        let mut filters = [BLOSC_NOFILTER; BLOSC2_MAX_FILTERS];
+        let filters_meta = [0u8; BLOSC2_MAX_FILTERS];
+        filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_SHUFFLE;
+
+        assert_eq!(
+            pipeline_forward(
+                &src,
+                &mut buf1,
+                &mut buf2,
+                &filters,
+                &filters_meta,
+                257,
+                0,
+                None
+            ),
+            1
+        );
+        assert_eq!(buf1, vec![0xA5; src.len()]);
+
+        assert_eq!(
+            pipeline_backward(
+                &mut buf1,
+                &mut buf2,
+                src.len(),
+                &filters,
+                &filters_meta,
+                BLOSC2_VERSION_FORMAT,
+                257,
+                0,
+                None,
+                1,
+            ),
+            2
+        );
+        assert_eq!(buf2, vec![0x5A; src.len()]);
+    }
+
+    #[test]
     fn test_user_filter_success_without_writes_leaves_output_buffer_unchanged() {
         const FILTER_ID: u8 = BLOSC2_USER_DEFINED_FILTERS_START + 32;
         register_fallible_filter(
@@ -5589,6 +5937,35 @@ mod tests {
         shuffle(4, &src, &mut shuffled);
         delta_encode(&src, 0, src.len(), 4, &shuffled, &mut expected);
         assert_eq!(encoded, &expected);
+    }
+
+    #[test]
+    fn test_pipeline_delta_reference_block_decode_ignores_external_dref() {
+        let src: Vec<u8> = (0..16).map(|i| i * 7 + 3).collect();
+        let wrong_dref = vec![0xA5; src.len()];
+        let filters = [BLOSC_DELTA, 0, 0, 0, 0, 0];
+        let filters_meta = [0u8; BLOSC2_MAX_FILTERS];
+
+        let mut encoded = vec![0u8; src.len()];
+        delta_encode(&src, 0, src.len(), 4, &src, &mut encoded);
+
+        let mut buf1 = encoded;
+        let mut buf2 = vec![0u8; src.len()];
+        let current = pipeline_backward(
+            &mut buf1,
+            &mut buf2,
+            src.len(),
+            &filters,
+            &filters_meta,
+            BLOSC2_VERSION_FORMAT,
+            4,
+            0,
+            Some(&wrong_dref),
+            1,
+        );
+
+        assert_eq!(current, 2);
+        assert_eq!(buf2, src);
     }
 
     // C's delta_{encoder,decoder} (c-blosc2/blosc/delta.c) falls back to typesize=1

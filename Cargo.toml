@@ -20,6 +20,18 @@ include = [
     "/Cargo.toml",
     "/README.md",
     "/LICENSE.txt",
+    "/c-blosc2/CMakeLists.txt",
+    "/c-blosc2/Blosc2Config.cmake.in",
+    "/c-blosc2/blosc2.pc.in",
+    "/c-blosc2/cmake_uninstall.cmake.in",
+    "/c-blosc2/LICENSE.txt",
+    "/c-blosc2/README.rst",
+    "/c-blosc2/LICENSES/**",
+    "/c-blosc2/blosc/**",
+    "/c-blosc2/cmake/**",
+    "/c-blosc2/include/**",
+    "/c-blosc2/internal-complibs/**",
+    "/c-blosc2/plugins/**",
 ]
 
 [lib]

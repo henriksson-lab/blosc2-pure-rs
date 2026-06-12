@@ -13,10 +13,12 @@ use std::path::PathBuf;
 
 use blosc2_pure_rs::constants::*;
 use blosc2_pure_rs::{
-    blosc2_compress_ctx, blosc2_create_cctx, blosc2_create_dctx, blosc2_decompress_ctx,
-    blosc2_set_maskout, CParams, DParams, B2ND_DEFAULT_DTYPE, B2ND_DEFAULT_DTYPE_FORMAT,
-    B2ND_MAX_DIM, B2ND_MAX_METALAYERS, B2ND_METALAYER_NAME, B2ND_METALAYER_VERSION,
-    DTYPE_NUMPY_FORMAT,
+    b2nd_from_cbuffer, b2nd_get_slice_nchunks, b2nd_get_slice_nchunks_vec, blosc2_compress_ctx,
+    blosc2_create_cctx, blosc2_create_dctx, blosc2_decompress_ctx, blosc2_set_maskout, B2ndMeta,
+    Blosc2CodecDecoderCb, Blosc2CodecEncoderCb, Blosc2FilterBackwardCb, Blosc2FilterForwardCb,
+    Blosc2PostfilterCb, Blosc2PrefilterCb, CParams, DParams, B2ND_DEFAULT_DTYPE,
+    B2ND_DEFAULT_DTYPE_FORMAT, B2ND_MAX_DIM, B2ND_MAX_METALAYERS, B2ND_METALAYER_NAME,
+    B2ND_METALAYER_VERSION, DTYPE_NUMPY_FORMAT,
 };
 
 const LIB_RS: &str = include_str!("../src/lib.rs");
@@ -189,7 +191,7 @@ const API_MATRIX: &[ApiRow] = &[
     covered!("b2nd_get_slice_cbuffer"),
     covered!("b2nd_set_slice_cbuffer"),
     covered!("b2nd_copy"),
-    partial!("b2nd_concatenate", "copy=false mutates the input and returns no cloned output; exact C pointer aliasing is not modeled."),
+    partial!("b2nd_concatenate", "copy=false mutates the input and returns a clone of the updated left array, matching C's observable *array = src1; exact C pointer aliasing is not modeled."),
     covered!("b2nd_print_meta"),
     covered!("b2nd_resize"),
     covered!("b2nd_insert"),
@@ -201,7 +203,7 @@ const API_MATRIX: &[ApiRow] = &[
     covered!("b2nd_deserialize_meta"),
     covered!("b2nd_copy_buffer"),
     covered!("b2nd_copy_buffer2"),
-    partial!("blosc2_register_codec", "Rust registry exists, but not the C callback ABI."),
+    covered!("blosc2_register_codec" => "blosc2_register_codec_abi"),
     covered!("blosc2_register_filter"),
     partial!("blosc2_schunk_new" => "blosc2_schunk_new_c", "Rust helper uses owned storage parameters, not blosc2_storage ABI."),
     partial!("blosc2_schunk_copy", "Rust copies supported data but not all C storage/plugin semantics."),
@@ -306,6 +308,34 @@ fn public_api_matrix_covers_all_vendored_header_exports() {
 }
 
 #[test]
+fn registry_bootstrap_helpers_are_not_public_c_exports() {
+    let Some(headers) = read_vendored_public_headers() else {
+        return;
+    };
+    let registry_exports = headers
+        .iter()
+        .filter(|(path, _)| path.ends_with("-registry.h"))
+        .flat_map(|(_, header)| exported_c_functions(header))
+        .collect::<BTreeSet<_>>();
+
+    assert!(
+        registry_exports.is_empty(),
+        "registry headers should contribute public constants, not non-BLOSC_EXPORT bootstrap helpers: {registry_exports:?}"
+    );
+
+    let matrix = API_MATRIX
+        .iter()
+        .map(|row| row.c_name)
+        .collect::<BTreeSet<_>>();
+    for helper in ["register_codecs", "register_filters", "register_tuners"] {
+        assert!(
+            !matrix.contains(helper),
+            "non-BLOSC_EXPORT registry bootstrap helper should not be tracked as a public C API row: {helper}"
+        );
+    }
+}
+
+#[test]
 fn mapped_public_api_rows_are_reexported_from_the_crate_root() {
     let root_exports = crate_root_exports();
     let missing = API_MATRIX
@@ -336,7 +366,7 @@ fn public_api_matrix_locks_known_b2nd_parity_statuses() {
             "b2nd_concatenate",
             ApiStatus::Partial,
             Some("b2nd_concatenate"),
-            "exact C pointer aliasing",
+            "returns a clone of the updated left array",
         ),
         (
             "b2nd_get_orthogonal_selection",
@@ -371,6 +401,143 @@ fn public_api_matrix_locks_known_b2nd_parity_statuses() {
             row.note
         );
     }
+}
+
+#[test]
+fn public_b2nd_slice_count_aliases_match_current_c_source_expectations() {
+    let root_exports = crate_root_exports();
+    for symbol in ["b2nd_get_slice_nchunks", "b2nd_get_slice_nchunks_vec"] {
+        assert!(
+            root_exports.contains(symbol),
+            "public B2ND slice-count alias not re-exported from src/lib.rs: {symbol}"
+        );
+    }
+
+    let meta = B2ndMeta::new(
+        vec![4, 6],
+        vec![2, 3],
+        vec![1, 3],
+        "|u1",
+        DTYPE_NUMPY_FORMAT,
+    )
+    .unwrap();
+    let cparams = CParams {
+        compcode: BLOSC_LZ4,
+        clevel: 5,
+        typesize: 1,
+        splitmode: BLOSC_NEVER_SPLIT,
+        filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+        ..Default::default()
+    };
+    let data = (0..24).collect::<Vec<u8>>();
+    let array = b2nd_from_cbuffer(meta, &data, cparams.clone(), DParams::default()).unwrap();
+
+    assert_eq!(
+        b2nd_get_slice_nchunks_vec(&array, &[1, 2], &[4, 6]).unwrap(),
+        vec![0, 1, 2, 3]
+    );
+    assert_eq!(
+        b2nd_get_slice_nchunks(&array, &[1, 2], &[4, 6]),
+        (4, Some(vec![0, 1, 2, 3]))
+    );
+    assert_eq!(
+        b2nd_get_slice_nchunks(&array, &[1, 2], &[1, 2]),
+        (1, Some(vec![0]))
+    );
+    assert_eq!(b2nd_get_slice_nchunks(&array, &[2, 3], &[2, 3]), (0, None));
+
+    let empty_meta = B2ndMeta::new(
+        vec![0, 6],
+        vec![0, 3],
+        vec![0, 3],
+        "|u1",
+        DTYPE_NUMPY_FORMAT,
+    )
+    .unwrap();
+    let empty_array = b2nd_from_cbuffer(empty_meta, &[], cparams, DParams::default()).unwrap();
+    assert_eq!(
+        b2nd_get_slice_nchunks(&empty_array, &[0, 100], &[0, 101]),
+        (0, None)
+    );
+}
+
+#[test]
+fn c_style_root_exports_cover_implemented_adapter_variants() {
+    let root_exports = crate_root_exports();
+    let missing = required_c_style_root_exports()
+        .iter()
+        .filter(|symbol| !root_exports.contains(**symbol))
+        .copied()
+        .collect::<Vec<_>>();
+
+    assert!(
+        missing.is_empty(),
+        "implemented C-style adapter variants not re-exported from src/lib.rs: {missing:?}"
+    );
+}
+
+#[test]
+fn callback_type_aliases_are_reexported_from_the_crate_root() {
+    let root_exports = crate_root_exports();
+    let required = [
+        "Blosc2CodecEncoderCb",
+        "Blosc2CodecDecoderCb",
+        "Blosc2PrefilterCb",
+        "Blosc2PostfilterCb",
+        "Blosc2FilterForwardCb",
+        "Blosc2FilterBackwardCb",
+    ];
+    let missing = required
+        .iter()
+        .filter(|symbol| !root_exports.contains(**symbol))
+        .copied()
+        .collect::<Vec<_>>();
+
+    assert!(
+        missing.is_empty(),
+        "public callback type aliases not re-exported from src/lib.rs: {missing:?}"
+    );
+
+    let _: Option<Blosc2CodecEncoderCb> = None;
+    let _: Option<Blosc2CodecDecoderCb> = None;
+    let _: Blosc2PrefilterCb = None;
+    let _: Blosc2PostfilterCb = None;
+    let _: Option<Blosc2FilterForwardCb> = None;
+    let _: Option<Blosc2FilterBackwardCb> = None;
+}
+
+#[test]
+fn context_param_structs_keep_public_cparams_and_callback_fields() {
+    let cparams = CParams::default();
+    assert_eq!(cparams.compcode, BLOSC_BLOSCLZ);
+    assert_eq!(cparams.compcode_meta, 0);
+    assert_eq!(cparams.clevel, 5);
+    assert!(!cparams.use_dict);
+    assert_eq!(cparams.typesize, 8);
+    assert_eq!(cparams.nthreads, 1);
+    assert_eq!(cparams.blocksize, 0);
+    assert_eq!(cparams.splitmode, BLOSC_FORWARD_COMPAT_SPLIT);
+    assert_eq!(cparams.schunk, 0);
+    assert_eq!(cparams.filters, [0, 0, 0, 0, 0, BLOSC_SHUFFLE]);
+    assert_eq!(cparams.filters_meta, [0; BLOSC2_MAX_FILTERS]);
+    assert!(cparams.prefilter.is_none());
+    assert_eq!(cparams.prefilter_user_data, 0);
+    assert_eq!(cparams.prefilter_output_typesize, 0);
+    assert!(!cparams.prefilter_output_is_disposable);
+    assert_eq!(cparams.codec_params, 0);
+    assert!(!cparams.instr_codec);
+    assert_eq!(cparams.nchunk, -1);
+    assert!(cparams.b2nd_metalayer.is_none());
+
+    let dparams = DParams::default();
+    assert_eq!(dparams.nthreads, 1);
+    assert_eq!(dparams.schunk, 0);
+    assert!(dparams.postfilter.is_none());
+    assert_eq!(dparams.postfilter_user_data, 0);
+    assert_eq!(dparams.typesize, 8);
+    assert_eq!(dparams.nchunk, -1);
+    assert!(dparams.b2nd_metalayer.is_none());
+    assert!(dparams.block_maskout.is_none());
 }
 
 #[test]
@@ -456,6 +623,18 @@ fn public_constants_match_vendored_c_header_values() {
         .iter()
         .map(|(name, _)| *name)
         .collect::<BTreeSet<_>>();
+    let root_exports = crate_root_exports();
+    let root_exported_c_constants_missing_from_matrix = c_constants
+        .keys()
+        .filter(|name| root_exports.contains(name.as_str()))
+        .filter(|name| !rust_constant_names.contains(name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        root_exported_c_constants_missing_from_matrix.is_empty(),
+        "root-exported C integer constants missing from public Rust constant matrix: {root_exported_c_constants_missing_from_matrix:?}"
+    );
+
     let missing_rust_constants = required_public_c_integer_constants()
         .iter()
         .filter(|name| c_constants.contains_key(**name))
@@ -510,6 +689,14 @@ fn public_b2nd_string_constants_match_vendored_header_values() {
         Some(BLOSC2_VERSION_DATE)
     );
     assert_eq!(
+        c_strings.get("BLOSC_VERSION_STRING").map(String::as_str),
+        Some(BLOSC_VERSION_STRING)
+    );
+    assert_eq!(
+        c_strings.get("BLOSC_VERSION_DATE").map(String::as_str),
+        Some(BLOSC_VERSION_DATE)
+    );
+    assert_eq!(
         c_strings.get("BLOSC_BLOSCLZ_COMPNAME").map(String::as_str),
         Some(BLOSC_BLOSCLZ_COMPNAME)
     );
@@ -547,6 +734,148 @@ fn public_b2nd_string_constants_match_vendored_header_values() {
     );
     assert_eq!(B2ND_DEFAULT_DTYPE_FORMAT, DTYPE_NUMPY_FORMAT);
     assert_eq!(B2ND_METALAYER_NAME, "b2nd");
+}
+
+fn required_c_style_root_exports() -> &'static [&'static str] {
+    &[
+        "blosc_init",
+        "blosc_destroy",
+        "blosc_free_resources",
+        "blosc_compress",
+        "blosc_decompress",
+        "blosc_getitem",
+        "blosc_get_nthreads",
+        "blosc_set_nthreads",
+        "blosc_get_compressor",
+        "blosc_set_compressor",
+        "blosc_set_compressor_c",
+        "blosc_get_blocksize",
+        "blosc_set_blocksize",
+        "blosc_set_splitmode",
+        "blosc_compcode_to_compname",
+        "blosc_compname_to_compcode",
+        "blosc_list_compressors",
+        "blosc_get_version_string",
+        "blosc_get_complib_info",
+        "blosc_cbuffer_sizes",
+        "blosc_cbuffer_validate",
+        "blosc_cbuffer_metainfo",
+        "blosc_cbuffer_versions",
+        "blosc_cbuffer_complib",
+        "blosc1_compress_c",
+        "blosc1_decompress_c",
+        "blosc1_set_compressor_c",
+        "blosc2_compcode_to_compname_c",
+        "blosc2_compcode_to_compname_int_c",
+        "blosc2_compname_to_compcode_c",
+        "blosc2_create_cctx_c",
+        "blosc2_create_dctx_c",
+        "blosc2_free_ctx_c",
+        "blosc2_getitem_c",
+        "blosc2_getitem_ctx_c",
+        "blosc2_vlcompress_ctx_c",
+        "blosc2_vldecompress_ctx_c",
+        "blosc2_vlchunk_get_nblocks_c",
+        "blosc2_vldecompress_block_ctx_c",
+        "blosc2_chunk_zeros_c",
+        "blosc2_chunk_nans_c",
+        "blosc2_chunk_repeatval_c",
+        "blosc2_chunk_uninit_c",
+        "blosc2_cbuffer_metainfo2_c",
+        "blosc2_register_codec_c",
+        "register_blosc2_filter_c",
+        "blosc2_schunk_new_c",
+        "blosc2_schunk_free_c",
+        "blosc2_schunk_from_buffer_c",
+        "blosc2_schunk_from_buffer_owned_c",
+        "blosc2_schunk_open_c",
+        "blosc2_schunk_open_offset_c",
+        "blosc2_schunk_open_lazy_c",
+        "blosc2_schunk_open_lazy_offset_c",
+        "blosc2_schunk_copy_c",
+        "blosc2_schunk_append_chunk_c",
+        "blosc2_schunk_update_chunk_c",
+        "blosc2_schunk_insert_chunk_c",
+        "blosc2_schunk_append_buffer_c",
+        "blosc2_schunk_insert_buffer_c",
+        "blosc2_schunk_update_buffer_c",
+        "blosc2_schunk_append_vlblocks_c",
+        "blosc2_schunk_insert_vlblocks_c",
+        "blosc2_schunk_update_vlblocks_c",
+        "blosc2_schunk_get_lazychunk_c",
+        "blosc2_schunk_decompress_chunk_c",
+        "blosc2_schunk_decompress_vlblock_c",
+        "blosc2_schunk_get_cparams_c",
+        "blosc2_schunk_get_dparams_c",
+        "blosc2_schunk_get_slice_nchunks_c",
+        "blosc2_schunk_get_slice_buffer_c",
+        "blosc2_schunk_get_slice_buffer_size_c",
+        "blosc2_schunk_set_slice_buffer_c",
+        "blosc2_schunk_set_slice_buffer_size_c",
+        "blosc2_meta_add_c",
+        "blosc2_meta_update_c",
+        "blosc2_vlmeta_add_c",
+        "blosc2_vlmeta_update_c",
+        "b2nd_create_ctx_c",
+        "b2nd_create_ctx_parts_c",
+        "b2nd_create_ctx_with_storage_c",
+        "b2nd_create_ctx_parts_with_storage_c",
+        "b2nd_free_ctx_c",
+        "b2nd_uninit_c",
+        "b2nd_uninit_ctx_c",
+        "b2nd_empty_c",
+        "b2nd_empty_ctx_c",
+        "b2nd_zeros_c",
+        "b2nd_zeros_ctx_c",
+        "b2nd_nans_c",
+        "b2nd_nans_ctx_c",
+        "b2nd_full_c",
+        "b2nd_full_ctx_c",
+        "b2nd_free_c",
+        "b2nd_free_option_c",
+        "b2nd_from_schunk_c",
+        "b2nd_to_cframe_c",
+        "b2nd_from_cframe_c",
+        "b2nd_open_c",
+        "b2nd_open_offset_c",
+        "b2nd_from_cbuffer_c",
+        "b2nd_from_cbuffer_ctx_c",
+        "b2nd_to_cbuffer_c",
+        "b2nd_get_slice_c",
+        "b2nd_get_slice_ctx_c",
+        "b2nd_get_slice_cbuffer_c",
+        "b2nd_set_slice_cbuffer_c",
+        "b2nd_copy_c",
+        "b2nd_copy_ctx_c",
+        "b2nd_concatenate_c",
+        "b2nd_concatenate_axis_c",
+        "b2nd_concatenate_ctx_c",
+        "b2nd_concatenate_ctx_axis_c",
+        "b2nd_print_meta_c",
+        "b2nd_print_meta_to_buffer_c",
+        "b2nd_resize_c",
+        "b2nd_insert_c",
+        "b2nd_insert_axis_c",
+        "b2nd_append_c",
+        "b2nd_append_axis_c",
+        "b2nd_delete_c",
+        "b2nd_delete_axis_c",
+        "b2nd_get_orthogonal_selection_c",
+        "b2nd_get_orthogonal_selection_c_sizes_c",
+        "b2nd_get_orthogonal_selection_count_c",
+        "b2nd_get_orthogonal_selection_cbuffer_c",
+        "b2nd_set_orthogonal_selection_c",
+        "b2nd_set_orthogonal_selection_c_sizes_c",
+        "b2nd_set_orthogonal_selection_count_c",
+        "b2nd_set_orthogonal_selection_cbuffer_c",
+        "b2nd_serialize_meta_c",
+        "b2nd_serialize_meta_parts_c",
+        "b2nd_deserialize_meta_c",
+        "b2nd_squeeze_index_c",
+        "b2nd_squeeze_c",
+        "b2nd_expand_dims_c",
+        "b2nd_expand_dims_final_c",
+    ]
 }
 
 fn read_vendored_public_headers() -> Option<Vec<(&'static str, String)>> {
@@ -600,6 +929,9 @@ fn public_constant_matrix() -> &'static [(&'static str, i64)] {
         ("BLOSC2_VERSION_MAJOR", BLOSC2_VERSION_MAJOR as i64),
         ("BLOSC2_VERSION_MINOR", BLOSC2_VERSION_MINOR as i64),
         ("BLOSC2_VERSION_RELEASE", BLOSC2_VERSION_RELEASE as i64),
+        ("BLOSC_VERSION_MAJOR", BLOSC_VERSION_MAJOR as i64),
+        ("BLOSC_VERSION_MINOR", BLOSC_VERSION_MINOR as i64),
+        ("BLOSC_VERSION_RELEASE", BLOSC_VERSION_RELEASE as i64),
         (
             "BLOSC1_VERSION_FORMAT_PRE1",
             BLOSC1_VERSION_FORMAT_PRE1 as i64,
@@ -644,7 +976,9 @@ fn public_constant_matrix() -> &'static [(&'static str, i64)] {
             BLOSC_EXTENDED_HEADER_LENGTH as i64,
         ),
         ("BLOSC2_MAX_OVERHEAD", BLOSC2_MAX_OVERHEAD as i64),
+        ("BLOSC_MAX_OVERHEAD", BLOSC_MAX_OVERHEAD as i64),
         ("BLOSC2_MAX_BUFFERSIZE", BLOSC2_MAX_BUFFERSIZE as i64),
+        ("BLOSC_MAX_BUFFERSIZE", BLOSC_MAX_BUFFERSIZE as i64),
         ("BLOSC_MAX_TYPESIZE", BLOSC_MAX_TYPESIZE as i64),
         ("BLOSC_MIN_BUFFERSIZE", BLOSC_MIN_BUFFERSIZE as i64),
         (
@@ -682,6 +1016,110 @@ fn public_constant_matrix() -> &'static [(&'static str, i64)] {
             "BLOSC_LAST_REGISTERED_TUNE",
             BLOSC_LAST_REGISTERED_TUNE as i64,
         ),
+        ("BLOSC2_ERROR_SUCCESS", BLOSC2_ERROR_SUCCESS as i64),
+        ("BLOSC2_ERROR_FAILURE", BLOSC2_ERROR_FAILURE as i64),
+        ("BLOSC2_ERROR_STREAM", BLOSC2_ERROR_STREAM as i64),
+        ("BLOSC2_ERROR_DATA", BLOSC2_ERROR_DATA as i64),
+        (
+            "BLOSC2_ERROR_MEMORY_ALLOC",
+            BLOSC2_ERROR_MEMORY_ALLOC as i64,
+        ),
+        ("BLOSC2_ERROR_READ_BUFFER", BLOSC2_ERROR_READ_BUFFER as i64),
+        (
+            "BLOSC2_ERROR_WRITE_BUFFER",
+            BLOSC2_ERROR_WRITE_BUFFER as i64,
+        ),
+        (
+            "BLOSC2_ERROR_CODEC_SUPPORT",
+            BLOSC2_ERROR_CODEC_SUPPORT as i64,
+        ),
+        ("BLOSC2_ERROR_CODEC_PARAM", BLOSC2_ERROR_CODEC_PARAM as i64),
+        ("BLOSC2_ERROR_CODEC_DICT", BLOSC2_ERROR_CODEC_DICT as i64),
+        (
+            "BLOSC2_ERROR_VERSION_SUPPORT",
+            BLOSC2_ERROR_VERSION_SUPPORT as i64,
+        ),
+        (
+            "BLOSC2_ERROR_INVALID_HEADER",
+            BLOSC2_ERROR_INVALID_HEADER as i64,
+        ),
+        (
+            "BLOSC2_ERROR_INVALID_PARAM",
+            BLOSC2_ERROR_INVALID_PARAM as i64,
+        ),
+        ("BLOSC2_ERROR_FILE_READ", BLOSC2_ERROR_FILE_READ as i64),
+        ("BLOSC2_ERROR_FILE_WRITE", BLOSC2_ERROR_FILE_WRITE as i64),
+        ("BLOSC2_ERROR_FILE_OPEN", BLOSC2_ERROR_FILE_OPEN as i64),
+        ("BLOSC2_ERROR_NOT_FOUND", BLOSC2_ERROR_NOT_FOUND as i64),
+        ("BLOSC2_ERROR_RUN_LENGTH", BLOSC2_ERROR_RUN_LENGTH as i64),
+        (
+            "BLOSC2_ERROR_FILTER_PIPELINE",
+            BLOSC2_ERROR_FILTER_PIPELINE as i64,
+        ),
+        (
+            "BLOSC2_ERROR_CHUNK_INSERT",
+            BLOSC2_ERROR_CHUNK_INSERT as i64,
+        ),
+        (
+            "BLOSC2_ERROR_CHUNK_APPEND",
+            BLOSC2_ERROR_CHUNK_APPEND as i64,
+        ),
+        (
+            "BLOSC2_ERROR_CHUNK_UPDATE",
+            BLOSC2_ERROR_CHUNK_UPDATE as i64,
+        ),
+        ("BLOSC2_ERROR_2GB_LIMIT", BLOSC2_ERROR_2GB_LIMIT as i64),
+        ("BLOSC2_ERROR_SCHUNK_COPY", BLOSC2_ERROR_SCHUNK_COPY as i64),
+        ("BLOSC2_ERROR_FRAME_TYPE", BLOSC2_ERROR_FRAME_TYPE as i64),
+        (
+            "BLOSC2_ERROR_FILE_TRUNCATE",
+            BLOSC2_ERROR_FILE_TRUNCATE as i64,
+        ),
+        (
+            "BLOSC2_ERROR_THREAD_CREATE",
+            BLOSC2_ERROR_THREAD_CREATE as i64,
+        ),
+        ("BLOSC2_ERROR_POSTFILTER", BLOSC2_ERROR_POSTFILTER as i64),
+        (
+            "BLOSC2_ERROR_FRAME_SPECIAL",
+            BLOSC2_ERROR_FRAME_SPECIAL as i64,
+        ),
+        (
+            "BLOSC2_ERROR_SCHUNK_SPECIAL",
+            BLOSC2_ERROR_SCHUNK_SPECIAL as i64,
+        ),
+        ("BLOSC2_ERROR_PLUGIN_IO", BLOSC2_ERROR_PLUGIN_IO as i64),
+        ("BLOSC2_ERROR_FILE_REMOVE", BLOSC2_ERROR_FILE_REMOVE as i64),
+        (
+            "BLOSC2_ERROR_NULL_POINTER",
+            BLOSC2_ERROR_NULL_POINTER as i64,
+        ),
+        (
+            "BLOSC2_ERROR_INVALID_INDEX",
+            BLOSC2_ERROR_INVALID_INDEX as i64,
+        ),
+        (
+            "BLOSC2_ERROR_METALAYER_NOT_FOUND",
+            BLOSC2_ERROR_METALAYER_NOT_FOUND as i64,
+        ),
+        (
+            "BLOSC2_ERROR_MAX_BUFSIZE_EXCEEDED",
+            BLOSC2_ERROR_MAX_BUFSIZE_EXCEEDED as i64,
+        ),
+        ("BLOSC2_ERROR_TUNER", BLOSC2_ERROR_TUNER as i64),
+        ("BLOSC2_IO_FILESYSTEM", BLOSC2_IO_FILESYSTEM as i64),
+        (
+            "BLOSC2_IO_FILESYSTEM_MMAP",
+            BLOSC2_IO_FILESYSTEM_MMAP as i64,
+        ),
+        (
+            "BLOSC_IO_LAST_BLOSC_DEFINED",
+            BLOSC_IO_LAST_BLOSC_DEFINED as i64,
+        ),
+        ("BLOSC_IO_LAST_REGISTERED", BLOSC_IO_LAST_REGISTERED as i64),
+        ("BLOSC2_IO_BLOSC_DEFINED", BLOSC2_IO_BLOSC_DEFINED as i64),
+        ("BLOSC2_IO_REGISTERED", BLOSC2_IO_REGISTERED as i64),
+        ("BLOSC2_IO_USER_DEFINED", BLOSC2_IO_USER_DEFINED as i64),
         (
             "BLOSC2_DEFINED_FILTERS_START",
             BLOSC2_DEFINED_FILTERS_START as i64,
@@ -723,6 +1161,14 @@ fn public_constant_matrix() -> &'static [(&'static str, i64)] {
             "BLOSC_LAST_REGISTERED_FILTER",
             BLOSC_LAST_REGISTERED_FILTER as i64,
         ),
+        ("BLOSC_FILTER_NDCELL", BLOSC_FILTER_NDCELL as i64),
+        ("BLOSC_FILTER_NDMEAN", BLOSC_FILTER_NDMEAN as i64),
+        (
+            "BLOSC_FILTER_BYTEDELTA_BUGGY",
+            BLOSC_FILTER_BYTEDELTA_BUGGY as i64,
+        ),
+        ("BLOSC_FILTER_BYTEDELTA", BLOSC_FILTER_BYTEDELTA as i64),
+        ("BLOSC_FILTER_INT_TRUNC", BLOSC_FILTER_INT_TRUNC as i64),
         ("BLOSC_DOSHUFFLE", BLOSC_DOSHUFFLE as i64),
         ("BLOSC_MEMCPYED", BLOSC_MEMCPYED as i64),
         ("BLOSC_DOBITSHUFFLE", BLOSC_DOBITSHUFFLE as i64),
@@ -768,6 +1214,22 @@ fn public_constant_matrix() -> &'static [(&'static str, i64)] {
         ("BLOSC_LZ4HC", BLOSC_LZ4HC as i64),
         ("BLOSC_ZLIB", BLOSC_ZLIB as i64),
         ("BLOSC_ZSTD", BLOSC_ZSTD as i64),
+        ("BLOSC_CODEC_NDLZ", BLOSC_CODEC_NDLZ as i64),
+        (
+            "BLOSC_CODEC_ZFP_FIXED_ACCURACY",
+            BLOSC_CODEC_ZFP_FIXED_ACCURACY as i64,
+        ),
+        (
+            "BLOSC_CODEC_ZFP_FIXED_PRECISION",
+            BLOSC_CODEC_ZFP_FIXED_PRECISION as i64,
+        ),
+        (
+            "BLOSC_CODEC_ZFP_FIXED_RATE",
+            BLOSC_CODEC_ZFP_FIXED_RATE as i64,
+        ),
+        ("BLOSC_CODEC_OPENHTJ2K", BLOSC_CODEC_OPENHTJ2K as i64),
+        ("BLOSC_CODEC_GROK", BLOSC_CODEC_GROK as i64),
+        ("BLOSC_CODEC_OPENZL", BLOSC_CODEC_OPENZL as i64),
         ("BLOSC_LAST_CODEC", BLOSC_LAST_CODEC as i64),
         (
             "BLOSC_LAST_REGISTERED_CODEC",
@@ -818,6 +1280,7 @@ fn public_constant_matrix() -> &'static [(&'static str, i64)] {
         ("BLOSC2_SPECIAL_NAN", BLOSC2_SPECIAL_NAN as i64),
         ("BLOSC2_SPECIAL_VALUE", BLOSC2_SPECIAL_VALUE as i64),
         ("BLOSC2_SPECIAL_UNINIT", BLOSC2_SPECIAL_UNINIT as i64),
+        ("BLOSC2_SPECIAL_LASTID", BLOSC2_SPECIAL_LASTID as i64),
         ("BLOSC2_SPECIAL_MASK", BLOSC2_SPECIAL_MASK as i64),
         ("BLOSC2_MAX_METALAYERS", BLOSC2_MAX_METALAYERS as i64),
         (
@@ -828,6 +1291,26 @@ fn public_constant_matrix() -> &'static [(&'static str, i64)] {
         (
             "BLOSC2_VLMETALAYERS_NAME_MAXLEN",
             BLOSC2_VLMETALAYERS_NAME_MAXLEN as i64,
+        ),
+        ("BLOSC2_CHUNK_VERSION", BLOSC2_CHUNK_VERSION as i64),
+        ("BLOSC2_CHUNK_VERSIONLZ", BLOSC2_CHUNK_VERSIONLZ as i64),
+        ("BLOSC2_CHUNK_FLAGS", BLOSC2_CHUNK_FLAGS as i64),
+        ("BLOSC2_CHUNK_TYPESIZE", BLOSC2_CHUNK_TYPESIZE as i64),
+        ("BLOSC2_CHUNK_NBYTES", BLOSC2_CHUNK_NBYTES as i64),
+        ("BLOSC2_CHUNK_BLOCKSIZE", BLOSC2_CHUNK_BLOCKSIZE as i64),
+        ("BLOSC2_CHUNK_CBYTES", BLOSC2_CHUNK_CBYTES as i64),
+        (
+            "BLOSC2_CHUNK_FILTER_CODES",
+            BLOSC2_CHUNK_FILTER_CODES as i64,
+        ),
+        ("BLOSC2_CHUNK_FILTER_META", BLOSC2_CHUNK_FILTER_META as i64),
+        (
+            "BLOSC2_CHUNK_BLOSC2_FLAGS2",
+            BLOSC2_CHUNK_BLOSC2_FLAGS2 as i64,
+        ),
+        (
+            "BLOSC2_CHUNK_BLOSC2_FLAGS",
+            BLOSC2_CHUNK_BLOSC2_FLAGS as i64,
         ),
         ("BLOSC2_MAX_DIM", BLOSC2_MAX_DIM as i64),
         ("B2ND_METALAYER_VERSION", B2ND_METALAYER_VERSION as i64),
@@ -901,6 +1384,7 @@ fn exported_c_integer_constants(header: &str) -> BTreeMap<String, i64> {
         ("INT_MAX".to_string(), i32::MAX as i64),
         ("UINT8_MAX".to_string(), u8::MAX as i64),
     ]);
+    let mut defines = Vec::new();
     let mut in_enum = false;
     let mut next_enum_value = 0i64;
 
@@ -909,6 +1393,7 @@ fn exported_c_integer_constants(header: &str) -> BTreeMap<String, i64> {
         if let Some(rest) = line.strip_prefix("#define ") {
             if let Some((name, expr)) = rest.split_once(char::is_whitespace) {
                 if is_constant_name(name) {
+                    defines.push((name.to_string(), expr.trim().to_string()));
                     if let Some(value) = eval_c_int_expr(expr.trim(), &constants) {
                         constants.insert(name.to_string(), value);
                     }
@@ -947,12 +1432,14 @@ fn exported_c_integer_constants(header: &str) -> BTreeMap<String, i64> {
         next_enum_value = value + 1;
     }
 
+    resolve_integer_defines(&defines, &mut constants);
     constants
 }
 
 fn exported_c_string_constants(header: &str) -> BTreeMap<String, String> {
     let without_comments = strip_c_comments(header);
     let mut constants = BTreeMap::new();
+    let mut defines = Vec::new();
     for raw_line in without_comments.lines() {
         let line = raw_line.trim();
         let Some(rest) = line.strip_prefix("#define ") else {
@@ -965,6 +1452,7 @@ fn exported_c_string_constants(header: &str) -> BTreeMap<String, String> {
             continue;
         }
         let expr = expr.trim();
+        defines.push((name.to_string(), expr.to_string()));
         if let Some(value) = expr
             .strip_prefix('"')
             .and_then(|rest| rest.split_once('"').map(|(value, _)| value))
@@ -972,7 +1460,40 @@ fn exported_c_string_constants(header: &str) -> BTreeMap<String, String> {
             constants.insert(name.to_string(), value.to_string());
         }
     }
+    resolve_string_defines(&defines, &mut constants);
     constants
+}
+
+fn resolve_integer_defines(defines: &[(String, String)], constants: &mut BTreeMap<String, i64>) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (name, expr) in defines {
+            if constants.contains_key(name) {
+                continue;
+            }
+            if let Some(value) = eval_c_int_expr(expr, constants) {
+                constants.insert(name.clone(), value);
+                changed = true;
+            }
+        }
+    }
+}
+
+fn resolve_string_defines(defines: &[(String, String)], constants: &mut BTreeMap<String, String>) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (name, expr) in defines {
+            if constants.contains_key(name) {
+                continue;
+            }
+            if let Some(value) = constants.get(expr.trim()).cloned() {
+                constants.insert(name.clone(), value);
+                changed = true;
+            }
+        }
+    }
 }
 
 fn is_constant_name(name: &str) -> bool {
@@ -1007,6 +1528,13 @@ fn eval_c_int_expr(expr: &str, constants: &BTreeMap<String, i64>) -> Option<i64>
         .collect::<Option<Vec<_>>>()?;
     if values.is_empty() {
         return None;
+    }
+    if operators.len() == 1
+        && operators[0] == '-'
+        && expr.trim_start().starts_with('-')
+        && values.len() == 1
+    {
+        return Some(-values[0]);
     }
     if operators.is_empty() {
         return Some(values[0]);

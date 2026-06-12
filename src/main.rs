@@ -5,11 +5,15 @@
 //! filter, thread count) are exposed as flags; decompression can optionally override the frame
 //! thread count.
 
-use blosc2_pure_rs::compress::{CParams, DParams};
+use blosc2_pure_rs::compress::{self, CParams, DParams};
 use blosc2_pure_rs::constants::*;
-use blosc2_pure_rs::schunk::{frame, Schunk};
-use clap::{Parser, Subcommand};
-use std::fs::File;
+#[cfg(test)]
+use blosc2_pure_rs::schunk::blosc2_schunk_decompress_chunk_c;
+use blosc2_pure_rs::schunk::{frame, LazySchunk, Schunk};
+use blosc2_pure_rs::utils::normalize_urlpath;
+use clap::{error::ErrorKind, Parser, Subcommand};
+use std::borrow::Cow;
+use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -31,6 +35,8 @@ enum Commands {
         input: PathBuf,
         /// Output file path (.b2frame)
         output: PathBuf,
+        #[arg(hide = true)]
+        extra: Vec<PathBuf>,
         /// Compression codec
         #[arg(short, long, default_value = "blosclz")]
         codec: String,
@@ -65,6 +71,8 @@ enum Commands {
         input: PathBuf,
         /// Output file path
         output: PathBuf,
+        #[arg(hide = true)]
+        extra: Vec<PathBuf>,
         /// Number of threads; defaults to the value stored in the frame
         #[arg(short, long, value_parser = clap::value_parser!(i16).range(1..))]
         nthreads: Option<i16>,
@@ -111,8 +119,6 @@ fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::R
         ));
     }
 
-    let foutput = File::create(output)?;
-
     let mut filters_meta = [0; BLOSC2_MAX_FILTERS];
     filters_meta[BLOSC2_MAX_FILTERS - 1] = options.filter_meta;
     let cparams = CParams {
@@ -135,34 +141,105 @@ fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::R
 
     let mut schunk = Schunk::new(cparams, dparams);
 
+    remove_existing_output_like_c(output);
+    if c_frame_storage_output_still_exists(output) {
+        return Err(io::Error::other(
+            "Error in appending data to destination file",
+        ));
+    }
+    write_frame_to_path(&schunk, output)?;
+
     let start = Instant::now();
 
-    let mut finput = File::open(input)?;
+    let mut finput =
+        File::open(input).map_err(|_| io::Error::other("Input file cannot be open."))?;
     let mut buf = vec![0u8; options.chunksize];
 
-    loop {
-        let bytes_read = read_next_chunk(&mut finput, &mut buf)?;
-        let chunk = &buf[..bytes_read];
+    let first_read = read_next_chunk(&mut finput, &mut buf)?;
+    if first_read == 0 {
         schunk
-            .append_buffer(chunk)
-            .map_err(|e| io::Error::other(format!("Error compressing: {e}")))?;
-        if bytes_read < options.chunksize {
-            break;
+            .append_buffer(&[])
+            .map_err(|_| io::Error::other("Error in appending data to destination file"))?;
+        write_frame_to_path(&schunk, output)
+            .map_err(|_| io::Error::other("Error in appending data to destination file"))?;
+
+        let nbytes = schunk.nbytes;
+        let elapsed = start.elapsed().as_secs_f64();
+        let cbytes = schunk.cbytes;
+
+        print_compression_stats(nbytes, cbytes, elapsed);
+        return Ok(());
+    }
+
+    let final_output = normalize_c_urlpath(output);
+    let file = File::create(final_output.as_ref())?;
+    let mut stream = frame::FixedFrameStreamWriter::new(&schunk, file)
+        .map_err(|_| io::Error::other("Error in appending data to destination file"))?;
+    let mut nchunk = 0i64;
+    append_streamed_compressed_chunk(&schunk, &mut stream, &buf[..first_read], nchunk)?;
+    nchunk += 1;
+
+    if first_read == options.chunksize {
+        loop {
+            let bytes_read = read_next_chunk(&mut finput, &mut buf)?;
+            append_streamed_compressed_chunk(&schunk, &mut stream, &buf[..bytes_read], nchunk)?;
+            nchunk += 1;
+            if bytes_read < options.chunksize {
+                break;
+            }
         }
     }
 
-    let nbytes = schunk.nbytes;
-    {
-        let mut writer = BufWriter::new(foutput);
-        frame::write_frame_to_writer(&schunk, &mut writer)?;
-        writer.flush()?;
-    }
+    let nbytes = stream.nbytes();
+    let cbytes = stream.cbytes();
+    stream
+        .finish()
+        .map_err(|_| io::Error::other("Error in appending data to destination file"))?;
     let elapsed = start.elapsed().as_secs_f64();
-    let cbytes = frame_equivalent_cbytes(output)?;
 
     print_compression_stats(nbytes, cbytes, elapsed);
 
     Ok(())
+}
+
+fn append_streamed_compressed_chunk<W: Write + io::Seek>(
+    schunk: &Schunk,
+    stream: &mut frame::FixedFrameStreamWriter<W>,
+    chunk: &[u8],
+    nchunk: i64,
+) -> io::Result<()> {
+    let mut cparams = schunk.cparams.clone();
+    cparams.nchunk = nchunk;
+    cparams.schunk = schunk as *const Schunk as usize;
+    let compressed = compress::compress(chunk, &cparams)
+        .map_err(|_| io::Error::other("Error in appending data to destination file"))?;
+    stream
+        .append_compressed_chunk(&compressed)
+        .map_err(|_| io::Error::other("Error in appending data to destination file"))
+}
+
+fn write_frame_to_path(schunk: &Schunk, output: &Path) -> io::Result<()> {
+    let output = normalize_c_urlpath(output);
+    let mut writer = BufWriter::new(File::create(output)?);
+    frame::write_frame_to_writer(schunk, &mut writer)?;
+    writer.flush()
+}
+
+fn remove_existing_output_like_c(output: &Path) {
+    if fs::remove_file(output).is_err() {
+        let _ = fs::remove_dir(output);
+    }
+}
+
+fn c_frame_storage_output_still_exists(output: &Path) -> bool {
+    fs::metadata(normalize_c_urlpath(output).as_ref()).is_ok()
+}
+
+fn normalize_c_urlpath(path: &Path) -> Cow<'_, Path> {
+    match path.to_str() {
+        Some(path) => Cow::Owned(Path::new(normalize_urlpath(path)).to_path_buf()),
+        None => Cow::Borrowed(path),
+    }
 }
 
 fn read_next_chunk<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
@@ -184,12 +261,12 @@ fn read_next_chunk<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize>
 /// Like the C example, mid-stream decompression failures can leave the chunks already written.
 /// Prints ratio and throughput statistics on completion.
 fn decompress_file(input: &Path, output: &Path, nthreads: Option<i16>) -> io::Result<()> {
-    let mut schunk = Schunk::open_offset(input, 0)
+    let mut schunk = open_frame_lazy_like_c_example(input)
         .map_err(|e| io::Error::other(format!("Failed to open frame: {e}")))?;
-    apply_decompression_nthreads_override(&mut schunk, nthreads);
+    apply_lazy_decompression_nthreads_override(&mut schunk, nthreads);
 
     let start = Instant::now();
-    write_decompressed_chunks_direct(&schunk, output)?;
+    write_lazy_decompressed_chunks_direct(&schunk, output)?;
 
     let nbytes = schunk.nbytes;
     let cbytes = schunk.cbytes;
@@ -200,30 +277,129 @@ fn decompress_file(input: &Path, output: &Path, nthreads: Option<i16>) -> io::Re
     Ok(())
 }
 
+fn open_frame_lazy_like_c_example(input: &Path) -> Result<LazySchunk, String> {
+    if let Some(input) = input.to_str() {
+        return Schunk::open_lazy(input);
+    }
+    Schunk::open_lazy_offset(input, 0)
+}
+
+#[cfg(test)]
+fn open_frame_like_c_example(input: &Path) -> Result<Schunk, String> {
+    if let Some(input) = input.to_str() {
+        return Schunk::open(input);
+    }
+    Schunk::open_offset(input, 0)
+}
+
+#[cfg(test)]
 fn apply_decompression_nthreads_override(schunk: &mut Schunk, nthreads: Option<i16>) {
     if let Some(nthreads) = nthreads {
         schunk.dparams.nthreads = nthreads;
     }
 }
 
-fn write_decompressed_chunks_direct(schunk: &Schunk, output: &Path) -> io::Result<()> {
-    let mut foutput = File::create(output)?;
-    for i in 0..schunk.nchunks() {
-        let data = schunk
-            .decompress_chunk(i)
-            .map_err(|e| io::Error::other(format!("Decompression error: {e}")))?;
-        // Intentional Rust divergence from the C example: C ignores fwrite's result, while the
-        // CLI reports checked write failures instead of silently producing truncated output.
-        foutput.write_all(&data)?;
+fn apply_lazy_decompression_nthreads_override(schunk: &mut LazySchunk, nthreads: Option<i16>) {
+    if let Some(nthreads) = nthreads {
+        schunk.dparams.nthreads = nthreads;
     }
-    foutput.flush()?;
+}
+
+fn write_lazy_decompressed_chunks_direct(schunk: &LazySchunk, output: &Path) -> io::Result<()> {
+    let mut foutput =
+        File::create(output).map_err(|_| io::Error::other("Output file cannot be open."))?;
+    let result = write_lazy_decompressed_chunks_c_style(schunk, &mut foutput);
+    let _ = foutput.flush();
+    result
+}
+
+fn write_lazy_decompressed_chunks_c_style<W: Write>(
+    schunk: &LazySchunk,
+    writer: &mut W,
+) -> io::Result<()> {
+    let mut data = vec![0u8; schunk.chunksize];
+    for i in 0..schunk.nchunks() {
+        let chunk = schunk
+            .compressed_chunk(i)
+            .map_err(|_| io::Error::other("Decompression error.  Error code: -1"))?;
+        let (chunk_nbytes, _, _) = compress::cbuffer_sizes(&chunk)
+            .map_err(|_| io::Error::other("Decompression error.  Error code: -1"))?;
+        if chunk_nbytes > data.len() {
+            return Err(io::Error::other("Decompression error.  Error code: -6"));
+        }
+        let dsize = compress::decompress_into_with_dparams(&chunk, &mut data, &schunk.dparams)
+            .map_err(|_| io::Error::other("Decompression error.  Error code: -1"))?;
+        let _ = writer.write(&data[..dsize]);
+    }
     Ok(())
 }
 
-fn frame_equivalent_cbytes(path: &Path) -> io::Result<i64> {
-    Schunk::open_offset(path, 0)
-        .map(|schunk| schunk.cbytes)
-        .map_err(|e| io::Error::other(format!("Failed to reopen frame for stats: {e}")))
+#[cfg(test)]
+fn write_decompressed_chunks_direct(schunk: &Schunk, output: &Path) -> io::Result<()> {
+    let mut foutput =
+        File::create(output).map_err(|_| io::Error::other("Output file cannot be open."))?;
+    let result = write_decompressed_chunks_c_style(schunk, &mut foutput);
+    let _ = foutput.flush();
+    result
+}
+
+#[cfg(test)]
+fn write_decompressed_chunks_c_style<W: Write>(schunk: &Schunk, writer: &mut W) -> io::Result<()> {
+    let mut data = vec![0u8; schunk.chunksize];
+    for i in 0..schunk.nchunks() {
+        let dsize = blosc2_schunk_decompress_chunk_c(schunk, i, &mut data, schunk.chunksize as i64);
+        if dsize < 0 {
+            return Err(io::Error::other(format!(
+                "Decompression error.  Error code: {dsize}"
+            )));
+        }
+        let _ = writer.write(&data[..dsize as usize]);
+    }
+    Ok(())
+}
+
+fn c_example_exit_status(error: &io::Error) -> i32 {
+    let message = error.to_string();
+    if message == "Error in appending data to destination file" {
+        return -1;
+    }
+    if let Some(code) = message
+        .strip_prefix("Decompression error.  Error code: ")
+        .and_then(|code| code.parse::<i32>().ok())
+    {
+        return code;
+    }
+    1
+}
+
+fn c_example_print_error(error: &io::Error) {
+    let message = error.to_string();
+    let mut stdout = io::stdout().lock();
+    let mut stderr = io::stderr().lock();
+    c_example_write_error(&message, &mut stdout, &mut stderr);
+}
+
+fn c_example_write_error<WOut: Write, WErr: Write>(
+    message: &str,
+    stdout: &mut WOut,
+    stderr: &mut WErr,
+) {
+    match message {
+        "Input file cannot be open." | "Output file cannot be open." => {
+            let _ = stdout.write_all(message.as_bytes());
+            let _ = stdout.flush();
+        }
+        "Error in appending data to destination file" => {
+            let _ = stderr.write_all(message.as_bytes());
+            let _ = stderr.flush();
+        }
+        message if message.starts_with("Decompression error.  Error code: ") => {
+            let _ = writeln!(stderr, "{message}");
+        }
+        _ => {
+            let _ = writeln!(stderr, "Error: {message}");
+        }
+    }
 }
 
 /// Returns `numerator / denominator` using the same floating-point behavior as the C examples.
@@ -382,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn compression_stats_use_frame_equivalent_cbytes_like_c_example() {
+    fn compression_stats_use_live_schunk_cbytes_like_c_example() {
         let (ratio_line, time_line) =
             compression_stats_lines(4 * 1024 * 1024, 2 * 1024 * 1024, 0.5);
 
@@ -516,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn compress_truncates_destination_before_input_open_failure_like_c_example() {
+    fn compress_initializes_destination_before_input_open_failure_like_c_example() {
         let dir = tempfile::tempdir().unwrap();
         let missing_input = dir.path().join("missing.bin");
         let output = dir.path().join("out.b2frame");
@@ -529,8 +705,47 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
-        assert_eq!(std::fs::read(&output).unwrap(), b"");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "Input file cannot be open.");
+        let schunk = Schunk::open_offset(&output, 0).unwrap();
+        assert_eq!(schunk.nchunks(), 0);
+        assert_eq!(schunk.nbytes, 0);
+        assert_eq!(schunk.cbytes, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compress_removes_existing_output_path_instead_of_truncating_symlink_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.bin");
+        let symlink_target = dir.path().join("target.bin");
+        let output = dir.path().join("out.b2frame");
+        std::fs::write(&input, b"payload").unwrap();
+        std::fs::write(&symlink_target, b"keep target").unwrap();
+        std::os::unix::fs::symlink(&symlink_target, &output).unwrap();
+
+        compress_file(&input, &output, default_test_options(CLI_DEFAULT_CHUNKSIZE)).unwrap();
+
+        assert_eq!(std::fs::read(&symlink_target).unwrap(), b"keep target");
+        assert!(!std::fs::symlink_metadata(&output)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(Schunk::open_offset(&output, 0).unwrap().nbytes, 7);
+    }
+
+    #[test]
+    fn compress_removes_empty_output_directory_like_c_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.bin");
+        let output = dir.path().join("out.b2frame");
+        std::fs::write(&input, b"payload").unwrap();
+        std::fs::create_dir(&output).unwrap();
+
+        compress_file(&input, &output, default_test_options(CLI_DEFAULT_CHUNKSIZE)).unwrap();
+
+        assert!(output.is_file());
+        assert_eq!(Schunk::open_offset(&output, 0).unwrap().nbytes, 7);
     }
 
     #[test]
@@ -539,31 +754,69 @@ mod tests {
         let output = dir.path().join("restored.bin");
         let mut schunk = Schunk::new(CParams::default(), DParams::default());
         schunk.append_buffer(b"first chunk").unwrap();
-        schunk.append_buffer(b"second chunk").unwrap();
+        schunk.append_buffer(b"second data").unwrap();
+        assert_eq!(schunk.chunksize, b"first chunk".len());
         schunk.chunks[1] = b"not a valid blosc chunk".to_vec();
         std::fs::write(&output, b"old destination").unwrap();
 
         let err = write_decompressed_chunks_direct(&schunk, &output).unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(err
+            .to_string()
+            .starts_with("Decompression error.  Error code: "));
         assert_eq!(std::fs::read(&output).unwrap(), b"first chunk");
     }
 
     #[test]
-    fn frame_equivalent_cbytes_uses_serialized_special_offsets() {
-        let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("special-offsets.b2frame");
-        let mut schunk = Schunk::new(CParams::default(), DParams::default());
-        schunk.append_buffer(&vec![0u8; 128]).unwrap();
-        assert!(schunk.cbytes > 0);
-
-        {
-            let mut writer = BufWriter::new(File::create(&output).unwrap());
-            frame::write_frame_to_writer(&schunk, &mut writer).unwrap();
-            writer.flush().unwrap();
+    fn decompression_uses_one_unchecked_write_per_chunk_like_c_fwrite() {
+        struct PartialWriter {
+            written: Vec<u8>,
+            max_per_write: usize,
         }
 
-        assert_eq!(frame_equivalent_cbytes(&output).unwrap(), 0);
+        impl Write for PartialWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let len = self.max_per_write.min(buf.len());
+                self.written.extend_from_slice(&buf[..len]);
+                Ok(len)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut schunk = Schunk::new(CParams::default(), DParams::default());
+        schunk.append_buffer(b"abcdef").unwrap();
+        schunk.append_buffer(b"ghijkl").unwrap();
+        assert_eq!(schunk.chunksize, 6);
+
+        let mut writer = PartialWriter {
+            written: Vec::new(),
+            max_per_write: 3,
+        };
+
+        write_decompressed_chunks_c_style(&schunk, &mut writer).unwrap();
+
+        assert_eq!(writer.written, b"abcghi");
+    }
+
+    #[test]
+    fn decompression_uses_c_fixed_chunksize_buffer_for_variable_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("restored.bin");
+        let mut schunk = Schunk::new(CParams::default(), DParams::default());
+        schunk.append_buffer(b"first long chunk").unwrap();
+        schunk.append_buffer(b"short").unwrap();
+        schunk.append_buffer(b"another long chunk").unwrap();
+        assert_eq!(schunk.chunksize, 0);
+
+        let err = write_decompressed_chunks_direct(&schunk, &output).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "Decompression error.  Error code: -12");
+        assert_eq!(std::fs::read(&output).unwrap(), b"");
     }
 
     #[test]
@@ -601,6 +854,100 @@ mod tests {
 
         decompress_file(&output, &restored, Some(1)).unwrap();
         assert_eq!(std::fs::read(restored).unwrap(), data);
+    }
+
+    #[test]
+    fn decompress_open_accepts_file_url_like_c_example() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("url.b2frame");
+        let mut schunk = Schunk::new(CParams::default(), DParams::default());
+        schunk.append_buffer(b"url payload").unwrap();
+        write_frame_to_path(&schunk, &output).unwrap();
+
+        let file_url = PathBuf::from(format!("file:///{}", output.display()));
+
+        assert_eq!(open_frame_like_c_example(&file_url).unwrap().nbytes, 11);
+    }
+
+    #[test]
+    fn compress_output_file_url_preserves_existing_local_target_like_c_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.bin");
+        let output = dir.path().join("url-output.b2frame");
+        std::fs::write(&input, b"url output payload").unwrap();
+        std::fs::write(&output, b"stale frame").unwrap();
+
+        let file_url = PathBuf::from(format!("file:///{}", output.display()));
+
+        compress_file(
+            &input,
+            &file_url,
+            default_test_options(CLI_DEFAULT_CHUNKSIZE),
+        )
+        .unwrap_err();
+
+        assert_eq!(std::fs::read(&output).unwrap(), b"stale frame");
+    }
+
+    #[test]
+    fn compress_persists_each_appended_chunk_like_frame_backed_c_example() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("incremental.b2frame");
+        let mut schunk = Schunk::new(CParams::default(), DParams::default());
+
+        write_frame_to_path(&schunk, &output).unwrap();
+        assert_eq!(Schunk::open_offset(&output, 0).unwrap().nchunks(), 0);
+
+        schunk.append_buffer(b"first").unwrap();
+        write_frame_to_path(&schunk, &output).unwrap();
+        let persisted = Schunk::open_offset(&output, 0).unwrap();
+        assert_eq!(persisted.nchunks(), 1);
+        assert_eq!(persisted.decompress_chunk(0).unwrap(), b"first");
+
+        schunk.append_buffer(b"second").unwrap();
+        write_frame_to_path(&schunk, &output).unwrap();
+        let persisted = Schunk::open_offset(&output, 0).unwrap();
+        assert_eq!(persisted.nchunks(), 2);
+        assert_eq!(persisted.decompress_all().unwrap(), b"firstsecond");
+    }
+
+    #[test]
+    fn c_example_exit_status_preserves_negative_failure_codes() {
+        assert_eq!(
+            c_example_exit_status(&io::Error::other(
+                "Error in appending data to destination file"
+            )),
+            -1
+        );
+        assert_eq!(
+            c_example_exit_status(&io::Error::other("Decompression error.  Error code: -12")),
+            -12
+        );
+        assert_eq!(c_example_exit_status(&io::Error::other("other")), 1);
+    }
+
+    #[test]
+    fn c_example_error_output_matches_newline_conventions() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        c_example_write_error(
+            "Error in appending data to destination file",
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(stdout, b"");
+        assert_eq!(stderr, b"Error in appending data to destination file");
+
+        stdout.clear();
+        stderr.clear();
+        c_example_write_error(
+            "Decompression error.  Error code: -12",
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(stdout, b"");
+        assert_eq!(stderr, b"Decompression error.  Error code: -12\n");
     }
 }
 
@@ -640,10 +987,50 @@ fn parse_filter(s: &str) -> Option<u8> {
     }
 }
 
+fn parse_cli_like_c_examples() -> Cli {
+    match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            if error.kind() == ErrorKind::MissingRequiredArgument {
+                if let Some(usage) = c_example_usage_for_missing_args() {
+                    eprintln!("{usage}");
+                    std::process::exit(-1);
+                }
+            }
+            error.exit();
+        }
+    }
+}
+
+fn c_example_usage_for_missing_args() -> Option<&'static str> {
+    let subcommand = std::env::args_os().nth(1)?;
+    match subcommand.to_str()? {
+        "compress" => Some("Usage: compress_file input_file output_file.b2frame"),
+        "decompress" => Some("Usage: decompress_file input_file.b2frame output_file"),
+        _ => None,
+    }
+}
+
+fn c_example_usage_for_wrong_arg_count(cli: &Cli) -> Option<&'static str> {
+    match &cli.command {
+        Commands::Compress { extra, .. } if !extra.is_empty() => {
+            Some("Usage: compress_file input_file output_file.b2frame")
+        }
+        Commands::Decompress { extra, .. } if !extra.is_empty() => {
+            Some("Usage: decompress_file input_file.b2frame output_file")
+        }
+        _ => None,
+    }
+}
+
 /// CLI entry point: parses arguments, configures the rayon thread pool, and dispatches to the
 /// `compress` or `decompress` handler. Exits with status 1 on error.
 fn main() {
-    let cli = Cli::parse();
+    let cli = parse_cli_like_c_examples();
+    if let Some(usage) = c_example_usage_for_wrong_arg_count(&cli) {
+        eprintln!("{usage}");
+        std::process::exit(-1);
+    }
     print_version_info();
 
     // Set rayon global thread pool based on nthreads from first subcommand
@@ -662,6 +1049,7 @@ fn main() {
         Commands::Compress {
             input,
             output,
+            extra: _,
             codec,
             clevel,
             typesize,
@@ -712,12 +1100,13 @@ fn main() {
         Commands::Decompress {
             input,
             output,
+            extra: _,
             nthreads,
         } => decompress_file(input, output, *nthreads),
     };
 
     if let Err(e) = result {
-        eprintln!("Error: {}", e);
-        std::process::exit(1);
+        c_example_print_error(&e);
+        std::process::exit(c_example_exit_status(&e));
     }
 }

@@ -13,12 +13,19 @@ use crate::b2nd::B2ndMeta;
 use crate::constants::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ffi::{c_char, c_void, CStr};
 use std::sync::{OnceLock, RwLock};
 use zstd_pure_rs::common::error::{ErrorCode, ERROR};
 use zstd_pure_rs::common::xxhash::XXH64_state_t;
 use zstd_pure_rs::decompress::zstd_ddict::{ZSTD_DDict_dictContent, ZSTD_createDDict};
 use zstd_pure_rs::decompress::zstd_decompress_block::{ZSTD_DCtx, ZSTD_decoder_entropy_rep};
 use zstd_pure_rs::prelude::*;
+
+/// Opaque C-ABI prefilter callback slot in `blosc2_cparams`.
+pub type Blosc2PrefilterCb = Option<unsafe extern "C" fn(params: *mut c_void) -> i32>;
+
+/// Opaque C-ABI postfilter callback slot in `blosc2_dparams`.
+pub type Blosc2PostfilterCb = Option<unsafe extern "C" fn(params: *mut c_void) -> i32>;
 
 /// Signature for a user-defined compression function registered via
 /// [`register_codec`].
@@ -41,6 +48,7 @@ pub struct CodecCParamsContext {
     pub compcode: u8,
     pub compcode_meta: u8,
     pub clevel: u8,
+    pub use_dict: i32,
     pub typesize: i32,
     pub blocksize: i32,
     pub splitmode: i32,
@@ -49,6 +57,8 @@ pub struct CodecCParamsContext {
     pub nthreads: i16,
     pub nchunk: i64,
     pub user_data: usize,
+    pub instr_codec: bool,
+    pub codec_params: usize,
 }
 
 /// Decompression-parameter snapshot exposed to codec plugin callbacks.
@@ -66,6 +76,7 @@ pub struct CodecChunkContext {
     pub schunk: usize,
     pub nchunk: i64,
     pub nblock: i32,
+    pub chunk_source: usize,
     pub block_offset: usize,
     pub blocksize: usize,
     pub bsize: usize,
@@ -85,6 +96,124 @@ pub struct CodecCallbackContext<'a> {
     pub user_data: usize,
 }
 
+/// C-ABI compression parameters passed to raw `blosc2_codec` callbacks.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Blosc2CParams {
+    pub compcode: u8,
+    pub compcode_meta: u8,
+    pub clevel: u8,
+    pub use_dict: i32,
+    pub typesize: i32,
+    pub nthreads: i16,
+    pub blocksize: i32,
+    pub splitmode: i32,
+    pub schunk: *mut c_void,
+    pub filters: [u8; BLOSC2_MAX_FILTERS],
+    pub filters_meta: [u8; BLOSC2_MAX_FILTERS],
+    pub prefilter: Blosc2PrefilterCb,
+    pub preparams: *mut c_void,
+    pub tuner_params: *mut c_void,
+    pub tuner_id: i32,
+    pub instr_codec: bool,
+    pub codec_params: *mut c_void,
+    pub filter_params: [*mut c_void; BLOSC2_MAX_FILTERS],
+}
+
+impl Blosc2CParams {
+    fn from_context(ctx: &CodecCParamsContext, schunk: usize) -> Self {
+        Self {
+            compcode: ctx.compcode,
+            compcode_meta: ctx.compcode_meta,
+            clevel: ctx.clevel,
+            use_dict: ctx.use_dict,
+            typesize: ctx.typesize,
+            nthreads: ctx.nthreads,
+            blocksize: ctx.blocksize,
+            splitmode: ctx.splitmode,
+            schunk: schunk as *mut c_void,
+            filters: ctx.filters,
+            filters_meta: ctx.filters_meta,
+            prefilter: None,
+            preparams: std::ptr::null_mut(),
+            tuner_params: std::ptr::null_mut(),
+            tuner_id: 0,
+            instr_codec: ctx.instr_codec,
+            codec_params: ctx.codec_params as *mut c_void,
+            filter_params: [std::ptr::null_mut(); BLOSC2_MAX_FILTERS],
+        }
+    }
+
+    fn from_pipeline(ctx: &CodecCallbackContext<'_>) -> Self {
+        ctx.cparams.map_or_else(
+            || Self {
+                compcode: ctx.compcode,
+                compcode_meta: ctx.meta,
+                clevel: ctx.clevel,
+                use_dict: 0,
+                typesize: 8,
+                nthreads: 1,
+                blocksize: 0,
+                splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
+                schunk: ctx.chunk.schunk as *mut c_void,
+                filters: [
+                    BLOSC_NOFILTER,
+                    BLOSC_NOFILTER,
+                    BLOSC_NOFILTER,
+                    BLOSC_NOFILTER,
+                    BLOSC_NOFILTER,
+                    BLOSC_SHUFFLE,
+                ],
+                filters_meta: [0; BLOSC2_MAX_FILTERS],
+                prefilter: None,
+                preparams: std::ptr::null_mut(),
+                tuner_params: std::ptr::null_mut(),
+                tuner_id: 0,
+                instr_codec: false,
+                codec_params: std::ptr::null_mut(),
+                filter_params: [std::ptr::null_mut(); BLOSC2_MAX_FILTERS],
+            },
+            |cparams| Self::from_context(cparams, ctx.chunk.schunk),
+        )
+    }
+}
+
+/// C-ABI decompression parameters passed to raw `blosc2_codec` callbacks.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Blosc2DParams {
+    pub nthreads: i16,
+    pub schunk: *mut c_void,
+    pub postfilter: Blosc2PostfilterCb,
+    pub postparams: *mut c_void,
+    pub typesize: i32,
+}
+
+impl Blosc2DParams {
+    fn from_context(ctx: &CodecDParamsContext, schunk: usize) -> Self {
+        Self {
+            nthreads: ctx.nthreads,
+            schunk: schunk as *mut c_void,
+            postfilter: None,
+            postparams: std::ptr::null_mut(),
+            typesize: ctx.typesize,
+        }
+    }
+
+    fn from_pipeline(ctx: &CodecCallbackContext<'_>) -> Self {
+        ctx.dparams.map_or_else(
+            || Self {
+                nthreads: 1,
+                schunk: ctx.chunk.schunk as *mut c_void,
+                postfilter: None,
+                postparams: std::ptr::null_mut(),
+                typesize: 8,
+            },
+            |dparams| Self::from_context(dparams, ctx.chunk.schunk),
+        )
+    }
+}
+
 /// Rich compression callback signature for C-compatible codecs.
 pub type ContextCodecCompressFn =
     for<'a> fn(&mut CodecCallbackContext<'a>, src: &[u8], dest: &mut [u8]) -> i32;
@@ -92,7 +221,29 @@ pub type ContextCodecCompressFn =
 pub type ContextCodecDecompressFn =
     for<'a> fn(&mut CodecCallbackContext<'a>, src: &[u8], dest: &mut [u8]) -> i32;
 
-/// C-shaped user codec descriptor for source-level `blosc2_codec` parity.
+/// Raw C-ABI encoder callback signature for a `blosc2_codec`.
+pub type Blosc2CodecEncoderCb = unsafe extern "C" fn(
+    input: *const u8,
+    input_len: i32,
+    output: *mut u8,
+    output_len: i32,
+    meta: u8,
+    cparams: *mut Blosc2CParams,
+    chunk: *const c_void,
+) -> i32;
+
+/// Raw C-ABI decoder callback signature for a `blosc2_codec`.
+pub type Blosc2CodecDecoderCb = unsafe extern "C" fn(
+    input: *const u8,
+    input_len: i32,
+    output: *mut u8,
+    output_len: i32,
+    meta: u8,
+    dparams: *mut Blosc2DParams,
+    chunk: *const c_void,
+) -> i32;
+
+/// Rust-shaped user codec descriptor for ergonomic source-level registration.
 #[derive(Clone, Copy)]
 pub struct Blosc2Codec {
     pub compcode: u8,
@@ -101,6 +252,18 @@ pub struct Blosc2Codec {
     pub version: u8,
     pub encoder: CodecCompressFn,
     pub decoder: CodecDecompressFn,
+}
+
+/// Raw C-shaped `blosc2_codec` descriptor.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Blosc2CodecAbi {
+    pub compcode: u8,
+    pub compname: *const c_char,
+    pub complib: u8,
+    pub version: u8,
+    pub encoder: Option<Blosc2CodecEncoderCb>,
+    pub decoder: Option<Blosc2CodecDecoderCb>,
 }
 
 #[derive(Clone, Copy)]
@@ -116,6 +279,7 @@ struct UserCodec {
 enum UserCodecCompress {
     Legacy(CodecCompressFn),
     Context(ContextCodecCompressFn),
+    CAbi(Option<Blosc2CodecEncoderCb>),
 }
 
 impl UserCodecCompress {
@@ -123,6 +287,9 @@ impl UserCodecCompress {
         match (self, other) {
             (Self::Legacy(a), Self::Legacy(b)) => a as usize == b as usize,
             (Self::Context(a), Self::Context(b)) => a as usize == b as usize,
+            (Self::CAbi(a), Self::CAbi(b)) => {
+                a.map(|callback| callback as usize) == b.map(|callback| callback as usize)
+            }
             _ => false,
         }
     }
@@ -138,6 +305,28 @@ impl UserCodecCompress {
         match self {
             Self::Legacy(callback) => callback(clevel, meta, src, dest),
             Self::Context(callback) => callback(ctx, src, dest),
+            Self::CAbi(Some(callback)) => {
+                let Ok(input_len) = i32::try_from(src.len()) else {
+                    return BLOSC2_ERROR_2GB_LIMIT;
+                };
+                let Ok(output_len) = i32::try_from(dest.len()) else {
+                    return BLOSC2_ERROR_2GB_LIMIT;
+                };
+                let mut cparams = Blosc2CParams::from_pipeline(ctx);
+                let chunk = codec_chunk_arg(src.as_ptr(), ctx);
+                unsafe {
+                    callback(
+                        src.as_ptr(),
+                        input_len,
+                        dest.as_mut_ptr(),
+                        output_len,
+                        meta,
+                        &mut cparams,
+                        chunk,
+                    )
+                }
+            }
+            Self::CAbi(None) => missing_dynamic_codec_callback(),
         }
     }
 }
@@ -146,6 +335,7 @@ impl UserCodecCompress {
 enum UserCodecDecompress {
     Legacy(CodecDecompressFn),
     Context(ContextCodecDecompressFn),
+    CAbi(Option<Blosc2CodecDecoderCb>),
 }
 
 impl UserCodecDecompress {
@@ -153,6 +343,9 @@ impl UserCodecDecompress {
         match (self, other) {
             (Self::Legacy(a), Self::Legacy(b)) => a as usize == b as usize,
             (Self::Context(a), Self::Context(b)) => a as usize == b as usize,
+            (Self::CAbi(a), Self::CAbi(b)) => {
+                a.map(|callback| callback as usize) == b.map(|callback| callback as usize)
+            }
             _ => false,
         }
     }
@@ -161,7 +354,45 @@ impl UserCodecDecompress {
         match self {
             Self::Legacy(callback) => callback(meta, src, dest),
             Self::Context(callback) => callback(ctx, src, dest),
+            Self::CAbi(Some(callback)) => {
+                let Ok(input_len) = i32::try_from(src.len()) else {
+                    return BLOSC2_ERROR_DATA;
+                };
+                let Ok(output_len) = i32::try_from(dest.len()) else {
+                    return BLOSC2_ERROR_DATA;
+                };
+                let mut dparams = Blosc2DParams::from_pipeline(ctx);
+                let chunk = codec_chunk_arg(src.as_ptr(), ctx);
+                unsafe {
+                    callback(
+                        src.as_ptr(),
+                        input_len,
+                        dest.as_mut_ptr(),
+                        output_len,
+                        meta,
+                        &mut dparams,
+                        chunk,
+                    )
+                }
+            }
+            Self::CAbi(None) => missing_dynamic_codec_callback(),
         }
+    }
+}
+
+fn missing_dynamic_codec_callback() -> i32 {
+    // C-Blosc2 may dynamically resolve null codec callbacks. This crate has no
+    // codec plugin loader, so preserve null callbacks and fail at invocation.
+    BLOSC2_ERROR_CODEC_SUPPORT
+}
+
+fn codec_chunk_arg(block_ptr: *const u8, ctx: &CodecCallbackContext<'_>) -> *const c_void {
+    if ctx.chunk.chunk_source != 0 {
+        ctx.chunk.chunk_source as *const c_void
+    } else {
+        (block_ptr as usize)
+            .checked_sub(ctx.chunk.block_offset)
+            .map_or(std::ptr::null(), |addr| addr as *const c_void)
     }
 }
 
@@ -296,7 +527,7 @@ fn remember_codec_order(compcode: u8) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn known_global_registration_result(
+fn known_global_registration_status(
     compcode: u8,
     name: Option<&str>,
     duplicate_error: &'static str,
@@ -304,10 +535,10 @@ fn known_global_registration_result(
     let Some(known) = known_global_codec_by_code(compcode) else {
         return Ok(false);
     };
-    if name == Some(known.name) {
-        return Ok(true);
+    if name != Some(known.name) {
+        return Err(duplicate_error);
     }
-    Err(duplicate_error)
+    Ok(true)
 }
 
 /// Register a user-defined codec under `compcode`.
@@ -373,6 +604,27 @@ pub fn blosc2_register_codec_c(codec: Option<&Blosc2Codec>) -> i32 {
     }
 }
 
+/// C-name registration wrapper for raw `blosc2_codec` descriptors.
+///
+/// This accepts the C callback shape:
+/// `(input, input_len, output, output_len, meta, cparams/dparams, chunk)`.
+pub fn blosc2_register_codec_abi(codec: *const Blosc2CodecAbi) -> i32 {
+    if codec.is_null() {
+        return BLOSC2_ERROR_INVALID_PARAM;
+    }
+    let codec = unsafe { &*codec };
+    match register_blosc2_codec_abi_impl(codec) {
+        Ok(()) => BLOSC2_ERROR_SUCCESS,
+        Err("Codec IDs must be >= 32")
+        | Err("User-defined codec IDs must be >= 160")
+        | Err("Codec ID outside allowed range")
+        | Err("User-defined codec ID already registered")
+        | Err("User-defined codec name already registered") => BLOSC2_ERROR_CODEC_PARAM,
+        Err("User-defined codec name cannot be empty") => BLOSC2_ERROR_INVALID_PARAM,
+        Err(_) => BLOSC2_ERROR_FAILURE,
+    }
+}
+
 fn register_blosc2_codec_impl(codec: &Blosc2Codec) -> Result<(), &'static str> {
     if codec.compcode < BLOSC2_USER_DEFINED_CODECS_START {
         return Err("User-defined codec IDs must be >= 160");
@@ -390,6 +642,49 @@ fn register_blosc2_codec_impl(codec: &Blosc2Codec) -> Result<(), &'static str> {
     };
     if let Some(existing) = codecs.get(&codec.compcode) {
         if existing.name == registered.name {
+            return Ok(());
+        }
+        return Err("User-defined codec ID already registered");
+    }
+    codecs.insert(codec.compcode, registered);
+    drop(codecs);
+    remember_codec_order(codec.compcode)?;
+    Ok(())
+}
+
+fn blosc2_codec_abi_name(name: *const c_char) -> Result<&'static str, &'static str> {
+    if name.is_null() {
+        return Err("User-defined codec name cannot be empty");
+    }
+    let c_name = unsafe { CStr::from_ptr(name) };
+    let name = match c_name.to_str() {
+        Ok(name) => name.to_owned(),
+        Err(_) => c_name
+            .to_bytes()
+            .iter()
+            .map(|&byte| char::from(byte))
+            .collect(),
+    };
+    Ok(Box::leak(name.into_boxed_str()))
+}
+
+fn register_blosc2_codec_abi_impl(codec: &Blosc2CodecAbi) -> Result<(), &'static str> {
+    if codec.compcode < BLOSC2_USER_DEFINED_CODECS_START {
+        return Err("User-defined codec IDs must be >= 160");
+    }
+    let name = blosc2_codec_abi_name(codec.compname)?;
+    let mut codecs = user_codecs()
+        .write()
+        .map_err(|_| "Codec registry poisoned")?;
+    let registered = UserCodec {
+        name: Some(name),
+        complib: Some(codec.complib),
+        version: Some(codec.version),
+        compress: UserCodecCompress::CAbi(codec.encoder),
+        decompress: UserCodecDecompress::CAbi(codec.decoder),
+    };
+    if let Some(existing) = codecs.get(&codec.compcode) {
+        if existing.name == Some(name) {
             return Ok(());
         }
         return Err("User-defined codec ID already registered");
@@ -428,7 +723,7 @@ fn register_codec_impl(
             return Ok(());
         }
         if name.is_some() && existing.name != name {
-            return Err("Global plugin codec ID already registered");
+            return Err("User-defined codec ID already registered");
         }
         return if existing.same_callbacks(codec) {
             Ok(())
@@ -446,9 +741,8 @@ fn register_codec_impl(
 ///
 /// This mirrors C-Blosc2's internal plugin registration path: IDs 32..=159 are
 /// accepted for globally registered plugins, while user-defined IDs still use
-/// [`register_codec`]. Duplicate IDs are rejected because this Rust registry has
-/// no separate plugin name to distinguish an idempotent re-registration from an
-/// accidental replacement.
+/// [`register_codec`]. Duplicate unnamed IDs are rejected because C-Blosc2's
+/// idempotent re-registration check is based on the codec name.
 pub fn register_global_codec(
     compcode: u8,
     compress: CodecCompressFn,
@@ -618,7 +912,7 @@ fn register_global_codec_impl(
     {
         return Err("Global plugin codec IDs must be in 32..=159");
     }
-    if known_global_registration_result(
+    if known_global_registration_status(
         compcode,
         name,
         "Global plugin codec ID already registered",
@@ -639,11 +933,7 @@ fn register_global_codec_impl(
         if name.is_some() && existing.name == name {
             return Ok(());
         }
-        return if existing.same_callbacks(codec) {
-            Ok(())
-        } else {
-            Err("Global plugin codec ID already registered")
-        };
+        return Err("Global plugin codec ID already registered");
     }
     codecs.insert(compcode, codec);
     drop(codecs);
@@ -662,7 +952,7 @@ fn register_private_codec_impl(
     if compcode < BLOSC2_GLOBAL_REGISTERED_CODECS_START {
         return Err("Private codec IDs must be >= 32");
     }
-    if known_global_registration_result(compcode, name, "Private codec ID already registered")? {
+    if known_global_registration_status(compcode, name, "Private codec ID already registered")? {
         return Ok(());
     }
     let mut codecs = user_codecs()
@@ -679,11 +969,7 @@ fn register_private_codec_impl(
         if name.is_some() && existing.name == name {
             return Ok(());
         }
-        return if existing.same_callbacks(codec) {
-            Ok(())
-        } else {
-            Err("Private codec ID already registered")
-        };
+        return Err("Private codec ID already registered");
     }
     codecs.insert(compcode, codec);
     drop(codecs);
@@ -706,7 +992,7 @@ fn register_context_codec_impl(
     if !allowed.contains(&compcode) {
         return Err(range_error);
     }
-    if known_global_registration_result(compcode, name, duplicate_error)? {
+    if known_global_registration_status(compcode, name, duplicate_error)? {
         return Ok(());
     }
     let mut codecs = user_codecs()
@@ -723,11 +1009,7 @@ fn register_context_codec_impl(
         if name.is_some() && existing.name == name {
             return Ok(());
         }
-        return if existing.same_callbacks(codec) {
-            Ok(())
-        } else {
-            Err(duplicate_error)
-        };
+        return Err(duplicate_error);
     }
     codecs.insert(compcode, codec);
     drop(codecs);
@@ -738,7 +1020,7 @@ fn register_context_codec_impl(
 /// Returns `true` if `compcode` corresponds to a registered global descriptor
 /// or a user-defined codec currently present in the registry.
 pub fn is_registered_codec(compcode: u8) -> bool {
-    is_known_global_codec(compcode)
+    known_global_codec_by_code(compcode).is_some()
         || user_codecs()
             .read()
             .is_ok_and(|codecs| codecs.contains_key(&compcode))
@@ -746,14 +1028,13 @@ pub fn is_registered_codec(compcode: u8) -> bool {
 
 /// Return the registered codec name for a plugin/user-defined codec.
 pub fn registered_codec_name(compcode: u8) -> Option<&'static str> {
-    known_global_codec_by_code(compcode)
-        .map(|codec| codec.name)
-        .or_else(|| {
-            user_codecs()
-                .read()
-                .ok()
-                .and_then(|codecs| codecs.get(&compcode).and_then(|codec| codec.name))
-        })
+    if known_global_codec_by_code(compcode).is_some() {
+        return known_global_codec_by_code(compcode).map(|codec| codec.name);
+    }
+    user_codecs()
+        .read()
+        .ok()
+        .and_then(|codecs| codecs.get(&compcode).and_then(|codec| codec.name))
 }
 
 /// Return C-Blosc2-style compression library info for a registered codec name.
@@ -876,6 +1157,9 @@ pub fn compress_block_with_context(
             .and_then(|codecs| codecs.get(&compcode).copied())
         {
             Some(codec) => {
+                if matches!(codec.compress, UserCodecCompress::CAbi(None)) {
+                    return missing_dynamic_codec_callback();
+                }
                 let mut callback_context = context.unwrap_or(CodecCallbackContext {
                     compcode,
                     complib: codec.complib,
@@ -887,6 +1171,7 @@ pub fn compress_block_with_context(
                         schunk: 0,
                         nchunk: -1,
                         nblock: -1,
+                        chunk_source: 0,
                         block_offset: 0,
                         blocksize: src.len(),
                         bsize: src.len(),
@@ -963,6 +1248,9 @@ pub fn decompress_block_with_context(
             .and_then(|codecs| codecs.get(&compcode).copied())
         {
             Some(codec) => {
+                if matches!(codec.decompress, UserCodecDecompress::CAbi(None)) {
+                    return missing_dynamic_codec_callback();
+                }
                 // C-Blosc2 block sizes are int32-sized; user callbacks should
                 // not see a direct decompression request that cannot be
                 // represented by the C callback contract.
@@ -980,6 +1268,7 @@ pub fn decompress_block_with_context(
                         schunk: 0,
                         nchunk: -1,
                         nblock: -1,
+                        chunk_source: 0,
                         block_offset: 0,
                         blocksize: dest.len(),
                         bsize: dest.len(),
@@ -1068,7 +1357,7 @@ fn lz4hc_compress(clevel: u8, src: &[u8], dest: &mut [u8]) -> i32 {
 }
 
 fn lz4hc_2gb_limit_result(src_len: usize) -> Option<i32> {
-    (src_len > BLOSC2_MAX_BUFFERSIZE as usize).then_some(BLOSC2_ERROR_2GB_LIMIT)
+    (src_len > (2usize << 30)).then_some(BLOSC2_ERROR_2GB_LIMIT)
 }
 
 /// Decompress a block produced by either the LZ4 fast or LZ4HC encoder
@@ -1221,13 +1510,7 @@ fn zlib_decompress(src: &[u8], dest: &mut [u8]) -> i32 {
 
     let mut decompress = Decompress::new(true);
     match decompress.decompress(src, dest, FlushDecompress::Finish) {
-        Ok(flate2::Status::StreamEnd)
-            if decompress.total_out() as usize == dest.len()
-                && decompress.total_in() as usize == src.len() =>
-        {
-            decompress.total_out() as i32
-        }
-        Ok(flate2::Status::StreamEnd) => 0,
+        Ok(flate2::Status::StreamEnd) => decompress.total_out() as i32,
         Ok(_) => 0,
         Err(_) => 0,
     }
@@ -1295,7 +1578,7 @@ fn zstd_decompress(src: &[u8], dest: &mut [u8]) -> i32 {
         *entropy_rep = ZSTD_decoder_entropy_rep::default();
         ZSTD_decompressDCtx(dctx, entropy_rep, xxh, dest, src)
     });
-    if ERR_isError(n) || n != dest.len() {
+    if ERR_isError(n) {
         0
     } else {
         n as i32
@@ -1317,7 +1600,7 @@ fn zstd_decompress_with_dict(src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
             n
         }
     });
-    if ERR_isError(n) || n != dest.len() {
+    if ERR_isError(n) {
         0
     } else {
         n as i32
@@ -2094,6 +2377,110 @@ fn ndlz_decompress_cell(cell_shape: usize, src: &[u8], dest: &mut [u8]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering},
+        Mutex,
+    };
+
+    static C_ABI_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static C_ABI_COMPRESS_INPUT_LEN: AtomicI32 = AtomicI32::new(0);
+    static C_ABI_COMPRESS_OUTPUT_LEN: AtomicI32 = AtomicI32::new(0);
+    static C_ABI_COMPRESS_META: AtomicU8 = AtomicU8::new(0);
+    static C_ABI_COMPRESS_CLEVEL: AtomicU8 = AtomicU8::new(0);
+    static C_ABI_COMPRESS_COMP_META: AtomicU8 = AtomicU8::new(0);
+    static C_ABI_COMPRESS_USE_DICT: AtomicI32 = AtomicI32::new(0);
+    static C_ABI_COMPRESS_TYPESIZE: AtomicI32 = AtomicI32::new(0);
+    static C_ABI_COMPRESS_BLOCKSIZE: AtomicI32 = AtomicI32::new(0);
+    static C_ABI_COMPRESS_SPLITMODE: AtomicI32 = AtomicI32::new(0);
+    static C_ABI_COMPRESS_FILTER_LAST: AtomicU8 = AtomicU8::new(0);
+    static C_ABI_COMPRESS_INPUT_PTR: AtomicUsize = AtomicUsize::new(0);
+    static C_ABI_COMPRESS_SCHUNK: AtomicUsize = AtomicUsize::new(0);
+    static C_ABI_COMPRESS_CHUNK: AtomicUsize = AtomicUsize::new(0);
+    static C_ABI_COMPRESS_PREFILTER_SET: AtomicBool = AtomicBool::new(false);
+    static C_ABI_COMPRESS_PREPARAMS: AtomicUsize = AtomicUsize::new(0);
+    static C_ABI_COMPRESS_TUNER_ID: AtomicI32 = AtomicI32::new(0);
+    static C_ABI_COMPRESS_INSTR_CODEC: AtomicBool = AtomicBool::new(false);
+    static C_ABI_COMPRESS_CODEC_PARAMS: AtomicUsize = AtomicUsize::new(0);
+    static C_ABI_DECOMPRESS_INPUT_LEN: AtomicI32 = AtomicI32::new(0);
+    static C_ABI_DECOMPRESS_OUTPUT_LEN: AtomicI32 = AtomicI32::new(0);
+    static C_ABI_DECOMPRESS_META: AtomicU8 = AtomicU8::new(0);
+    static C_ABI_DECOMPRESS_TYPESIZE: AtomicI32 = AtomicI32::new(0);
+    static C_ABI_DECOMPRESS_INPUT_PTR: AtomicUsize = AtomicUsize::new(0);
+    static C_ABI_DECOMPRESS_SCHUNK: AtomicUsize = AtomicUsize::new(0);
+    static C_ABI_DECOMPRESS_CHUNK: AtomicUsize = AtomicUsize::new(0);
+    static C_ABI_DECOMPRESS_POSTFILTER_SET: AtomicBool = AtomicBool::new(false);
+    static C_ABI_DECOMPRESS_POSTPARAMS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn c_abi_codec_encoder(
+        input: *const u8,
+        input_len: i32,
+        output: *mut u8,
+        output_len: i32,
+        meta: u8,
+        cparams: *mut Blosc2CParams,
+        chunk: *const c_void,
+    ) -> i32 {
+        if input.is_null() || output.is_null() || cparams.is_null() {
+            return -1;
+        }
+        let cparams = unsafe { &*cparams };
+        C_ABI_COMPRESS_INPUT_LEN.store(input_len, Ordering::SeqCst);
+        C_ABI_COMPRESS_OUTPUT_LEN.store(output_len, Ordering::SeqCst);
+        C_ABI_COMPRESS_META.store(meta, Ordering::SeqCst);
+        C_ABI_COMPRESS_INPUT_PTR.store(input as usize, Ordering::SeqCst);
+        C_ABI_COMPRESS_CLEVEL.store(cparams.clevel, Ordering::SeqCst);
+        C_ABI_COMPRESS_COMP_META.store(cparams.compcode_meta, Ordering::SeqCst);
+        C_ABI_COMPRESS_USE_DICT.store(cparams.use_dict, Ordering::SeqCst);
+        C_ABI_COMPRESS_TYPESIZE.store(cparams.typesize, Ordering::SeqCst);
+        C_ABI_COMPRESS_BLOCKSIZE.store(cparams.blocksize, Ordering::SeqCst);
+        C_ABI_COMPRESS_SPLITMODE.store(cparams.splitmode, Ordering::SeqCst);
+        C_ABI_COMPRESS_FILTER_LAST.store(cparams.filters[BLOSC2_MAX_FILTERS - 1], Ordering::SeqCst);
+        C_ABI_COMPRESS_SCHUNK.store(cparams.schunk as usize, Ordering::SeqCst);
+        C_ABI_COMPRESS_CHUNK.store(chunk as usize, Ordering::SeqCst);
+        C_ABI_COMPRESS_PREFILTER_SET.store(cparams.prefilter.is_some(), Ordering::SeqCst);
+        C_ABI_COMPRESS_PREPARAMS.store(cparams.preparams as usize, Ordering::SeqCst);
+        C_ABI_COMPRESS_TUNER_ID.store(cparams.tuner_id, Ordering::SeqCst);
+        C_ABI_COMPRESS_INSTR_CODEC.store(cparams.instr_codec, Ordering::SeqCst);
+        C_ABI_COMPRESS_CODEC_PARAMS.store(cparams.codec_params as usize, Ordering::SeqCst);
+        if input_len < 0 || output_len < input_len {
+            return 0;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(input, output, input_len as usize);
+        }
+        input_len
+    }
+
+    unsafe extern "C" fn c_abi_codec_decoder(
+        input: *const u8,
+        input_len: i32,
+        output: *mut u8,
+        output_len: i32,
+        meta: u8,
+        dparams: *mut Blosc2DParams,
+        chunk: *const c_void,
+    ) -> i32 {
+        if input.is_null() || output.is_null() || dparams.is_null() {
+            return -1;
+        }
+        let dparams = unsafe { &*dparams };
+        C_ABI_DECOMPRESS_INPUT_LEN.store(input_len, Ordering::SeqCst);
+        C_ABI_DECOMPRESS_OUTPUT_LEN.store(output_len, Ordering::SeqCst);
+        C_ABI_DECOMPRESS_META.store(meta, Ordering::SeqCst);
+        C_ABI_DECOMPRESS_INPUT_PTR.store(input as usize, Ordering::SeqCst);
+        C_ABI_DECOMPRESS_TYPESIZE.store(dparams.typesize, Ordering::SeqCst);
+        C_ABI_DECOMPRESS_SCHUNK.store(dparams.schunk as usize, Ordering::SeqCst);
+        C_ABI_DECOMPRESS_CHUNK.store(chunk as usize, Ordering::SeqCst);
+        C_ABI_DECOMPRESS_POSTFILTER_SET.store(dparams.postfilter.is_some(), Ordering::SeqCst);
+        C_ABI_DECOMPRESS_POSTPARAMS.store(dparams.postparams as usize, Ordering::SeqCst);
+        if input_len < 0 || output_len < input_len {
+            return -1;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(input, output, input_len as usize);
+        }
+        output_len
+    }
 
     #[test]
     fn blosc_clevel_to_zstd_matches_c_library_mapping() {
@@ -2187,16 +2574,66 @@ mod tests {
 
     #[test]
     fn lz4hc_size_guard_returns_c_2gb_limit_sentinel() {
-        assert_eq!(lz4hc_2gb_limit_result(BLOSC2_MAX_BUFFERSIZE as usize), None);
+        let c_lz4hc_limit = 2usize << 30;
+        assert_eq!(lz4hc_2gb_limit_result(c_lz4hc_limit), None);
         assert_eq!(
-            lz4hc_2gb_limit_result(BLOSC2_MAX_BUFFERSIZE as usize + 1),
+            lz4hc_2gb_limit_result(c_lz4hc_limit + 1),
             Some(BLOSC2_ERROR_2GB_LIMIT)
         );
     }
 
     #[test]
+    fn zlib_decompress_returns_actual_size_for_oversized_output_like_c() {
+        let data = b"zlib payload";
+        let mut compressed = vec![0; 128];
+        let cbytes = zlib_compress(data, &mut compressed, 5);
+        assert!(cbytes > 0);
+
+        let mut decoded = vec![0xaa; data.len() + 8];
+        assert_eq!(
+            zlib_decompress(&compressed[..cbytes as usize], &mut decoded),
+            data.len() as i32
+        );
+        assert_eq!(&decoded[..data.len()], data);
+        assert_eq!(&decoded[data.len()..], &[0xaa; 8]);
+    }
+
+    #[test]
+    fn zstd_decompress_returns_actual_size_for_oversized_output_like_c() {
+        let data = b"zstd payload";
+        let mut compressed = vec![0; 128];
+        let cbytes = zstd_compress(data, &mut compressed, 5);
+        assert!(cbytes > 0);
+
+        let mut decoded = vec![0xaa; data.len() + 8];
+        assert_eq!(
+            zstd_decompress(&compressed[..cbytes as usize], &mut decoded),
+            data.len() as i32
+        );
+        assert_eq!(&decoded[..data.len()], data);
+        assert_eq!(&decoded[data.len()..], &[0xaa; 8]);
+    }
+
+    #[test]
+    fn zstd_dict_decompress_returns_actual_size_for_oversized_output_like_c() {
+        let dict = b"payload dictionary payload dictionary";
+        let data = b"dictionary payload";
+        let mut compressed = vec![0; 128];
+        let cbytes = zstd_compress_with_dict(data, &mut compressed, 5, dict);
+        assert!(cbytes > 0);
+
+        let mut decoded = vec![0xaa; data.len() + 8];
+        assert_eq!(
+            zstd_decompress_with_dict(&compressed[..cbytes as usize], &mut decoded, dict),
+            data.len() as i32
+        );
+        assert_eq!(&decoded[..data.len()], data);
+        assert_eq!(&decoded[data.len()..], &[0xaa; 8]);
+    }
+
+    #[test]
     fn known_global_codec_metadata_matches_c_registry() {
-        for (code, name) in [
+        for (code, _name) in [
             (BLOSC_CODEC_NDLZ, "ndlz"),
             (BLOSC_CODEC_ZFP_FIXED_ACCURACY, "zfp_acc"),
             (BLOSC_CODEC_ZFP_FIXED_PRECISION, "zfp_prec"),
@@ -2206,6 +2643,17 @@ mod tests {
             (BLOSC_CODEC_OPENZL, "openzl"),
         ] {
             assert!(is_known_global_codec(code));
+        }
+        for (code, name) in [
+            (BLOSC_CODEC_NDLZ, "ndlz"),
+            (BLOSC_CODEC_ZFP_FIXED_ACCURACY, "zfp_acc"),
+            (BLOSC_CODEC_ZFP_FIXED_PRECISION, "zfp_prec"),
+            (BLOSC_CODEC_ZFP_FIXED_RATE, "zfp_rate"),
+            (BLOSC_CODEC_OPENHTJ2K, "openhtj2k"),
+            (BLOSC_CODEC_GROK, "grok"),
+            (BLOSC_CODEC_OPENZL, "openzl"),
+        ] {
+            assert!(is_registered_codec(code));
             assert_eq!(registered_codec_name(code), Some(name));
             assert_eq!(registered_codec_code(name), Some(code));
             assert_eq!(registered_codec_version(code), Some(1));
@@ -2215,17 +2663,6 @@ mod tests {
                 Some((code, name, "unknown"))
             );
         }
-        for code in [
-            BLOSC_CODEC_NDLZ,
-            BLOSC_CODEC_ZFP_FIXED_ACCURACY,
-            BLOSC_CODEC_ZFP_FIXED_PRECISION,
-            BLOSC_CODEC_ZFP_FIXED_RATE,
-            BLOSC_CODEC_OPENHTJ2K,
-            BLOSC_CODEC_GROK,
-            BLOSC_CODEC_OPENZL,
-        ] {
-            assert!(is_registered_codec(code));
-        }
     }
 
     #[test]
@@ -2234,20 +2671,11 @@ mod tests {
         let mut decompressed = vec![0u8; 128];
 
         assert_eq!(
-            compress_block(
-                BLOSC_CODEC_ZFP_FIXED_ACCURACY,
-                5,
-                b"payload",
-                &mut compressed
-            ),
+            compress_block(BLOSC_CODEC_ZFP_FIXED_RATE, 5, b"payload", &mut compressed),
             BLOSC2_ERROR_CODEC_SUPPORT
         );
         assert_eq!(
-            decompress_block(
-                BLOSC_CODEC_ZFP_FIXED_ACCURACY,
-                b"payload",
-                &mut decompressed
-            ),
+            decompress_block(BLOSC_CODEC_ZFP_FIXED_RATE, b"payload", &mut decompressed),
             BLOSC2_ERROR_CODEC_SUPPORT
         );
         assert_eq!(
@@ -2351,6 +2779,7 @@ mod tests {
                 schunk: 0,
                 nchunk: -1,
                 nblock: -1,
+                chunk_source: 0,
                 block_offset: 0,
                 blocksize: 0,
                 bsize: 0,
@@ -2523,7 +2952,7 @@ mod tests {
     }
 
     #[test]
-    fn known_global_codec_registration_is_idempotent_by_name_without_mutating_callbacks() {
+    fn known_global_codec_registration_is_descriptor_idempotent_without_dispatch() {
         let mut compressed = vec![0; 32];
         assert_eq!(
             compress_block(
@@ -2533,6 +2962,10 @@ mod tests {
                 &mut compressed
             ),
             BLOSC2_ERROR_CODEC_SUPPORT
+        );
+        assert_eq!(
+            registered_codec_name(BLOSC_CODEC_ZFP_FIXED_ACCURACY),
+            Some("zfp_acc")
         );
 
         assert_eq!(
@@ -2574,6 +3007,14 @@ mod tests {
             Some("zfp_acc")
         );
         assert_eq!(
+            registered_codec_version(BLOSC_CODEC_ZFP_FIXED_ACCURACY),
+            Some(1)
+        );
+        assert_eq!(
+            registered_codec_complib_info("zfp_acc"),
+            Some((BLOSC_CODEC_ZFP_FIXED_ACCURACY, "zfp_acc", "unknown"))
+        );
+        assert_eq!(
             compress_block(
                 BLOSC_CODEC_ZFP_FIXED_ACCURACY,
                 5,
@@ -2582,6 +3023,438 @@ mod tests {
             ),
             BLOSC2_ERROR_CODEC_SUPPORT
         );
+        let mut decompressed = vec![0; 7];
+        assert_eq!(
+            decompress_block(
+                BLOSC_CODEC_ZFP_FIXED_ACCURACY,
+                b"payload",
+                &mut decompressed
+            ),
+            BLOSC2_ERROR_CODEC_SUPPORT
+        );
+    }
+
+    #[test]
+    fn known_global_codec_registration_is_idempotent_for_builtin_dispatch_ids() {
+        assert_eq!(
+            register_global_codec_with_metadata(
+                BLOSC_CODEC_NDLZ,
+                "ndlz",
+                BLOSC_CODEC_NDLZ,
+                1,
+                passthrough_codec_compress,
+                passthrough_codec_decompress,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn blosc2_register_codec_abi_uses_raw_c_callback_shape() {
+        let _lock = C_ABI_TEST_LOCK.lock().unwrap();
+        const CODE: u8 = 170;
+        let codec = Blosc2CodecAbi {
+            compcode: CODE,
+            compname: b"raw-c-abi-codec\0".as_ptr().cast(),
+            complib: CODE,
+            version: 3,
+            encoder: Some(c_abi_codec_encoder),
+            decoder: Some(c_abi_codec_decoder),
+        };
+        assert_eq!(
+            blosc2_register_codec_abi(&codec as *const Blosc2CodecAbi),
+            BLOSC2_ERROR_SUCCESS
+        );
+        assert_eq!(
+            blosc2_register_codec_abi(std::ptr::null()),
+            BLOSC2_ERROR_INVALID_PARAM
+        );
+        assert_eq!(registered_codec_name(CODE), Some("raw-c-abi-codec"));
+        assert_eq!(registered_codec_version(CODE), Some(3));
+
+        C_ABI_COMPRESS_INPUT_LEN.store(0, Ordering::SeqCst);
+        C_ABI_DECOMPRESS_INPUT_LEN.store(0, Ordering::SeqCst);
+        let mut source_chunk = vec![0u8; 128];
+        source_chunk.extend_from_slice(b"c-abi payload");
+        let src = &source_chunk[128..];
+        let filtered_block = src.to_vec();
+        let mut encoded = vec![0; 64];
+        let cparams = CodecCParamsContext {
+            compcode: CODE,
+            compcode_meta: 0x5a,
+            clevel: 7,
+            use_dict: 1,
+            typesize: 4,
+            blocksize: 0,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [BLOSC_NOFILTER; BLOSC2_MAX_FILTERS],
+            filters_meta: [0; BLOSC2_MAX_FILTERS],
+            nthreads: 2,
+            nchunk: 33,
+            user_data: 0xfeed,
+            instr_codec: true,
+            codec_params: 0xc0de,
+        };
+        let chunk = CodecChunkContext {
+            schunk: 0x1234,
+            nchunk: 33,
+            nblock: 4,
+            chunk_source: source_chunk.as_ptr() as usize,
+            block_offset: 128,
+            blocksize: 64,
+            bsize: src.len(),
+        };
+        let cbytes = compress_block_with_context(
+            CODE,
+            7,
+            0x5a,
+            &filtered_block,
+            &mut encoded,
+            Some(CodecCallbackContext {
+                compcode: CODE,
+                complib: Some(CODE),
+                meta: 0x5a,
+                clevel: 7,
+                cparams: Some(&cparams),
+                dparams: None,
+                chunk,
+                b2nd_metalayer: None,
+                user_data: 0xfeed,
+            }),
+        );
+        assert_eq!(cbytes, src.len() as i32);
+        assert_eq!(&encoded[..src.len()], src);
+        assert_eq!(
+            C_ABI_COMPRESS_INPUT_LEN.load(Ordering::SeqCst),
+            src.len() as i32
+        );
+        assert_eq!(
+            C_ABI_COMPRESS_INPUT_PTR.load(Ordering::SeqCst),
+            filtered_block.as_ptr() as usize
+        );
+        assert_eq!(C_ABI_COMPRESS_OUTPUT_LEN.load(Ordering::SeqCst), 64);
+        assert_eq!(C_ABI_COMPRESS_META.load(Ordering::SeqCst), 0x5a);
+        assert_eq!(C_ABI_COMPRESS_CLEVEL.load(Ordering::SeqCst), 7);
+        assert_eq!(C_ABI_COMPRESS_COMP_META.load(Ordering::SeqCst), 0x5a);
+        assert_eq!(C_ABI_COMPRESS_USE_DICT.load(Ordering::SeqCst), 1);
+        assert_eq!(C_ABI_COMPRESS_TYPESIZE.load(Ordering::SeqCst), 4);
+        assert_eq!(C_ABI_COMPRESS_BLOCKSIZE.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            C_ABI_COMPRESS_SPLITMODE.load(Ordering::SeqCst),
+            BLOSC_NEVER_SPLIT
+        );
+        assert_eq!(
+            C_ABI_COMPRESS_FILTER_LAST.load(Ordering::SeqCst),
+            BLOSC_NOFILTER
+        );
+        assert_eq!(C_ABI_COMPRESS_SCHUNK.load(Ordering::SeqCst), 0x1234);
+        assert_eq!(
+            C_ABI_COMPRESS_CHUNK.load(Ordering::SeqCst),
+            source_chunk.as_ptr() as usize
+        );
+        assert!(!C_ABI_COMPRESS_PREFILTER_SET.load(Ordering::SeqCst));
+        assert_eq!(C_ABI_COMPRESS_PREPARAMS.load(Ordering::SeqCst), 0);
+        assert_eq!(C_ABI_COMPRESS_TUNER_ID.load(Ordering::SeqCst), 0);
+        assert!(C_ABI_COMPRESS_INSTR_CODEC.load(Ordering::SeqCst));
+        assert_eq!(C_ABI_COMPRESS_CODEC_PARAMS.load(Ordering::SeqCst), 0xc0de);
+
+        let dparams = CodecDParamsContext {
+            nthreads: 3,
+            typesize: 4,
+            nchunk: 34,
+            user_data: 0xbeef,
+        };
+        let mut decoded = vec![0; src.len()];
+        let mut compressed_chunk = vec![0u8; 128];
+        compressed_chunk.extend_from_slice(&encoded[..cbytes as usize]);
+        let compressed_block = encoded[..cbytes as usize].to_vec();
+        assert_eq!(
+            decompress_block_with_context(
+                CODE,
+                0x5a,
+                &compressed_block,
+                &mut decoded,
+                Some(CodecCallbackContext {
+                    compcode: CODE,
+                    complib: Some(CODE),
+                    meta: 0x5a,
+                    clevel: 0,
+                    cparams: None,
+                    dparams: Some(&dparams),
+                    chunk: CodecChunkContext {
+                        nchunk: 34,
+                        chunk_source: compressed_chunk.as_ptr() as usize,
+                        ..chunk
+                    },
+                    b2nd_metalayer: None,
+                    user_data: 0xbeef,
+                }),
+            ),
+            src.len() as i32
+        );
+        assert_eq!(decoded, src);
+        assert_eq!(
+            C_ABI_DECOMPRESS_INPUT_LEN.load(Ordering::SeqCst),
+            src.len() as i32
+        );
+        assert_eq!(
+            C_ABI_DECOMPRESS_INPUT_PTR.load(Ordering::SeqCst),
+            compressed_block.as_ptr() as usize
+        );
+        assert_eq!(
+            C_ABI_DECOMPRESS_OUTPUT_LEN.load(Ordering::SeqCst),
+            src.len() as i32
+        );
+        assert_eq!(C_ABI_DECOMPRESS_META.load(Ordering::SeqCst), 0x5a);
+        assert_eq!(C_ABI_DECOMPRESS_TYPESIZE.load(Ordering::SeqCst), 4);
+        assert_eq!(C_ABI_DECOMPRESS_SCHUNK.load(Ordering::SeqCst), 0x1234);
+        assert_eq!(
+            C_ABI_DECOMPRESS_CHUNK.load(Ordering::SeqCst),
+            compressed_chunk.as_ptr() as usize
+        );
+        assert!(!C_ABI_DECOMPRESS_POSTFILTER_SET.load(Ordering::SeqCst));
+        assert_eq!(C_ABI_DECOMPRESS_POSTPARAMS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn blosc2_register_codec_abi_fallback_params_match_c_defaults() {
+        let _lock = C_ABI_TEST_LOCK.lock().unwrap();
+        const CODE: u8 = 171;
+        let codec = Blosc2CodecAbi {
+            compcode: CODE,
+            compname: b"raw-c-abi-defaults\0".as_ptr().cast(),
+            complib: CODE,
+            version: 1,
+            encoder: Some(c_abi_codec_encoder),
+            decoder: Some(c_abi_codec_decoder),
+        };
+        assert_eq!(
+            blosc2_register_codec_abi(&codec as *const Blosc2CodecAbi),
+            BLOSC2_ERROR_SUCCESS
+        );
+
+        let src = b"default params";
+        let mut encoded = vec![0; 64];
+        C_ABI_COMPRESS_CHUNK.store(usize::MAX, Ordering::SeqCst);
+        assert_eq!(
+            compress_block_with_meta(CODE, 6, 0x23, src, &mut encoded),
+            src.len() as i32
+        );
+        assert_eq!(
+            C_ABI_COMPRESS_CHUNK.load(Ordering::SeqCst),
+            src.as_ptr() as usize
+        );
+        assert_eq!(C_ABI_COMPRESS_META.load(Ordering::SeqCst), 0x23);
+        assert_eq!(C_ABI_COMPRESS_CLEVEL.load(Ordering::SeqCst), 6);
+        assert_eq!(C_ABI_COMPRESS_USE_DICT.load(Ordering::SeqCst), 0);
+        assert_eq!(C_ABI_COMPRESS_TYPESIZE.load(Ordering::SeqCst), 8);
+        assert_eq!(C_ABI_COMPRESS_BLOCKSIZE.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            C_ABI_COMPRESS_SPLITMODE.load(Ordering::SeqCst),
+            BLOSC_FORWARD_COMPAT_SPLIT
+        );
+        assert_eq!(
+            C_ABI_COMPRESS_FILTER_LAST.load(Ordering::SeqCst),
+            BLOSC_SHUFFLE
+        );
+        assert!(!C_ABI_COMPRESS_PREFILTER_SET.load(Ordering::SeqCst));
+        assert_eq!(C_ABI_COMPRESS_PREPARAMS.load(Ordering::SeqCst), 0);
+        assert_eq!(C_ABI_COMPRESS_TUNER_ID.load(Ordering::SeqCst), 0);
+        assert!(!C_ABI_COMPRESS_INSTR_CODEC.load(Ordering::SeqCst));
+        assert_eq!(C_ABI_COMPRESS_CODEC_PARAMS.load(Ordering::SeqCst), 0);
+
+        let mut decoded = vec![0; src.len()];
+        C_ABI_DECOMPRESS_CHUNK.store(usize::MAX, Ordering::SeqCst);
+        assert_eq!(
+            decompress_block_with_meta(CODE, 0x23, &encoded[..src.len()], &mut decoded),
+            src.len() as i32
+        );
+        assert_eq!(decoded, src);
+        assert_eq!(
+            C_ABI_DECOMPRESS_CHUNK.load(Ordering::SeqCst),
+            encoded.as_ptr() as usize
+        );
+        assert_eq!(C_ABI_DECOMPRESS_TYPESIZE.load(Ordering::SeqCst), 8);
+        assert!(!C_ABI_DECOMPRESS_POSTFILTER_SET.load(Ordering::SeqCst));
+        assert_eq!(C_ABI_DECOMPRESS_POSTPARAMS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn blosc2_register_codec_abi_null_chunk_source_fallback_is_null() {
+        let _lock = C_ABI_TEST_LOCK.lock().unwrap();
+        const CODE: u8 = 172;
+        let codec = Blosc2CodecAbi {
+            compcode: CODE,
+            compname: b"raw-c-abi-null-chunk-fallback\0".as_ptr().cast(),
+            complib: CODE,
+            version: 1,
+            encoder: Some(c_abi_codec_encoder),
+            decoder: Some(c_abi_codec_decoder),
+        };
+        assert_eq!(
+            blosc2_register_codec_abi(&codec as *const Blosc2CodecAbi),
+            BLOSC2_ERROR_SUCCESS
+        );
+
+        let src = b"null chunk";
+        let mut encoded = vec![0; 32];
+        C_ABI_COMPRESS_CHUNK.store(usize::MAX, Ordering::SeqCst);
+        assert_eq!(
+            compress_block_with_context(
+                CODE,
+                5,
+                0,
+                src,
+                &mut encoded,
+                Some(CodecCallbackContext {
+                    compcode: CODE,
+                    complib: Some(CODE),
+                    meta: 0,
+                    clevel: 5,
+                    cparams: None,
+                    dparams: None,
+                    chunk: CodecChunkContext {
+                        schunk: 0,
+                        nchunk: -1,
+                        nblock: 0,
+                        chunk_source: 0,
+                        block_offset: src.as_ptr() as usize,
+                        blocksize: src.len(),
+                        bsize: src.len(),
+                    },
+                    b2nd_metalayer: None,
+                    user_data: 0,
+                }),
+            ),
+            src.len() as i32
+        );
+        assert_eq!(C_ABI_COMPRESS_CHUNK.load(Ordering::SeqCst), 0);
+
+        let mut decoded = vec![0; src.len()];
+        C_ABI_DECOMPRESS_CHUNK.store(usize::MAX, Ordering::SeqCst);
+        assert_eq!(
+            decompress_block_with_context(
+                CODE,
+                0,
+                &encoded[..src.len()],
+                &mut decoded,
+                Some(CodecCallbackContext {
+                    compcode: CODE,
+                    complib: Some(CODE),
+                    meta: 0,
+                    clevel: 0,
+                    cparams: None,
+                    dparams: None,
+                    chunk: CodecChunkContext {
+                        schunk: 0,
+                        nchunk: -1,
+                        nblock: 0,
+                        chunk_source: 0,
+                        block_offset: encoded.as_ptr() as usize,
+                        blocksize: src.len(),
+                        bsize: src.len(),
+                    },
+                    b2nd_metalayer: None,
+                    user_data: 0,
+                }),
+            ),
+            src.len() as i32
+        );
+        assert_eq!(decoded, src);
+        assert_eq!(C_ABI_DECOMPRESS_CHUNK.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn blosc2_register_codec_abi_null_callbacks_return_codec_support() {
+        let _lock = C_ABI_TEST_LOCK.lock().unwrap();
+        const NULL_ENCODER_CODE: u8 = 173;
+        let null_encoder = Blosc2CodecAbi {
+            compcode: NULL_ENCODER_CODE,
+            compname: b"raw-c-abi-null-encoder\0".as_ptr().cast(),
+            complib: NULL_ENCODER_CODE,
+            version: 1,
+            encoder: None,
+            decoder: Some(c_abi_codec_decoder),
+        };
+        assert_eq!(
+            blosc2_register_codec_abi(&null_encoder as *const Blosc2CodecAbi),
+            BLOSC2_ERROR_SUCCESS
+        );
+        let mut encoded = vec![0; 32];
+        assert_eq!(
+            compress_block(NULL_ENCODER_CODE, 5, b"payload", &mut encoded),
+            BLOSC2_ERROR_CODEC_SUPPORT
+        );
+
+        const NULL_DECODER_CODE: u8 = 174;
+        let null_decoder = Blosc2CodecAbi {
+            compcode: NULL_DECODER_CODE,
+            compname: b"raw-c-abi-null-decoder\0".as_ptr().cast(),
+            complib: NULL_DECODER_CODE,
+            version: 1,
+            encoder: Some(c_abi_codec_encoder),
+            decoder: None,
+        };
+        assert_eq!(
+            blosc2_register_codec_abi(&null_decoder as *const Blosc2CodecAbi),
+            BLOSC2_ERROR_SUCCESS
+        );
+        let mut decoded = vec![0; 7];
+        assert_eq!(
+            decompress_block(NULL_DECODER_CODE, b"payload", &mut decoded),
+            BLOSC2_ERROR_CODEC_SUPPORT
+        );
+    }
+
+    #[test]
+    fn blosc2_register_codec_abi_rejects_null_name_and_parses_empty_name() {
+        let _lock = C_ABI_TEST_LOCK.lock().unwrap();
+        const CODE: u8 = 175;
+        let null_name = Blosc2CodecAbi {
+            compcode: CODE,
+            compname: std::ptr::null(),
+            complib: CODE,
+            version: 1,
+            encoder: Some(c_abi_codec_encoder),
+            decoder: Some(c_abi_codec_decoder),
+        };
+        assert_eq!(
+            blosc2_register_codec_abi(&null_name as *const Blosc2CodecAbi),
+            BLOSC2_ERROR_INVALID_PARAM
+        );
+        assert_eq!(blosc2_codec_abi_name(b"\0".as_ptr().cast()), Ok(""));
+    }
+
+    #[test]
+    fn blosc2_register_codec_abi_duplicate_id_matches_c_name_idempotence() {
+        let _lock = C_ABI_TEST_LOCK.lock().unwrap();
+        const CODE: u8 = 176;
+        let codec = Blosc2CodecAbi {
+            compcode: CODE,
+            compname: b"raw-c-abi-duplicate-id\0".as_ptr().cast(),
+            complib: CODE,
+            version: 1,
+            encoder: Some(c_abi_codec_encoder),
+            decoder: Some(c_abi_codec_decoder),
+        };
+        assert_eq!(
+            blosc2_register_codec_abi(&codec as *const Blosc2CodecAbi),
+            BLOSC2_ERROR_SUCCESS
+        );
+        assert_eq!(
+            blosc2_register_codec_abi(&codec as *const Blosc2CodecAbi),
+            BLOSC2_ERROR_SUCCESS
+        );
+
+        let same_callbacks_different_name = Blosc2CodecAbi {
+            compname: b"raw-c-abi-other-name\0".as_ptr().cast(),
+            ..codec
+        };
+        assert_eq!(
+            blosc2_register_codec_abi(&same_callbacks_different_name as *const Blosc2CodecAbi),
+            BLOSC2_ERROR_CODEC_PARAM
+        );
+        assert_eq!(registered_codec_name(CODE), Some("raw-c-abi-duplicate-id"));
     }
 
     #[test]
@@ -2655,6 +3528,45 @@ mod tests {
                 passthrough_codec_decompress,
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn unnamed_global_and_private_duplicate_registration_is_rejected() {
+        const GLOBAL_CODE: u8 = 42;
+        assert_eq!(
+            register_global_codec(
+                GLOBAL_CODE,
+                passthrough_codec_compress,
+                passthrough_codec_decompress,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            register_global_codec(
+                GLOBAL_CODE,
+                passthrough_codec_compress,
+                passthrough_codec_decompress,
+            ),
+            Err("Global plugin codec ID already registered")
+        );
+
+        const PRIVATE_CODE: u8 = 43;
+        assert_eq!(
+            register_private_codec(
+                PRIVATE_CODE,
+                passthrough_codec_compress,
+                passthrough_codec_decompress,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            register_private_codec(
+                PRIVATE_CODE,
+                passthrough_codec_compress,
+                passthrough_codec_decompress,
+            ),
+            Err("Private codec ID already registered")
         );
     }
 
@@ -3176,7 +4088,10 @@ mod tests {
             src.len() as i32
         );
         compressed.extend_from_slice(b"trailing");
-        assert_eq!(zlib_decompress(&compressed, &mut zlib_out), 0);
+        assert_eq!(
+            zlib_decompress(&compressed, &mut zlib_out),
+            src.len() as i32
+        );
         assert_eq!(
             decompress_block(BLOSC_ZSTD, b"not-a-zstd-block", &mut dest),
             0

@@ -9,7 +9,10 @@ use std::path::Path;
 use std::process::Command;
 
 const DATA_SIZE: usize = 10 * 1024 * 1024;
-const CHUNK_SIZE: usize = 1024 * 1024;
+const CHUNK_SIZE: usize = 1_000_000;
+const BENCH_NTHREADS: i16 = 4;
+const SFRAME_BENCH_CHUNK_SIZE: usize = 2_000_000 * std::mem::size_of::<i32>();
+const SFRAME_BENCH_NTHREADS: i16 = 2;
 
 fn signal_f32_bytes(len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
@@ -36,20 +39,30 @@ fn random_bytes(len: usize) -> Vec<u8> {
     out
 }
 
-fn cparams(compcode: u8, typesize: i32, filter: u8) -> CParams {
+fn cparams_with_clevel(
+    compcode: u8,
+    clevel: u8,
+    typesize: i32,
+    filter: u8,
+    nthreads: i16,
+) -> CParams {
     CParams {
         compcode,
         compcode_meta: 0,
-        clevel: 9,
+        clevel,
         typesize,
         blocksize: 0,
         splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
         filters: [0, 0, 0, 0, 0, filter],
         filters_meta: [0; BLOSC2_MAX_FILTERS],
         use_dict: false,
-        nthreads: 1,
+        nthreads,
         ..CParams::default()
     }
+}
+
+fn cparams(compcode: u8, typesize: i32, filter: u8, nthreads: i16) -> CParams {
+    cparams_with_clevel(compcode, 9, typesize, filter, nthreads)
 }
 
 fn bench_filters(c: &mut Criterion) {
@@ -199,7 +212,7 @@ fn bench_chunks(c: &mut Criterion) {
         ("zlib_t4", BLOSC_ZLIB),
         ("zstd_t4", BLOSC_ZSTD),
     ] {
-        let params = cparams(compcode, 4, BLOSC_SHUFFLE);
+        let params = cparams(compcode, 4, BLOSC_SHUFFLE, BENCH_NTHREADS);
         let compressed = compress::compress(&signal, &params).unwrap();
 
         group.bench_function(format!("{name}/compress"), |b| {
@@ -209,7 +222,12 @@ fn bench_chunks(c: &mut Criterion) {
         });
 
         group.bench_function(format!("{name}/decompress"), |b| {
-            b.iter(|| black_box(compress::decompress(black_box(&compressed)).unwrap()));
+            b.iter(|| {
+                black_box(
+                    compress::decompress_with_threads(black_box(&compressed), params.nthreads)
+                        .unwrap(),
+                )
+            });
         });
     }
 
@@ -218,10 +236,16 @@ fn bench_chunks(c: &mut Criterion) {
 
 fn bench_schunk_frame(c: &mut Criterion) {
     let data = signal_f32_bytes(DATA_SIZE);
-    let chunks: Vec<&[u8]> = data.chunks(CHUNK_SIZE).collect();
-    let params = cparams(BLOSC_BLOSCLZ, 4, BLOSC_SHUFFLE);
+    let chunks: Vec<&[u8]> = data.chunks(SFRAME_BENCH_CHUNK_SIZE).collect();
+    let params = cparams_with_clevel(
+        BLOSC_BLOSCLZ,
+        5,
+        std::mem::size_of::<i32>() as i32,
+        BLOSC_SHUFFLE,
+        SFRAME_BENCH_NTHREADS,
+    );
     let dparams = DParams {
-        nthreads: 1,
+        nthreads: SFRAME_BENCH_NTHREADS,
         ..DParams::default()
     };
     let mut schunk = Schunk::new(params.clone(), dparams.clone());
@@ -282,7 +306,7 @@ fn bench_c_helpers(c: &mut Criterion) {
     group.sample_size(10);
     group.throughput(Throughput::Bytes(DATA_SIZE as u64));
 
-    group.bench_function("lz4_t4/compress_process", |b| {
+    group.bench_function("lz4_typesize4_t1/compress_process", |b| {
         b.iter(|| {
             let output = temp.path().join("c_lz4_iter.b2frame");
             let status = Command::new(&c_compress)
@@ -294,7 +318,7 @@ fn bench_c_helpers(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("lz4_t4/decompress_process", |b| {
+    group.bench_function("lz4_typesize4_t1/decompress_process", |b| {
         b.iter(|| {
             let output = temp.path().join("c_lz4_iter.out");
             let status = Command::new(&c_decompress)

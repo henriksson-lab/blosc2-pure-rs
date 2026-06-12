@@ -26,7 +26,8 @@ use crate::constants::{
     BLOSC2_ERROR_INVALID_INDEX, BLOSC2_ERROR_INVALID_PARAM, BLOSC2_ERROR_MAX_BUFSIZE_EXCEEDED,
     BLOSC2_ERROR_METALAYER_NOT_FOUND, BLOSC2_ERROR_NULL_POINTER, BLOSC2_ERROR_SUCCESS,
     BLOSC2_ERROR_WRITE_BUFFER, BLOSC2_MAX_BUFFERSIZE, BLOSC2_MAX_METALAYERS, BLOSC2_SPECIAL_NAN,
-    BLOSC2_SPECIAL_UNINIT, BLOSC2_SPECIAL_ZERO,
+    BLOSC2_SPECIAL_UNINIT, BLOSC2_SPECIAL_ZERO, BLOSC_BITSHUFFLE, BLOSC_CODEC_ZFP_FIXED_ACCURACY,
+    BLOSC_CODEC_ZFP_FIXED_PRECISION, BLOSC_CODEC_ZFP_FIXED_RATE, BLOSC_SHUFFLE,
 };
 use crate::schunk::{blosc2_schunk_to_buffer, FrameStorage, Schunk};
 use crate::utils::normalized_path;
@@ -142,6 +143,7 @@ fn b2nd_create_ctx_impl(
 ) -> Result<B2ndContext, &'static str> {
     meta.validate()?;
     let typesize = b2nd_cparams_typesize(&cparams)?;
+    b2nd_validate_ctx_plugin_codecs(&cparams)?;
     cparams.blocksize = b2nd_c_context_blocksize(&meta.blockshape, typesize)?;
     if metalayers.len() >= BLOSC2_MAX_METALAYERS {
         return Err("Too many B2ND context metalayers");
@@ -163,13 +165,11 @@ fn b2nd_create_ctx_impl_c(
     storage: B2ndStorage,
 ) -> Result<B2ndContext, &'static str> {
     let typesize = b2nd_cparams_typesize(&cparams)?;
+    b2nd_validate_ctx_plugin_codecs(&cparams)?;
     if meta.dtype.is_empty() {
         meta.dtype = format!("|S{typesize}");
     }
     cparams.blocksize = b2nd_c_context_blocksize(&meta.blockshape, typesize)?;
-    if metalayers.len() >= BLOSC2_MAX_METALAYERS {
-        return Err("Too many B2ND context metalayers");
-    }
     Ok(B2ndContext {
         meta,
         cparams,
@@ -191,6 +191,7 @@ fn b2nd_create_ctx_parts_impl_c(
     storage: B2ndStorage,
 ) -> Result<B2ndContext, &'static str> {
     let typesize = b2nd_cparams_typesize(&cparams)?;
+    b2nd_validate_ctx_plugin_codecs(&cparams)?;
     let meta = B2ndMeta {
         shape,
         chunkshape,
@@ -201,9 +202,6 @@ fn b2nd_create_ctx_parts_impl_c(
         dtype_format,
     };
     cparams.blocksize = b2nd_c_context_blocksize(&meta.blockshape, typesize)?;
-    if metalayers.len() >= BLOSC2_MAX_METALAYERS {
-        return Err("Too many B2ND context metalayers");
-    }
     Ok(B2ndContext {
         meta,
         cparams,
@@ -221,6 +219,26 @@ fn b2nd_c_context_blocksize(blockshape: &[i32], typesize: usize) -> Result<i32, 
     block_nitems
         .checked_mul(typesize)
         .ok_or("B2ND block too large")
+}
+
+fn b2nd_validate_ctx_plugin_codecs(cparams: &CParams) -> Result<(), &'static str> {
+    if matches!(
+        cparams.compcode,
+        BLOSC_CODEC_ZFP_FIXED_ACCURACY
+            | BLOSC_CODEC_ZFP_FIXED_PRECISION
+            | BLOSC_CODEC_ZFP_FIXED_RATE
+    ) && cparams
+        .filters
+        .iter()
+        .any(|&filter| matches!(filter, BLOSC_SHUFFLE | BLOSC_BITSHUFFLE))
+    {
+        return Err("ZFP cannot be run in presence of SHUFFLE / BITSHUFFLE");
+    }
+    Ok(())
+}
+
+fn b2nd_validate_cparams_for_array(cparams: &CParams) -> Result<(), &'static str> {
+    b2nd_validate_ctx_plugin_codecs(cparams)
 }
 
 /// C-style status adapter for [`b2nd_create_ctx`].
@@ -347,6 +365,7 @@ pub fn b2nd_deserialize_meta_c(data: &[u8]) -> (i32, Option<B2ndMeta>) {
             Ok(consumed) => (consumed, Some(decoded.meta)),
             Err(_) => (BLOSC2_ERROR_INVALID_PARAM, None),
         },
+        Err("Invalid B2ND ndim") => (BLOSC2_ERROR_FAILURE, None),
         Err(_) => (BLOSC2_ERROR_INVALID_PARAM, None),
     }
 }
@@ -384,25 +403,28 @@ fn b2nd_serialize_meta_parts_raw_c(
         return Err("B2ND dtype too large");
     }
     let ndim = shape.len();
+    if chunkshape.len() < ndim || blockshape.len() < ndim {
+        return Err("B2ND shape ranks differ");
+    }
     let mut out = Vec::with_capacity(3 + 3 * (3 + ndim * 9) + 6 + dtype.len());
     out.push(0x90 + 7);
     out.push(B2ND_METALAYER_VERSION);
     out.push(ndim as u8);
 
-    write_array_header(&mut out, shape.len())?;
+    write_array_header(&mut out, ndim)?;
     for dim in shape {
         out.push(0xd3);
         out.extend_from_slice(&dim.to_be_bytes());
     }
 
-    write_array_header(&mut out, chunkshape.len())?;
-    for dim in chunkshape {
+    write_array_header(&mut out, ndim)?;
+    for dim in chunkshape.into_iter().take(ndim) {
         out.push(0xd2);
         out.extend_from_slice(&dim.to_be_bytes());
     }
 
-    write_array_header(&mut out, blockshape.len())?;
-    for dim in blockshape {
+    write_array_header(&mut out, ndim)?;
+    for dim in blockshape.into_iter().take(ndim) {
         out.push(0xd2);
         out.extend_from_slice(&dim.to_be_bytes());
     }
@@ -440,6 +462,7 @@ pub fn b2nd_serialize_meta_parts_c(
             dest[..encoded.len()].copy_from_slice(&encoded);
             i32::try_from(encoded.len()).unwrap_or(BLOSC2_ERROR_INVALID_PARAM)
         }
+        Err("B2ND dtype too large") => BLOSC2_ERROR_FAILURE,
         Err(_) => BLOSC2_ERROR_INVALID_PARAM,
     }
 }
@@ -657,11 +680,10 @@ pub fn b2nd_from_cbuffer_c(
     cparams: CParams,
     dparams: DParams,
 ) -> (i32, Option<B2ndArray>) {
-    let data = match b2nd_checked_cbuffer_prefix(data, buffersize) {
-        Ok(data) => data,
-        Err(code) => return (code, None),
-    };
-    b2nd_array_result_to_c(B2ndArray::from_cbuffer(meta, data, cparams, dparams))
+    match B2ndArray::empty(meta, cparams, dparams) {
+        Ok(array) => b2nd_fill_created_array_from_cbuffer_c(array, data, buffersize),
+        Err(err) => (b2nd_array_error_code(err), None),
+    }
 }
 
 /// C-style context adapter for [`B2ndArray::from_cbuffer`].
@@ -670,21 +692,53 @@ pub fn b2nd_from_cbuffer_ctx_c(
     data: &[u8],
     buffersize: i64,
 ) -> (i32, Option<B2ndArray>) {
-    let data = match b2nd_checked_cbuffer_prefix(data, buffersize) {
-        Ok(data) => data,
-        Err(code) => return (code, None),
-    };
     let metalayers = ctx.metalayer_refs();
-    b2nd_ctx_array_result_to_c(
-        ctx,
-        B2ndArray::from_cbuffer_with_metalayers(
-            ctx.meta.clone(),
-            data,
-            ctx.cparams.clone(),
-            ctx.dparams.clone(),
-            &metalayers,
-        ),
-    )
+    let array = match B2ndArray::empty_with_metalayers(
+        ctx.meta.clone(),
+        ctx.cparams.clone(),
+        ctx.dparams.clone(),
+        &metalayers,
+    ) {
+        Ok(array) => array,
+        Err(err) => return (b2nd_array_error_code(err), None),
+    };
+    match b2nd_fill_created_array_from_cbuffer_c(array, data, buffersize) {
+        (BLOSC2_ERROR_SUCCESS, Some(array)) => b2nd_ctx_array_result_to_c(ctx, Ok(array)),
+        result => result,
+    }
+}
+
+fn b2nd_fill_created_array_from_cbuffer_c(
+    mut array: B2ndArray,
+    data: &[u8],
+    buffersize: i64,
+) -> (i32, Option<B2ndArray>) {
+    let buffersize = match usize::try_from(buffersize) {
+        Ok(buffersize) => buffersize,
+        Err(_) => return (BLOSC2_ERROR_INVALID_PARAM, Some(array)),
+    };
+    let required = match array.preflight_dense_cbuffer_len() {
+        Ok(required) => required,
+        Err(err) => return (b2nd_array_error_code(err), Some(array)),
+    };
+    if buffersize < required {
+        return (BLOSC2_ERROR_INVALID_PARAM, Some(array));
+    }
+    let data = match data.get(..buffersize) {
+        Some(data) => data,
+        None => return (BLOSC2_ERROR_INVALID_PARAM, Some(array)),
+    };
+    if array.meta.nitems().unwrap_or(usize::MAX) == 0 {
+        return (BLOSC2_ERROR_SUCCESS, Some(array));
+    }
+    let ndim = array.meta.ndim();
+    let start = vec![0i64; ndim];
+    let stop = array.meta.shape.clone();
+    let buffershape = array.meta.shape.clone();
+    match array.set_slice_cbuffer(&start, &stop, &buffershape, data) {
+        Ok(()) => (BLOSC2_ERROR_SUCCESS, Some(array)),
+        Err(err) => (b2nd_selection_error_code(err), Some(array)),
+    }
 }
 
 /// C-name alias for [`B2ndArray::from_schunk`].
@@ -699,6 +753,7 @@ pub fn b2nd_from_schunk_c(schunk: Schunk) -> (i32, Option<B2ndArray>) {
         Err("Schunk does not contain a B2ND metalayer")
         | Err("Missing b2nd metalayer")
         | Err("Missing caterva metalayer") => (BLOSC2_ERROR_METALAYER_NOT_FOUND, None),
+        Err("Invalid B2ND ndim") => (BLOSC2_ERROR_FAILURE, None),
         Err(_) => (BLOSC2_ERROR_INVALID_PARAM, None),
     }
 }
@@ -715,7 +770,7 @@ pub fn b2nd_from_cframe(frame: &[u8], copy: bool) -> Result<B2ndArray, String> {
 pub fn b2nd_from_cframe_c(frame: &[u8], cframe_len: i64, copy: bool) -> (i32, Option<B2ndArray>) {
     let frame = match b2nd_checked_cbuffer_prefix(frame, cframe_len) {
         Ok(frame) => frame,
-        Err(code) => return (code, None),
+        Err(_) => return (BLOSC2_ERROR_FAILURE, None),
     };
     match b2nd_from_cframe(frame, copy) {
         Ok(array) => (BLOSC2_ERROR_SUCCESS, Some(array)),
@@ -974,12 +1029,12 @@ pub fn b2nd_print_meta_to_buffer_c(array: &B2ndArray, dest: &mut [u8], buffersiz
 
 /// C-name alias for [`B2ndArray::expand_dims_view`].
 pub fn b2nd_expand_dims(array: &B2ndArray, axes: &[bool]) -> Result<B2ndArray, &'static str> {
-    array.expand_dims_view(axes)
+    b2nd_expand_dims_view_c(array, axes)
 }
 
 /// C-style status adapter for [`B2ndArray::expand_dims_view`].
 pub fn b2nd_expand_dims_c(array: &B2ndArray, axes: &[bool]) -> (i32, Option<B2ndArray>) {
-    b2nd_array_result_to_c(array.expand_dims_view(axes))
+    b2nd_array_result_to_c(b2nd_expand_dims_view_c(array, axes))
 }
 
 /// C-style status adapter for [`B2ndArray::expand_dims_view`] with explicit final ndim.
@@ -1010,12 +1065,12 @@ pub fn b2nd_squeeze_c(array: &B2ndArray) -> (i32, Option<B2ndArray>) {
 
 /// C-name alias for [`B2ndArray::squeeze_index_view`].
 pub fn b2nd_squeeze_index(array: &B2ndArray, axes: &[bool]) -> Result<B2ndArray, &'static str> {
-    array.squeeze_index_view(axes)
+    b2nd_squeeze_index_view_c(array, axes)
 }
 
 /// C-style status adapter for [`B2ndArray::squeeze_index_view`].
 pub fn b2nd_squeeze_index_c(array: &B2ndArray, axes: &[bool]) -> (i32, Option<B2ndArray>) {
-    match array.squeeze_index_view(axes) {
+    match b2nd_squeeze_index_view_c(array, axes) {
         Ok(array) => (BLOSC2_ERROR_SUCCESS, Some(array)),
         Err(err) => (b2nd_squeeze_error_code(err), None),
     }
@@ -1066,7 +1121,9 @@ pub fn b2nd_concatenate(
             .concatenate_with_meta(other, axis, meta, cparams, dparams)
             .map(Some)
     } else {
-        array.concatenate_in_place(other, axis).map(|()| None)
+        array
+            .concatenate_in_place(other, axis)
+            .map(|()| Some(array.clone()))
     }
 }
 
@@ -1082,7 +1139,7 @@ pub fn b2nd_concatenate_c(
 ) -> (i32, Option<B2ndArray>) {
     if !copy {
         return match array.concatenate_in_place(other, axis) {
-            Ok(()) => (BLOSC2_ERROR_SUCCESS, None),
+            Ok(()) => (BLOSC2_ERROR_SUCCESS, Some(array.clone())),
             Err(_) => (BLOSC2_ERROR_INVALID_PARAM, None),
         };
     }
@@ -1119,7 +1176,7 @@ pub fn b2nd_concatenate_ctx_c(
 ) -> (i32, Option<B2ndArray>) {
     if !copy {
         return match array.concatenate_in_place(other, axis) {
-            Ok(()) => (BLOSC2_ERROR_SUCCESS, None),
+            Ok(()) => (BLOSC2_ERROR_SUCCESS, Some(array.clone())),
             Err(_) => (BLOSC2_ERROR_INVALID_PARAM, None),
         };
     }
@@ -1160,7 +1217,7 @@ pub fn b2nd_get_slice(
     cparams: CParams,
     dparams: DParams,
 ) -> Result<B2ndArray, &'static str> {
-    array.get_slice_array_with_meta(start, stop, meta, cparams, dparams)
+    b2nd_get_slice_array_with_meta_c(array, start, stop, meta, cparams, dparams, &[])
 }
 
 /// C-style status adapter for [`B2ndArray::get_slice_array_with_meta`].
@@ -1172,7 +1229,15 @@ pub fn b2nd_get_slice_c(
     cparams: CParams,
     dparams: DParams,
 ) -> (i32, Option<B2ndArray>) {
-    b2nd_array_result_to_c(array.get_slice_array_with_meta(start, stop, meta, cparams, dparams))
+    b2nd_array_result_to_c(b2nd_get_slice_array_with_meta_c(
+        array,
+        start,
+        stop,
+        meta,
+        cparams,
+        dparams,
+        &[],
+    ))
 }
 
 /// C-style context adapter for [`B2ndArray::get_slice_array_with_meta`].
@@ -1182,21 +1247,18 @@ pub fn b2nd_get_slice_ctx_c(
     start: &[i64],
     stop: &[i64],
 ) -> (i32, Option<B2ndArray>) {
-    if array.meta.nitems().unwrap_or(usize::MAX) == 0 {
-        let extents_as_i64 = match slice_extents_without_source_bounds(&array.meta, start, stop) {
-            Ok(extents_as_i64) => extents_as_i64,
-            Err(_) => return (BLOSC2_ERROR_INVALID_PARAM, None),
-        };
-        if product_i64(&extents_as_i64) == Ok(0) {
-            ctx.meta.shape = extents_as_i64;
-            return b2nd_empty_ctx_c(ctx);
-        }
-    }
-    let slice = match validate_slice_bounds(&array.meta, start, stop) {
-        Ok(slice) => slice,
+    let extents_as_i64 = match slice_extents_without_source_bounds(&array.meta, start, stop) {
+        Ok(extents_as_i64) => extents_as_i64,
         Err(_) => return (BLOSC2_ERROR_INVALID_PARAM, None),
     };
-    ctx.meta.shape = slice.extents_as_i64.clone();
+    ctx.meta.shape = extents_as_i64.clone();
+    if product_i64(&extents_as_i64) == Ok(0) {
+        return b2nd_empty_ctx_c(ctx);
+    }
+    match validate_slice_bounds(&array.meta, start, stop) {
+        Ok(_) => {}
+        Err(_) => return (BLOSC2_ERROR_INVALID_PARAM, None),
+    }
     let metalayers = ctx.metalayer_refs();
     b2nd_ctx_array_result_to_c(
         ctx,
@@ -1229,12 +1291,22 @@ pub fn b2nd_get_slice_cbuffer(
     dest: &mut [u8],
     buffershape: &[i64],
 ) -> i32 {
-    let required = match array.preflight_slice_cbuffer_len(start, stop, buffershape) {
+    let extents_as_i64 = match slice_extents_without_source_bounds(&array.meta, start, stop) {
+        Ok(extents_as_i64) => extents_as_i64,
+        Err(err) => return b2nd_selection_error_code(err),
+    };
+    let required = match array.preflight_slice_cbuffer_len_c(start, stop, buffershape) {
         Ok(required) => required,
         Err(err) => return b2nd_selection_error_code(err),
     };
     if dest.len() < required {
         return BLOSC2_ERROR_INVALID_PARAM;
+    }
+    if array.meta.nitems().unwrap_or(usize::MAX) == 0
+        || extents_as_i64.iter().any(|&extent| extent == 0)
+    {
+        dest.fill(0);
+        return BLOSC2_ERROR_SUCCESS;
     }
     match array.get_slice_cbuffer(start, stop, buffershape) {
         Ok(buffer) => {
@@ -1258,29 +1330,29 @@ pub fn b2nd_get_slice_cbuffer_c(
         Ok(buffersize) => buffersize,
         Err(code) => return code,
     };
-    if array.meta.nitems().unwrap_or(usize::MAX) == 0 {
-        dest[..buffersize].fill(0);
-        return BLOSC2_ERROR_SUCCESS;
-    }
     let result = (|| {
         let typesize = b2nd_cparams_typesize(&array.schunk.cparams)?;
+        let extents_as_i64 = slice_extents_without_source_bounds(&array.meta, start, stop)?;
+        validate_slice_buffershape(&extents_as_i64, buffershape)?;
+        if array.meta.nitems()? == 0 || extents_as_i64.iter().any(|&extent| extent == 0) {
+            return Ok(None);
+        }
         let slice = validate_slice_bounds(&array.meta, start, stop)?;
-        if buffershape.len() != slice.extents.len() {
-            return Err("B2ND buffer rank does not match array rank");
-        }
-        for (extent, &buffer_dim) in slice.extents_as_i64.iter().zip(buffershape) {
-            if buffer_dim < *extent {
-                return Err("B2ND buffer shape is smaller than slice shape");
-            }
-        }
-        if slice.extents.iter().any(|&extent| extent == 0) {
-            dest[..buffersize].fill(0);
-            return Ok(());
-        }
         let required_len = dense_region_required_len(buffershape, &slice.extents, typesize)?;
         if buffersize < required_len {
             return Err("Invalid B2ND destination buffer size");
         }
+        Ok(Some((slice, typesize)))
+    })();
+    let (slice, typesize) = match result {
+        Ok(Some(validated)) => validated,
+        Ok(None) => {
+            dest[..buffersize].fill(0);
+            return BLOSC2_ERROR_SUCCESS;
+        }
+        Err(err) => return b2nd_selection_error_code(err),
+    };
+    let result = (|| {
         dest[..buffersize].fill(0);
         let coords: Vec<Vec<usize>> = slice
             .starts
@@ -1335,6 +1407,18 @@ pub fn b2nd_set_slice_cbuffer(
     stop: &[i64],
     array: &mut B2ndArray,
 ) -> i32 {
+    let extents_as_i64 = match slice_extents_without_source_bounds(&array.meta, start, stop) {
+        Ok(extents_as_i64) => extents_as_i64,
+        Err(_) => return BLOSC2_ERROR_INVALID_PARAM,
+    };
+    if validate_slice_buffershape(&extents_as_i64, buffershape).is_err() {
+        return BLOSC2_ERROR_INVALID_PARAM;
+    }
+    if array.meta.nitems().unwrap_or(usize::MAX) == 0
+        || extents_as_i64.iter().any(|&extent| extent == 0)
+    {
+        return BLOSC2_ERROR_SUCCESS;
+    }
     match array.set_slice_cbuffer(start, stop, buffershape, data) {
         Ok(()) => BLOSC2_ERROR_SUCCESS,
         Err(_) => BLOSC2_ERROR_INVALID_PARAM,
@@ -1350,13 +1434,23 @@ pub fn b2nd_set_slice_cbuffer_c(
     stop: &[i64],
     array: &mut B2ndArray,
 ) -> i32 {
-    if array.meta.nitems().unwrap_or(usize::MAX) == 0 {
-        return BLOSC2_ERROR_SUCCESS;
-    }
     let data = match b2nd_checked_cbuffer_prefix(data, buffersize) {
         Ok(data) => data,
         Err(code) => return code,
     };
+    if array.meta.nitems().unwrap_or(usize::MAX) == 0 {
+        return BLOSC2_ERROR_SUCCESS;
+    }
+    let extents_as_i64 = match slice_extents_without_source_bounds(&array.meta, start, stop) {
+        Ok(extents_as_i64) => extents_as_i64,
+        Err(_) => return BLOSC2_ERROR_INVALID_PARAM,
+    };
+    if validate_slice_buffershape(&extents_as_i64, buffershape).is_err() {
+        return BLOSC2_ERROR_INVALID_PARAM;
+    }
+    if extents_as_i64.iter().any(|&extent| extent == 0) {
+        return BLOSC2_ERROR_SUCCESS;
+    }
     b2nd_set_slice_cbuffer(data, buffershape, start, stop, array)
 }
 
@@ -1796,6 +1890,27 @@ fn b2nd_ctx_array_result_to_c(
     }
 }
 
+fn b2nd_get_slice_array_with_meta_c(
+    array: &B2ndArray,
+    start: &[i64],
+    stop: &[i64],
+    mut meta: B2ndMeta,
+    cparams: CParams,
+    dparams: DParams,
+    metalayers: &[(&str, &[u8])],
+) -> Result<B2ndArray, &'static str> {
+    let extents_as_i64 = slice_extents_without_source_bounds(&array.meta, start, stop)?;
+    meta.shape = extents_as_i64.clone();
+    if product_i64(&extents_as_i64)? == 0 {
+        return B2ndArray::empty_with_metalayers(meta, cparams, dparams, metalayers);
+    }
+    match validate_slice_bounds(&array.meta, start, stop) {
+        Ok(_) => {}
+        Err(err) => return Err(err),
+    }
+    array.get_slice_array_with_meta_and_metalayers(start, stop, meta, cparams, dparams, metalayers)
+}
+
 fn finish_ctx_array_storage(ctx: &B2ndContext, mut array: B2ndArray) -> Result<B2ndArray, String> {
     let Some(storage) = &ctx.storage else {
         return Ok(array);
@@ -1860,9 +1975,18 @@ fn b2nd_expand_dims_view_c(array: &B2ndArray, axes: &[bool]) -> Result<B2ndArray
     Ok(view)
 }
 
+fn b2nd_squeeze_index_view_c(array: &B2ndArray, axes: &[bool]) -> Result<B2ndArray, &'static str> {
+    let ndim = array.meta.ndim();
+    if axes.len() < ndim {
+        return Err("B2ND squeeze axes do not match array rank");
+    }
+    array.squeeze_index_view(&axes[..ndim])
+}
+
 fn b2nd_array_error_code(err: &str) -> i32 {
     match err {
         "B2ND chunk too large" => BLOSC2_ERROR_MAX_BUFSIZE_EXCEEDED,
+        "B2ND dtype too large" | "Invalid B2ND dtype format" => BLOSC2_ERROR_FAILURE,
         "Schunk does not contain a B2ND metalayer"
         | "Missing b2nd metalayer"
         | "Missing caterva metalayer" => BLOSC2_ERROR_METALAYER_NOT_FOUND,
@@ -2412,6 +2536,7 @@ impl B2ndArray {
     ) -> Result<Self, &'static str> {
         meta.validate()?;
         let typesize = b2nd_cparams_typesize(&cparams)?;
+        b2nd_validate_cparams_for_array(&cparams)?;
         let chunk_nbytes = extchunk_nitems(&meta)?
             .checked_mul(typesize)
             .ok_or("B2ND chunk too large")?;
@@ -2454,6 +2579,7 @@ impl B2ndArray {
     ) -> Result<Self, &'static str> {
         meta.validate()?;
         let typesize = b2nd_cparams_typesize(&cparams)?;
+        b2nd_validate_cparams_for_array(&cparams)?;
         if value.len() != typesize {
             return Err("B2ND fill value size does not match typesize");
         }
@@ -2516,6 +2642,7 @@ impl B2ndArray {
     ) -> Result<Self, &'static str> {
         meta.validate()?;
         let typesize = b2nd_cparams_typesize(&cparams)?;
+        b2nd_validate_cparams_for_array(&cparams)?;
         let expected_len = meta
             .nitems()?
             .checked_mul(typesize)
@@ -2802,24 +2929,44 @@ impl B2ndArray {
     /// Return the linear chunk indexes touched by the half-open item slice
     /// `start..stop`, matching C-Blosc2 `b2nd_get_slice_nchunks`.
     pub fn get_slice_nchunks(&self, start: &[i64], stop: &[i64]) -> Result<Vec<i64>, &'static str> {
-        let slice = validate_slice_bounds(&self.meta, start, stop)?;
+        let ndim = self.meta.ndim();
+        if start.len() != ndim || stop.len() != ndim {
+            return Err("B2ND slice rank does not match array rank");
+        }
         if self.meta.nitems()? == 0 {
             return Ok(Vec::new());
         }
-        if slice.extents.iter().any(|&extent| extent == 0) {
-            return Ok(Vec::new());
-        }
+        let slice = validate_slice_bounds(&self.meta, start, stop)?;
         let chunk_grid = chunk_grid(&self.meta)?;
-        let mut first = vec![0usize; self.meta.ndim()];
-        let mut last = vec![0usize; self.meta.ndim()];
+        let mut first = vec![0usize; ndim];
+        let mut shape = vec![0usize; ndim];
         for dim in 0..self.meta.ndim() {
             let chunk = self.meta.chunkshape[dim] as usize;
-            first[dim] = slice.starts[dim] / chunk;
-            last[dim] = (slice.starts[dim] + slice.extents[dim] - 1) / chunk;
+            let slice_stop = slice.starts[dim]
+                .checked_add(slice.extents[dim])
+                .ok_or("Invalid B2ND slice bounds")?;
+            let mut pos = 0usize;
+            while pos <= slice.starts[dim] {
+                pos = pos.checked_add(chunk).ok_or("B2ND chunk index overflow")?;
+            }
+            first[dim] = pos / chunk - 1;
+            while pos < slice_stop {
+                pos = pos.checked_add(chunk).ok_or("B2ND chunk index overflow")?;
+            }
+            shape[dim] = pos / chunk - first[dim];
         }
+        product_usize(&shape)?;
         let mut out = Vec::new();
-        let mut chunk_index = first.clone();
-        collect_slice_chunks(0, &first, &last, &mut chunk_index, &chunk_grid, &mut out)?;
+        collect_slice_chunks_c_filtered(
+            0,
+            &first,
+            &shape,
+            &mut vec![0usize; ndim],
+            &chunk_grid,
+            &self.meta,
+            &slice,
+            &mut out,
+        )?;
         Ok(out)
     }
 
@@ -2905,6 +3052,7 @@ impl B2ndArray {
         dparams: DParams,
     ) -> Result<Self, &'static str> {
         meta.shape = self.meta.shape.clone();
+        b2nd_validate_cparams_for_array(&cparams)?;
         if meta.chunkshape == self.meta.chunkshape && meta.blockshape == self.meta.blockshape {
             return Ok(Self::from_parts(
                 meta,
@@ -2985,6 +3133,7 @@ impl B2ndArray {
         let ndim = self.meta.ndim();
         let new_shape = self.concatenated_shape(other, axis)?;
         meta.shape = new_shape.clone();
+        b2nd_validate_cparams_for_array(&cparams)?;
 
         if let Some(result) = self.try_concatenate_raw_chunks_axis0(
             other,
@@ -3139,21 +3288,17 @@ impl B2ndArray {
         Ok(chunk_count)
     }
 
-    fn preflight_slice_cbuffer_len(
+    fn preflight_slice_cbuffer_len_c(
         &self,
         start: &[i64],
         stop: &[i64],
         buffershape: &[i64],
     ) -> Result<usize, &'static str> {
         let typesize = b2nd_cparams_typesize(&self.schunk.cparams)?;
-        let slice = validate_slice_bounds(&self.meta, start, stop)?;
-        if buffershape.len() != slice.extents.len() {
-            return Err("B2ND buffer rank does not match array rank");
-        }
-        for (extent, &buffer_dim) in slice.extents_as_i64.iter().zip(buffershape) {
-            if buffer_dim < *extent {
-                return Err("B2ND buffer shape is smaller than slice shape");
-            }
+        let extents_as_i64 = slice_extents_without_source_bounds(&self.meta, start, stop)?;
+        validate_slice_buffershape(&extents_as_i64, buffershape)?;
+        if self.meta.nitems()? != 0 && extents_as_i64.iter().all(|&extent| extent != 0) {
+            validate_slice_bounds(&self.meta, start, stop)?;
         }
         product_i64(buffershape)?
             .checked_mul(typesize)
@@ -4169,6 +4314,9 @@ fn add_fixed_metalayers(
         if name == B2ND_METALAYER_NAME {
             return Err("B2ND metalayer is managed by the array");
         }
+        if schunk.metalayers.len() >= BLOSC2_MAX_METALAYERS {
+            return Err("Too many metalayers");
+        }
         schunk.add_metalayer(name, content)?;
     }
     Ok(())
@@ -4287,6 +4435,7 @@ fn validate_resize_at(
             }
             let delta = new_dim
                 .checked_sub(old_dim)
+                .or_else(|| old_dim.checked_sub(new_dim).and_then(i64::checked_neg))
                 .ok_or("Invalid B2ND resize shape")?;
             let touches_end = if delta > 0 {
                 start_dim == old_dim
@@ -4512,22 +4661,75 @@ fn slice_extents_without_source_bounds(
     Ok(extents)
 }
 
-fn collect_slice_chunks(
+fn validate_slice_buffershape(
+    extents_as_i64: &[i64],
+    buffershape: &[i64],
+) -> Result<(), &'static str> {
+    if buffershape.len() != extents_as_i64.len() {
+        return Err("B2ND buffer rank does not match array rank");
+    }
+    for (extent, &buffer_dim) in extents_as_i64.iter().zip(buffershape) {
+        if buffer_dim < *extent {
+            return Err("B2ND buffer shape is smaller than slice shape");
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_slice_chunks_c_filtered(
     dim: usize,
     first: &[usize],
-    last: &[usize],
+    shape: &[usize],
     chunk_index: &mut [usize],
     chunk_grid: &[usize],
+    meta: &B2ndMeta,
+    slice: &B2ndSlice,
     out: &mut Vec<i64>,
 ) -> Result<(), &'static str> {
     if dim < chunk_index.len() {
-        for value in first[dim]..=last[dim] {
-            chunk_index[dim] = value;
-            collect_slice_chunks(dim + 1, first, last, chunk_index, chunk_grid, out)?;
+        for offset in 0..shape[dim] {
+            chunk_index[dim] = first[dim]
+                .checked_add(offset)
+                .ok_or("B2ND chunk index overflow")?;
+            collect_slice_chunks_c_filtered(
+                dim + 1,
+                first,
+                shape,
+                chunk_index,
+                chunk_grid,
+                meta,
+                slice,
+                out,
+            )?;
         }
         return Ok(());
     }
-    out.push(ravel_index(chunk_index, chunk_grid)? as i64);
+
+    let mut chunk_empty = false;
+    for dim in 0..chunk_index.len() {
+        let chunk_start = chunk_index[dim]
+            .checked_mul(meta.chunkshape[dim] as usize)
+            .ok_or("B2ND chunk index overflow")?;
+        let chunk_stop = chunk_start
+            .checked_add(meta.chunkshape[dim] as usize)
+            .ok_or("B2ND chunk index overflow")?
+            .min(meta.shape[dim] as usize);
+        let slice_stop = slice.starts[dim]
+            .checked_add(slice.extents[dim])
+            .ok_or("Invalid B2ND slice bounds")?;
+        chunk_empty |= chunk_stop <= slice.starts[dim] || chunk_start >= slice_stop;
+    }
+    if !chunk_empty {
+        if chunk_index
+            .iter()
+            .zip(chunk_grid)
+            .any(|(&chunk_index, &grid)| chunk_index >= grid)
+        {
+            return Err("B2ND chunk index out of bounds");
+        }
+        out.push(ravel_index(chunk_index, chunk_grid)? as i64);
+    }
     Ok(())
 }
 
@@ -5943,6 +6145,12 @@ mod tests {
             b2nd_deserialize_meta_c(&c_lenient_encoded),
             (c_lenient_encoded.len() as i32, Some(meta.clone()))
         );
+        let mut invalid_ndim_encoded = encoded.clone();
+        invalid_ndim_encoded[2] = (B2ND_MAX_DIM + 1) as u8;
+        assert_eq!(
+            b2nd_deserialize_meta_c(&invalid_ndim_encoded),
+            (BLOSC2_ERROR_FAILURE, None)
+        );
         let dtype_start = 3 + 1 + 2 * 9 + 1 + 2 * 5 + 1 + 2 * 5;
         let legacy_without_dtype = encoded[..dtype_start].to_vec();
         assert_eq!(
@@ -6027,6 +6235,22 @@ mod tests {
         assert_eq!(raw_meta.chunkshape, vec![-4]);
         assert_eq!(raw_meta.blockshape, vec![0]);
         assert_eq!(raw_meta.dtype, "<i4");
+        let mut extra_dims_dest = vec![0u8; 128];
+        let extra_dims_len = b2nd_serialize_meta_parts_c(
+            vec![10],
+            vec![4, 99],
+            vec![2, 88],
+            Some("<i4"),
+            DTYPE_NUMPY_FORMAT,
+            &mut extra_dims_dest,
+        );
+        assert!(extra_dims_len > 0);
+        let extra_dims_meta = b2nd_deserialize_meta_c(&extra_dims_dest[..extra_dims_len as usize])
+            .1
+            .unwrap();
+        assert_eq!(extra_dims_meta.shape, vec![10]);
+        assert_eq!(extra_dims_meta.chunkshape, vec![4]);
+        assert_eq!(extra_dims_meta.blockshape, vec![2]);
         assert_eq!(
             b2nd_serialize_meta_parts_c(
                 vec![10, 20],
@@ -7790,6 +8014,20 @@ mod tests {
             array.get_slice_nchunks(&[1, 2], &[4, 6]).unwrap(),
             vec![0, 1, 2, 3]
         );
+        assert_eq!(array.get_slice_nchunks(&[1, 2], &[1, 2]).unwrap(), vec![0]);
+        assert_eq!(array.get_slice_nchunks(&[4, 5], &[4, 5]).unwrap(), vec![3]);
+        assert_eq!(
+            array.get_slice_nchunks(&[1, 0], &[1, 7]).unwrap(),
+            vec![0, 1]
+        );
+        assert!(array
+            .get_slice_nchunks(&[3, 4], &[3, 4])
+            .unwrap()
+            .is_empty());
+        assert!(array
+            .get_slice_nchunks(&[5, 7], &[5, 7])
+            .unwrap()
+            .is_empty());
         assert!(array.get_slice_nchunks(&[0, 0], &[6, 1]).is_err());
 
         let replacement: Vec<u16> = (1000..1012).collect();
@@ -8064,10 +8302,7 @@ mod tests {
         assert_eq!(invalid_parts_ctx.meta.blockshape, vec![-2]);
         assert_eq!(invalid_parts_ctx.meta.dtype_format, -1);
         assert_eq!(invalid_parts_ctx.cparams.blocksize, -2);
-        assert_eq!(
-            b2nd_zeros_ctx_c(&invalid_parts_ctx).0,
-            BLOSC2_ERROR_INVALID_PARAM
-        );
+        assert_eq!(b2nd_zeros_ctx_c(&invalid_parts_ctx).0, BLOSC2_ERROR_FAILURE);
         let (invalid_storage_ctx_rc, invalid_storage_ctx) = b2nd_create_ctx_parts_with_storage_c(
             vec![2],
             vec![2],
@@ -8119,6 +8354,30 @@ mod tests {
         let ctx_full = ctx_full.unwrap();
         assert_eq!(ctx_full.to_cbuffer().unwrap(), vec![7; 24]);
         assert_eq!(ctx_full.schunk.metalayer("owner"), Some(&b"ctx"[..]));
+        let (short_from_cbuffer_rc, short_from_cbuffer) = b2nd_from_cbuffer_c(
+            meta.clone(),
+            &data,
+            (data.len() - 1) as i64,
+            cparams.clone(),
+            DParams::default(),
+        );
+        assert_eq!(short_from_cbuffer_rc, BLOSC2_ERROR_INVALID_PARAM);
+        assert_eq!(
+            b2nd_to_cbuffer_vec(&short_from_cbuffer.unwrap()).unwrap(),
+            vec![0; data.len()]
+        );
+        let (short_ctx_from_cbuffer_rc, short_ctx_from_cbuffer) =
+            b2nd_from_cbuffer_ctx_c(&ctx, &data, (data.len() - 1) as i64);
+        assert_eq!(short_ctx_from_cbuffer_rc, BLOSC2_ERROR_INVALID_PARAM);
+        let short_ctx_from_cbuffer = short_ctx_from_cbuffer.unwrap();
+        assert_eq!(
+            b2nd_to_cbuffer_vec(&short_ctx_from_cbuffer).unwrap(),
+            vec![0; data.len()]
+        );
+        assert_eq!(
+            short_ctx_from_cbuffer.schunk.metalayer("owner"),
+            Some(&b"ctx"[..])
+        );
         let (oversized_ctx_rc, oversized_ctx) = b2nd_create_ctx_c(
             oversized_meta,
             oversized_cparams,
@@ -8155,7 +8414,73 @@ mod tests {
             b2nd_zeros_ctx_c(&reserved_ctx.unwrap()).0,
             BLOSC2_ERROR_INVALID_PARAM
         );
+        let too_many_metalayers: Vec<_> = (0..BLOSC2_MAX_METALAYERS)
+            .map(|idx| (format!("m{idx}"), vec![idx as u8]))
+            .collect();
+        assert!(b2nd_create_ctx(
+            meta.clone(),
+            cparams.clone(),
+            DParams::default(),
+            too_many_metalayers.clone()
+        )
+        .is_err());
+        let (too_many_ctx_rc, too_many_ctx) = b2nd_create_ctx_c(
+            meta.clone(),
+            cparams.clone(),
+            DParams::default(),
+            too_many_metalayers.clone(),
+        );
+        assert_eq!(too_many_ctx_rc, BLOSC2_ERROR_SUCCESS);
+        assert_eq!(
+            b2nd_zeros_ctx_c(&too_many_ctx.unwrap()).0,
+            BLOSC2_ERROR_INVALID_PARAM
+        );
+        let (too_many_parts_rc, too_many_parts) = b2nd_create_ctx_parts_c(
+            vec![2, 3],
+            vec![2, 3],
+            vec![1, 3],
+            Some("|u1"),
+            DTYPE_NUMPY_FORMAT,
+            cparams.clone(),
+            DParams::default(),
+            too_many_metalayers,
+        );
+        assert_eq!(too_many_parts_rc, BLOSC2_ERROR_SUCCESS);
+        assert_eq!(
+            b2nd_zeros_ctx_c(&too_many_parts.unwrap()).0,
+            BLOSC2_ERROR_INVALID_PARAM
+        );
         assert_eq!(b2nd_free_ctx_c(Some(ctx.clone())), BLOSC2_ERROR_SUCCESS);
+
+        let mut zfp_cparams = CParams {
+            compcode: BLOSC_CODEC_ZFP_FIXED_RATE,
+            filters: [0; BLOSC2_MAX_FILTERS],
+            ..cparams.clone()
+        };
+        assert_eq!(
+            b2nd_create_ctx_c(
+                meta.clone(),
+                zfp_cparams.clone(),
+                DParams::default(),
+                Vec::new()
+            )
+            .0,
+            BLOSC2_ERROR_SUCCESS
+        );
+        zfp_cparams.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_SHUFFLE;
+        assert_eq!(
+            b2nd_create_ctx_c(
+                meta.clone(),
+                zfp_cparams.clone(),
+                DParams::default(),
+                Vec::new()
+            )
+            .0,
+            BLOSC2_ERROR_INVALID_PARAM
+        );
+        assert!(
+            b2nd_create_ctx(meta.clone(), zfp_cparams, DParams::default(), Vec::new()).is_err()
+        );
 
         assert_eq!(b2nd_to_cbuffer_vec(&array).unwrap(), data);
         let mut dense_dest = vec![0u8; data.len()];
@@ -8240,13 +8565,10 @@ mod tests {
             b2nd_from_cframe_c(&[frame.as_slice(), &[0]].concat(), frame.len() as i64, true);
         assert_eq!(from_frame_rc, BLOSC2_ERROR_SUCCESS);
         assert_eq!(b2nd_to_cbuffer_vec(&from_frame_c.unwrap()).unwrap(), data);
-        assert_eq!(
-            b2nd_from_cframe_c(&frame, -1, true).0,
-            BLOSC2_ERROR_INVALID_PARAM
-        );
+        assert_eq!(b2nd_from_cframe_c(&frame, -1, true).0, BLOSC2_ERROR_FAILURE);
         assert_eq!(
             b2nd_from_cframe_c(&frame, (frame.len() + 1) as i64, true).0,
-            BLOSC2_ERROR_INVALID_PARAM
+            BLOSC2_ERROR_FAILURE
         );
         let alias_cparams = CParams {
             clevel: 0,
@@ -8337,6 +8659,16 @@ mod tests {
             b2nd_from_schunk_c(array.schunk.clone()).0,
             BLOSC2_ERROR_SUCCESS
         );
+        let mut invalid_ndim_schunk = Schunk::new(cparams.clone(), DParams::default());
+        let mut invalid_ndim_meta = meta.serialize().unwrap();
+        invalid_ndim_meta[2] = (B2ND_MAX_DIM + 1) as u8;
+        invalid_ndim_schunk
+            .add_metalayer(B2ND_METALAYER_NAME, &invalid_ndim_meta)
+            .unwrap();
+        let (invalid_ndim_schunk_rc, invalid_ndim_schunk_array) =
+            b2nd_from_schunk_c(invalid_ndim_schunk);
+        assert_eq!(invalid_ndim_schunk_rc, BLOSC2_ERROR_FAILURE);
+        assert!(invalid_ndim_schunk_array.is_none());
         assert_eq!(
             b2nd_get_slice_nchunks_vec(&array, &[1, 2], &[4, 6]).unwrap(),
             vec![0, 1, 2, 3]
@@ -8346,6 +8678,16 @@ mod tests {
             (4, Some(vec![0, 1, 2, 3]))
         );
         assert_eq!(b2nd_get_slice_nchunks(&array, &[0, 0], &[0, 0]), (0, None));
+        assert_eq!(
+            b2nd_get_slice_nchunks(&array, &[1, 2], &[1, 2]),
+            (1, Some(vec![0]))
+        );
+        assert_eq!(
+            b2nd_get_slice_nchunks(&array, &[3, 4], &[3, 4]),
+            (1, Some(vec![3]))
+        );
+        assert_eq!(b2nd_get_slice_nchunks(&array, &[2, 3], &[2, 3]), (0, None));
+        assert_eq!(b2nd_get_slice_nchunks(&array, &[4, 6], &[4, 6]), (0, None));
         let empty_array = B2ndArray::from_cbuffer(
             B2ndMeta::new(vec![0, 5], vec![0, 5], vec![0, 1], "|u1", 0).unwrap(),
             &[],
@@ -8355,7 +8697,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             b2nd_get_slice_nchunks(&empty_array, &[0, 100], &[0, 101]),
-            (BLOSC2_ERROR_INVALID_PARAM, None)
+            (0, None)
         );
         assert_eq!(
             b2nd_get_slice_nchunks(&empty_array, &[0, 0], &[0, 5]),
@@ -8462,7 +8804,7 @@ mod tests {
             b2nd_get_slice_ctx_c(&mut ctx, &array, &[3, 5], &[5, 7]).0,
             BLOSC2_ERROR_INVALID_PARAM
         );
-        assert_eq!(ctx.meta.shape, vec![3, 4]);
+        assert_eq!(ctx.meta.shape, vec![2, 2]);
         let mut source_ctx_array = array.clone();
         source_ctx_array
             .schunk
@@ -8520,6 +8862,25 @@ mod tests {
             ctx_concat.schunk.vlmetalayer("source-vl"),
             Some(&b"payload"[..])
         );
+        let mut ctx_concat_in_place_left = source_ctx_array.clone();
+        let (ctx_concat_in_place_rc, ctx_concat_in_place) =
+            b2nd_concatenate_ctx_c(&mut ctx, &mut ctx_concat_in_place_left, &array, 0, false);
+        assert_eq!(ctx_concat_in_place_rc, BLOSC2_ERROR_SUCCESS);
+        let ctx_concat_in_place = ctx_concat_in_place.unwrap();
+        assert_eq!(ctx_concat_in_place.shape(), &[8, 6]);
+        assert_eq!(
+            b2nd_to_cbuffer_vec(&ctx_concat_in_place).unwrap(),
+            [data.as_slice(), data.as_slice()].concat()
+        );
+        assert_eq!(
+            b2nd_to_cbuffer_vec(&ctx_concat_in_place_left).unwrap(),
+            [data.as_slice(), data.as_slice()].concat()
+        );
+        let mut ctx_concat_axis_left = source_ctx_array.clone();
+        let (ctx_concat_axis_rc, ctx_concat_axis) =
+            b2nd_concatenate_ctx_axis_c(&mut ctx, &mut ctx_concat_axis_left, &array, 0, false);
+        assert_eq!(ctx_concat_axis_rc, BLOSC2_ERROR_SUCCESS);
+        assert_eq!(ctx_concat_axis.unwrap().shape(), &[8, 6]);
         let previous_ctx_shape = ctx.meta.shape.clone();
         let incompatible_meta =
             B2ndMeta::new(vec![4, 5], vec![2, 3], vec![1, 3], "|u1", 0).unwrap();
@@ -8951,6 +9312,10 @@ mod tests {
             .1
             .unwrap();
         assert_eq!(partial_expanded.shape(), &[1, 4]);
+        let partial_expanded_alias = b2nd_expand_dims(&array, &[true, false]).unwrap();
+        assert_eq!(partial_expanded_alias.shape(), &[1, 4]);
+        let partial_expanded_c = b2nd_expand_dims_c(&array, &[true, false]).1.unwrap();
+        assert_eq!(partial_expanded_c.shape(), &[1, 4]);
         assert_eq!(
             b2nd_expand_dims_final_c(&array, &[true, false, false, true], 3).0,
             BLOSC2_ERROR_SUCCESS
@@ -9008,9 +9373,35 @@ mod tests {
             DParams::default(),
         );
         assert_eq!(concat_rc, BLOSC2_ERROR_SUCCESS);
-        assert!(concat_result.is_none());
+        let concat_result = concat_result.unwrap();
+        assert_eq!(
+            b2nd_to_cbuffer_vec(&concat_result).unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
         assert_eq!(
             b2nd_to_cbuffer_vec(&concat_left).unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        let mut concat_alias_left = b2nd_from_cbuffer(
+            one_d_meta.clone(),
+            &[1, 2, 3, 4],
+            cparams.clone(),
+            DParams::default(),
+        )
+        .unwrap();
+        let concat_alias_result = b2nd_concatenate(
+            &mut concat_alias_left,
+            &concat_right,
+            0,
+            false,
+            one_d_meta.clone(),
+            cparams.clone(),
+            DParams::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            b2nd_to_cbuffer_vec(&concat_alias_result).unwrap(),
             vec![1, 2, 3, 4, 5, 6, 7, 8]
         );
 
@@ -9117,6 +9508,20 @@ mod tests {
                 .unwrap()
                 .shape(),
             &[4]
+        );
+        assert_eq!(
+            b2nd_squeeze_index(&expanded, &[true, false, true])
+                .unwrap()
+                .shape(),
+            &[4]
+        );
+        assert_eq!(
+            b2nd_squeeze_index_c(&expanded, &[true, false, true]).0,
+            BLOSC2_ERROR_SUCCESS
+        );
+        assert_eq!(
+            b2nd_squeeze_index_c(&expanded, &[true]).0,
+            BLOSC2_ERROR_INVALID_PARAM
         );
 
         let mut copied_region = vec![0u8; 9];
@@ -9948,6 +10353,10 @@ mod tests {
             BLOSC2_ERROR_SUCCESS
         );
         assert_eq!(
+            b2nd_set_slice_cbuffer_c(&[], -1, &[0, 1], &[0, 100], &[0, 101], &mut array),
+            BLOSC2_ERROR_INVALID_PARAM
+        );
+        assert_eq!(
             b2nd_set_slice_cbuffer_c(&[], 0, &[0, 5], &[0, 0], &[0, 5], &mut array),
             BLOSC2_ERROR_SUCCESS
         );
@@ -9975,6 +10384,81 @@ mod tests {
         assert_eq!(slice.shape(), &[0, 5]);
         assert_eq!(slice.to_cbuffer().unwrap(), Vec::<u8>::new());
         assert_eq!(slice.schunk.metalayer("owner"), Some(&b"ctx"[..]));
+    }
+
+    #[test]
+    fn test_b2nd_c_zero_item_slice_on_nonempty_array_returns_before_source_bounds() {
+        let meta = B2ndMeta::new(vec![4, 6], vec![2, 3], vec![1, 3], "|u1", 0).unwrap();
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 1,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            ..Default::default()
+        };
+        let data: Vec<u8> = (0..24).collect();
+        let mut array =
+            B2ndArray::from_cbuffer(meta.clone(), &data, cparams.clone(), DParams::default())
+                .unwrap();
+        let before = array.to_cbuffer().unwrap();
+        let start = [0, 100];
+        let stop = [0, 101];
+        let buffershape = [0, 1];
+
+        let mut dest = vec![0xff; 4];
+        assert_eq!(
+            b2nd_get_slice_cbuffer_c(&array, &start, &stop, &mut dest, &buffershape, 4),
+            BLOSC2_ERROR_SUCCESS
+        );
+        assert_eq!(dest, vec![0; 4]);
+        dest.fill(0xff);
+        assert_eq!(
+            b2nd_get_slice_cbuffer(&array, &start, &stop, &mut dest, &buffershape),
+            BLOSC2_ERROR_SUCCESS
+        );
+        assert_eq!(dest, vec![0; 4]);
+
+        assert_eq!(
+            b2nd_set_slice_cbuffer(&[], &buffershape, &start, &stop, &mut array),
+            BLOSC2_ERROR_SUCCESS
+        );
+        assert_eq!(
+            b2nd_set_slice_cbuffer_c(&[], 0, &buffershape, &start, &stop, &mut array),
+            BLOSC2_ERROR_SUCCESS
+        );
+        assert_eq!(array.to_cbuffer().unwrap(), before);
+
+        let slice_meta = B2ndMeta::new(vec![99, 99], vec![2, 3], vec![1, 3], "|u1", 0).unwrap();
+        let slice = b2nd_get_slice(
+            &array,
+            &start,
+            &stop,
+            slice_meta.clone(),
+            cparams.clone(),
+            DParams::default(),
+        )
+        .unwrap();
+        assert_eq!(slice.shape(), &[0, 1]);
+        assert_eq!(slice.to_cbuffer().unwrap(), Vec::<u8>::new());
+        let (slice_rc, slice) = b2nd_get_slice_c(
+            &array,
+            &start,
+            &stop,
+            slice_meta,
+            cparams.clone(),
+            DParams::default(),
+        );
+        assert_eq!(slice_rc, BLOSC2_ERROR_SUCCESS);
+        assert_eq!(slice.unwrap().shape(), &[0, 1]);
+
+        let (ctx_rc, ctx) = b2nd_create_ctx_c(meta, cparams, DParams::default(), Vec::new());
+        assert_eq!(ctx_rc, BLOSC2_ERROR_SUCCESS);
+        let mut ctx = ctx.unwrap();
+        let (ctx_slice_rc, ctx_slice) = b2nd_get_slice_ctx_c(&mut ctx, &array, &start, &stop);
+        assert_eq!(ctx_slice_rc, BLOSC2_ERROR_SUCCESS);
+        assert_eq!(ctx.meta.shape, vec![0, 1]);
+        assert_eq!(ctx_slice.unwrap().shape(), &[0, 1]);
     }
 
     #[test]

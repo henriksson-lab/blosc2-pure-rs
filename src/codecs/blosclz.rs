@@ -101,6 +101,7 @@ fn get_run(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usize) -> usiz
 /// position whose byte differs from the corresponding reference byte
 /// (one past the mismatch, matching the upstream C convention).
 #[inline(always)]
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 fn get_match(data: &[u8], ip: usize, ip_bound: usize, refp: usize) -> usize {
     get_match_generic(data, ip, ip_bound, refp)
 }
@@ -204,25 +205,30 @@ fn get_match_generic(data: &[u8], mut ip: usize, ip_bound: usize, mut refp: usiz
 /// (`run == true`) means the match overlaps with a single byte and is
 /// most efficiently handled as a run.
 #[inline(always)]
-fn get_run_or_match(
+fn get_run_or_match<const USE_SSE2_MATCH: bool>(
     data: &[u8],
     ip: usize,
     ip_bound: usize,
     refp: usize,
     run: bool,
-    use_sse2_match: bool,
 ) -> usize {
     if run {
         get_run(data, ip, ip_bound, refp)
     } else {
-        #[cfg(target_arch = "x86_64")]
-        if use_sse2_match {
-            return unsafe { get_match_16_x86_64(data, ip, ip_bound, refp) };
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if USE_SSE2_MATCH {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                get_match_16_x86_64(data, ip, ip_bound, refp)
+            }
+            #[cfg(target_arch = "x86")]
+            unsafe {
+                get_match_16_x86(data, ip, ip_bound, refp)
+            }
+        } else {
+            get_match(data, ip, ip_bound, refp)
         }
-        #[cfg(target_arch = "x86")]
-        if use_sse2_match {
-            return unsafe { get_match_16_x86(data, ip, ip_bound, refp) };
-        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         get_match(data, ip, ip_bound, refp)
     }
 }
@@ -241,14 +247,13 @@ fn output_has_space(op: usize, len: usize, op_limit: usize) -> bool {
 /// output bytes that the real encoder would emit (`oc`), then returns
 /// `bytes_read / bytes_written`. Low ratios cause the caller to bail out
 /// and store the block uncompressed.
-fn get_cratio_with_htab(
+fn get_cratio_with_htab<const USE_SSE2_MATCH: bool>(
     data: &[u8],
     maxlen: usize,
     minlen: usize,
     ipshift: usize,
     hash_shift: u32,
     htab: &mut [u32],
-    use_sse2_match: bool,
 ) -> f64 {
     htab.fill(0);
     let data_ptr = data.as_ptr();
@@ -298,13 +303,12 @@ fn get_cratio_with_htab(
             ip = anchor + 4;
             let ref_after = ref_offset + 4;
             let distance_dec = distance - 1;
-            ip = get_run_or_match(
+            ip = get_run_or_match::<USE_SSE2_MATCH>(
                 data,
                 ip,
                 ip_bound,
                 ref_after,
                 distance_dec == 0,
-                use_sse2_match,
             );
 
             debug_assert!(ip >= ipshift);
@@ -378,13 +382,12 @@ fn get_cratio_with_htab(
             ip = anchor + 4;
             let ref_after = ref_offset + 4;
             let distance_dec = distance - 1;
-            ip = get_run_or_match(
+            ip = get_run_or_match::<USE_SSE2_MATCH>(
                 data,
                 ip,
                 ip_bound,
                 ref_after,
                 distance_dec == 0,
-                use_sse2_match,
             );
 
             debug_assert!(ip >= ipshift);
@@ -443,6 +446,25 @@ fn get_cratio_with_htab(
 /// Returns the number of bytes written to `output`, or `0` if the input
 /// is incompressible or the output buffer is too small.
 pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        compress_impl::<true>(clevel, input, output)
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        if std::arch::is_x86_feature_detected!("sse2") {
+            compress_impl::<true>(clevel, input, output)
+        } else {
+            compress_impl::<false>(clevel, input, output)
+        }
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        compress_impl::<false>(clevel, input, output)
+    }
+}
+
+fn compress_impl<const USE_SSE2_MATCH: bool>(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
     let length = input.len();
     let maxout = output.len();
 
@@ -483,20 +505,14 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
     // SAFETY: We only ever read entries from `htab[..hashlen]` after explicitly
     // zeroing that prefix, and the compressor never touches the unused suffix.
     let htab = unsafe { &mut *htab_storage.as_mut_ptr() };
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    let use_sse2_match = std::arch::is_x86_feature_detected!("sse2");
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    let use_sse2_match = false;
-
     let shift = length - maxlen;
-    let cratio = get_cratio_with_htab(
+    let cratio = get_cratio_with_htab::<USE_SSE2_MATCH>(
         &input[shift..],
         maxlen,
         minlen,
         ipshift,
         hash_shift,
         &mut htab[..hashlen],
-        use_sse2_match,
     );
 
     let cratio_table: [f64; 10] = [0.0, 2.0, 1.5, 1.2, 1.2, 1.2, 1.2, 1.15, 1.1, 1.0];
@@ -574,14 +590,7 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
             ip = anchor + 4;
             let ref_after = ref_offset + 4;
             let distance = distance - 1;
-            ip = get_run_or_match(
-                input,
-                ip,
-                ip_bound,
-                ref_after,
-                distance == 0,
-                use_sse2_match,
-            );
+            ip = get_run_or_match::<USE_SSE2_MATCH>(input, ip, ip_bound, ref_after, distance == 0);
 
             debug_assert!(ip >= ipshift);
             ip -= ipshift;
@@ -692,14 +701,7 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
             ip = anchor + 4;
             let ref_after = ref_offset + 4;
             let distance = distance - 1;
-            ip = get_run_or_match(
-                input,
-                ip,
-                ip_bound,
-                ref_after,
-                distance == 0,
-                use_sse2_match,
-            );
+            ip = get_run_or_match::<USE_SSE2_MATCH>(input, ip, ip_bound, ref_after, distance == 0);
 
             debug_assert!(ip >= ipshift);
             ip -= ipshift;
@@ -816,14 +818,7 @@ pub fn compress(clevel: i32, input: &[u8], output: &mut [u8]) -> i32 {
             ip = anchor + 4;
             let ref_after = ref_offset + 4;
             let distance = distance - 1;
-            ip = get_run_or_match(
-                input,
-                ip,
-                ip_bound,
-                ref_after,
-                distance == 0,
-                use_sse2_match,
-            );
+            ip = get_run_or_match::<USE_SSE2_MATCH>(input, ip, ip_bound, ref_after, distance == 0);
 
             debug_assert!(ip >= ipshift);
             ip -= ipshift;

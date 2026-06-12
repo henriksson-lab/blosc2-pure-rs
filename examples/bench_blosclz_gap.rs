@@ -52,7 +52,7 @@ mod enabled {
     }
 
     unsafe fn c_cparams(filter: u8) -> ffi::blosc2_cparams {
-        let mut cparams: ffi::blosc2_cparams = std::mem::zeroed();
+        let mut cparams = ffi::blosc2_get_blosc2_cparams_defaults();
         cparams.compcode = ffi::BLOSC_BLOSCLZ as u8;
         cparams.clevel = 5;
         cparams.typesize = 4;
@@ -96,7 +96,7 @@ mod enabled {
         let _b = common::Blosc2::new();
 
         let src_size = data.len() as i32;
-        let mut compressed = vec![0u8; data.len() + 4096];
+        let mut compressed = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD];
         let csize = unsafe {
             let cctx = ffi::blosc2_create_cctx(c_cparams(filter));
             assert!(!cctx.is_null());
@@ -115,7 +115,7 @@ mod enabled {
 
         let mut restored = vec![0u8; data.len()];
         let dsize = unsafe {
-            let mut dparams: ffi::blosc2_dparams = std::mem::zeroed();
+            let mut dparams = ffi::blosc2_get_blosc2_dparams_defaults();
             dparams.nthreads = 1;
             let dctx = ffi::blosc2_create_dctx(dparams);
             assert!(!dctx.is_null());
@@ -134,7 +134,7 @@ mod enabled {
 
         let mut c_times = Vec::with_capacity(iters);
         for _ in 0..iters {
-            let mut out = vec![0u8; data.len() + 4096];
+            let mut out = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD];
             let start = Instant::now();
             let n = unsafe {
                 let cctx = ffi::blosc2_create_cctx(c_cparams(filter));
@@ -159,7 +159,7 @@ mod enabled {
             let mut out = vec![0u8; data.len()];
             let start = Instant::now();
             let n = unsafe {
-                let mut dparams: ffi::blosc2_dparams = std::mem::zeroed();
+                let mut dparams = ffi::blosc2_get_blosc2_dparams_defaults();
                 dparams.nthreads = 1;
                 let dctx = ffi::blosc2_create_dctx(dparams);
                 assert!(!dctx.is_null());
@@ -183,6 +183,59 @@ mod enabled {
             mib_per_s(data.len(), median(c_times)),
             mib_per_s(data.len(), median(d_times)),
         )
+    }
+
+    fn assert_cross_decode_compatibility(data: &[u8], filter: u8) {
+        let rust_chunk = compress::compress(data, &rust_cparams(filter)).unwrap();
+        let rust_decoded = compress::decompress(&rust_chunk).unwrap();
+        assert_eq!(rust_decoded, data);
+
+        let _b = common::Blosc2::new();
+        let src_size = data.len() as i32;
+        let mut c_chunk = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD];
+        let csize = unsafe {
+            let cctx = ffi::blosc2_create_cctx(c_cparams(filter));
+            assert!(!cctx.is_null());
+            let n = ffi::blosc2_compress_ctx(
+                cctx,
+                data.as_ptr() as *const _,
+                src_size,
+                c_chunk.as_mut_ptr() as *mut _,
+                c_chunk.len() as i32,
+            );
+            ffi::blosc2_free_ctx(cctx);
+            n
+        };
+        assert!(csize > 0, "c compression failed: {csize}");
+        c_chunk.truncate(csize as usize);
+
+        let c_decoded_by_rust = compress::decompress(&c_chunk).unwrap();
+        assert_eq!(
+            c_decoded_by_rust, data,
+            "Rust decode of C blosclz chunk failed for filter={filter}"
+        );
+
+        let mut rust_decoded_by_c = vec![0u8; data.len()];
+        let dsize = unsafe {
+            let mut dparams = ffi::blosc2_get_blosc2_dparams_defaults();
+            dparams.nthreads = 1;
+            let dctx = ffi::blosc2_create_dctx(dparams);
+            assert!(!dctx.is_null());
+            let n = ffi::blosc2_decompress_ctx(
+                dctx,
+                rust_chunk.as_ptr() as *const _,
+                rust_chunk.len() as i32,
+                rust_decoded_by_c.as_mut_ptr() as *mut _,
+                rust_decoded_by_c.len() as i32,
+            );
+            ffi::blosc2_free_ctx(dctx);
+            n
+        };
+        assert_eq!(dsize, src_size);
+        assert_eq!(
+            rust_decoded_by_c, data,
+            "C decode of Rust blosclz chunk failed for filter={filter}"
+        );
     }
 
     fn scalar_unshuffle4(src: &[u8], dest: &mut [u8]) {
@@ -232,10 +285,11 @@ mod enabled {
     pub fn main() {
         let data = signal_f32_bytes(DATA_SIZE);
         for (label, filter) in [("nofilter", BLOSC_NOFILTER), ("shuffle", BLOSC_SHUFFLE)] {
+            assert_cross_decode_compatibility(&data, filter);
             let (rust_size, rust_c, rust_d) = bench_rust(&data, filter, 20);
             let (c_size, c_c, c_d) = bench_c(&data, filter, 20);
             println!(
-                "blosclz/{label}: csize rust={rust_size} c={c_size}; compress MB/s rust={rust_c:.1} c={c_c:.1}; decompress MB/s rust={rust_d:.1} c={c_d:.1}"
+                "blosclz/{label}: cross-decode ok; output sizes rust={rust_size} c={c_size}; compress MB/s rust={rust_c:.1} c={c_c:.1}; decompress MB/s rust={rust_d:.1} c={c_d:.1}"
             );
         }
 
