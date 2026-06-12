@@ -10966,6 +10966,27 @@ mod tests {
     }
 
     #[test]
+    fn test_delta_pipeline_preserves_partial_typesize_tail() {
+        let data: Vec<u8> = (0..4097usize)
+            .map(|i| (i.wrapping_mul(31).wrapping_add(17)) as u8)
+            .collect();
+        let cparams = CParams {
+            compcode: BLOSC_BLOSCLZ,
+            clevel: 1,
+            typesize: 4,
+            blocksize: 0,
+            splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
+            filters: [0, 0, 0, BLOSC_NOFILTER, BLOSC_DELTA, BLOSC_SHUFFLE],
+            nthreads: 1,
+            ..Default::default()
+        };
+
+        let compressed = compress(&data, &cparams).unwrap();
+
+        assert_eq!(decompress(&compressed).unwrap(), data);
+    }
+
+    #[test]
     fn test_c_source_write_ordinal_matches_c_buffer_rotation() {
         let mut filters = [BLOSC_NOFILTER; BLOSC2_MAX_FILTERS];
         filters[0] = BLOSC_SHUFFLE;

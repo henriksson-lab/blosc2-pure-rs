@@ -116,6 +116,49 @@ Options:
 
 Chunk-size guidance: keep the default for general file compression unless you have workload-specific measurements showing a better setting.
 
+## Real-data Rust vs C-Blosc2 benchmarks
+
+Use `tools/bench_against_c_blosc2.py` to compare this Rust CLI against original
+C-Blosc2 on real files. The harness measures process wall time and max RSS with
+`/usr/bin/time`, verifies decompressed bytes with SHA-256, and writes
+`results.csv` plus `summary.md`.
+
+```bash
+tools/bench_against_c_blosc2.py \
+  --manifest tools/bench_real_manifest.example.toml \
+  --profile quick
+```
+
+The script builds `target/release/blosc2` with the `cli` feature and builds a
+small C helper from `tools/c_blosc2_file_bench.c`. It uses
+`c-blosc2/build-ref/blosc/libblosc2.a` when present, otherwise it attempts a
+local CMake build of the vendored `c-blosc2/` tree. Pass `--rust-bin` or
+`--c-helper` to benchmark prebuilt binaries.
+
+Profiles:
+- `quick`: small smoke matrix over `blosclz`, `lz4`, `zstd`, shuffle/no-filter, and 1/4 threads.
+- `publish`: broader real-data matrix over all built-in codecs, core filters, levels, split modes, and chunk sizes.
+- `full`: larger matrix intended for overnight/local investigation.
+
+Manifest format:
+
+```toml
+[[dataset]]
+name = "float32_signal"
+path = "fixtures/real/float32_signal.bin"
+typesizes = [4]
+
+[[dataset]]
+name = "fastq"
+path = "fixtures/real/sample.fastq"
+typesizes = [1]
+```
+
+CSV rows include dataset, implementation (`rust` or `c`), mode (`compress` or
+`decompress`), codec, filter, type size, thread count, chunk size, compressed
+size, ratio, wall time, max RSS, throughput, verification status, and process
+status.
+
 ### Decompress
 
 ```bash

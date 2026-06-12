@@ -3452,6 +3452,15 @@ pub fn pipeline_forward_with_context(
                     dref.unwrap_or(src)
                 };
                 delta_encode(actual_dref, block_offset, bsize, typesize, inp, out);
+                let effective_typesize = match typesize {
+                    1 | 2 | 4 | 8 => typesize,
+                    n if n != 0 && n % 8 == 0 => 8,
+                    _ => 1,
+                };
+                if effective_typesize > 1 {
+                    let main_len = bsize - (bsize % effective_typesize);
+                    out[main_len..bsize].copy_from_slice(&inp[main_len..bsize]);
+                }
             }
             BLOSC_TRUNC_PREC => {
                 // C treats filters_meta as int8_t — negative values have Python-style
