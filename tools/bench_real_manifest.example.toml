@@ -1,0 +1,9 @@
+[[dataset]]
+name = "example_text"
+path = "README.md"
+typesizes = [1]
+
+[[dataset]]
+name = "example_rust_source"
+path = "src/compress.rs"
+typesizes = [1, 4]

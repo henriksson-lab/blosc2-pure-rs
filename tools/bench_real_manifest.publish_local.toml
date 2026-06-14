@@ -1,0 +1,14 @@
+[[dataset]]
+name = "rust_source"
+path = "src/compress.rs"
+typesizes = [1, 4]
+
+[[dataset]]
+name = "zlib_lcet10_text"
+path = "c-blosc2/internal-complibs/zlib-ng-2.0.7/test/data/lcet10.txt"
+typesizes = [1]
+
+[[dataset]]
+name = "elf_bench_compress"
+path = "bench_compress"
+typesizes = [1]

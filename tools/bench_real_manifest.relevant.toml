@@ -1,0 +1,44 @@
+[[dataset]]
+name = "readme_text"
+path = "README.md"
+typesizes = [1]
+
+[[dataset]]
+name = "rust_source"
+path = "src/compress.rs"
+typesizes = [1, 4]
+
+[[dataset]]
+name = "rainfall_grid"
+path = "c-blosc2/bench/rainfall-grid-150x150.bin"
+typesizes = [4, 8]
+
+[[dataset]]
+name = "b2nd_day_month_temp"
+path = "c-blosc2/plugins/test_data/example_day_month_temp.b2nd"
+typesizes = [1, 4]
+
+[[dataset]]
+name = "b2nd_item_prices"
+path = "c-blosc2/plugins/test_data/example_item_prices.b2nd"
+typesizes = [1, 4]
+
+[[dataset]]
+name = "zlib_lcet10_text"
+path = "c-blosc2/internal-complibs/zlib-ng-2.0.7/test/data/lcet10.txt"
+typesizes = [1]
+
+[[dataset]]
+name = "zlib_paper_pdf"
+path = "c-blosc2/internal-complibs/zlib-ng-2.0.7/test/data/paper-100k.pdf"
+typesizes = [1]
+
+[[dataset]]
+name = "jpeg_fireworks"
+path = "c-blosc2/internal-complibs/zlib-ng-2.0.7/test/data/fireworks.jpg"
+typesizes = [1]
+
+[[dataset]]
+name = "elf_bench_compress"
+path = "bench_compress"
+typesizes = [1]

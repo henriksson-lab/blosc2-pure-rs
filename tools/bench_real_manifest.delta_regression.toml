@@ -1,0 +1,4 @@
+[[dataset]]
+name = "rust_source"
+path = "src/compress.rs"
+typesizes = [4]
