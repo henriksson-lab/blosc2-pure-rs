@@ -4,9 +4,9 @@ A pure Rust implementation of the [Blosc2](https://www.blosc.org/) high-performa
 
 Blosc2 is a block-oriented compressor optimized for binary data such as numerical arrays, tensors, and structured formats. It applies a filter pipeline (shuffle, bitshuffle, delta) before compression to exploit data patterns, then compresses with one of several codecs.
 
+**Beware that translation is immature technology. Check that this crate works on your data to avoid data loss**
 
-**Full feature coverage is being added. Unstable state**
-
+* 2026-06-14: More audit. Possibly converged. Some differences in speed stem from dependencies that need to be fixed
 * 2026-06-02: Further audit
 * 2026-05-20: New audit approach - many smaller(?) issues fixed, but further auditing needed 
 * 2026-05-19: Another audit pass with fixes

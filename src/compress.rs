@@ -3080,7 +3080,7 @@ fn compress_block_with_scratch(
     prefilter_buf: &mut Vec<u8>,
     tid: i32,
     block_output_limit: Option<usize>,
-) -> Result<(Vec<u8>, bool, bool), &'static str> {
+) -> Result<(usize, bool, bool), &'static str> {
     let mut skip_filters = false;
     let mut force_zero_run = false;
     let block_data = if let Some(filtered) = apply_prefilter(
@@ -3448,9 +3448,9 @@ fn compress_pre_filtered_block_with_scratch(
     block_start: usize,
     blocksize: usize,
     nblock: i32,
-    _compressed: &mut Vec<u8>,
+    compressed: &mut Vec<u8>,
     output_limit: Option<usize>,
-) -> Result<(Vec<u8>, bool, bool), &'static str> {
+) -> Result<(usize, bool, bool), &'static str> {
     #[inline(always)]
     unsafe fn push_bytes(dst: &mut Vec<u8>, pos: &mut usize, src: &[u8]) {
         std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().add(*pos), src.len());
@@ -3466,7 +3466,14 @@ fn compress_pre_filtered_block_with_scratch(
     let nstreams = stream_count(dont_split, is_leftover, typesize, bsize);
     let neblock = bsize / nstreams;
 
-    let mut result = Vec::with_capacity(stored_block_len(dont_split, is_leftover, typesize, bsize));
+    // Reuse the caller-provided scratch buffer instead of allocating a fresh Vec
+    // per block. Mirrors C-Blosc2's per-thread `tmp2` staging buffer.
+    let result = compressed;
+    result.clear();
+    ensure_scratch_len_uninit(
+        result,
+        stored_block_len(dont_split, is_leftover, typesize, bsize),
+    );
     let mut result_len = 0usize;
     let mut all_zero_runs = true;
     let mut any_literal_stream = false;
@@ -3479,12 +3486,12 @@ fn compress_pre_filtered_block_with_scratch(
         if let Some(val) = get_run(stream_data) {
             if val == 0 {
                 check_output_budget(result_len + 4, output_limit)?;
-                unsafe { push_i32(&mut result, &mut result_len, 0) };
+                unsafe { push_i32(result, &mut result_len, 0) };
             } else {
                 all_zero_runs = false;
                 check_output_budget(result_len + 5, output_limit)?;
                 unsafe {
-                    push_i32(&mut result, &mut result_len, -(val as i32));
+                    push_i32(result, &mut result_len, -(val as i32));
                     *result.as_mut_ptr().add(result_len) = 0x01;
                 }
                 result_len += 1;
@@ -3496,7 +3503,7 @@ fn compress_pre_filtered_block_with_scratch(
 
         let header_pos = result_len;
         let payload_pos = header_pos + 4;
-        ensure_scratch_len_uninit(&mut result, payload_pos + max_out);
+        ensure_scratch_len_uninit(result, payload_pos + max_out);
 
         let cparams_context = codec_cparams_context(cparams, blocksize as i32);
         let codec_context = codecs::CodecCallbackContext {
@@ -3573,7 +3580,7 @@ fn compress_pre_filtered_block_with_scratch(
     unsafe {
         result.set_len(result_len);
     }
-    Ok((result, all_zero_runs, any_literal_stream))
+    Ok((result_len, all_zero_runs, any_literal_stream))
 }
 
 /// Run the forward filter pipeline over every block of `src`, returning the filtered
@@ -4398,6 +4405,7 @@ fn build_lz4_dictionary(
     samples_buffer: &[u8],
     nbytes: usize,
     dict_target: usize,
+    block_table_len: usize,
 ) -> Option<Vec<u8>> {
     let dict_maxsize = BLOSC2_MAXDICTSIZE.min(nbytes / 20);
     let dict_target = dict_target.min(dict_maxsize);
@@ -4405,7 +4413,18 @@ fn build_lz4_dictionary(
         return None;
     }
 
-    Some(samples_buffer[..dict_target].to_vec())
+    let mut dict = samples_buffer[..dict_target].to_vec();
+    // C-Blosc2 copies LZ4 samples from the training-pass output buffer into the
+    // final dictionary slot after writing the 4-byte dict-size field at
+    // dest + header + nblocks * sizeof(int32_t).  That field aliases the sample
+    // source, so the embedded LZ4 dictionary contains these bytes too.
+    let size_bytes = (dict.len() as i32).to_le_bytes();
+    for (idx, byte) in size_bytes.iter().enumerate() {
+        if let Some(slot) = dict.get_mut(block_table_len + idx) {
+            *slot = *byte;
+        }
+    }
+    Some(dict)
 }
 
 /// Dispatch to the dictionary builder appropriate for `compcode`. Returns `None` for codecs without dictionary support.
@@ -4414,10 +4433,13 @@ fn build_codec_dictionary(
     nbytes: usize,
     compcode: u8,
     lz4_dict_target: usize,
+    block_table_len: usize,
     zstd_sample_sizes: &[usize],
 ) -> Option<Vec<u8>> {
     match compcode {
-        BLOSC_LZ4 | BLOSC_LZ4HC => build_lz4_dictionary(samples_buffer, nbytes, lz4_dict_target),
+        BLOSC_LZ4 | BLOSC_LZ4HC => {
+            build_lz4_dictionary(samples_buffer, nbytes, lz4_dict_target, block_table_len)
+        }
         BLOSC_ZSTD => train_zstd_dictionary(samples_buffer, nbytes, zstd_sample_sizes),
         _ => None,
     }
@@ -4574,6 +4596,7 @@ fn compress_chunk_with_output_limit(
             nbytes as usize,
             cparams.compcode,
             training_buffer_len,
+            bstarts_len,
             &zstd_sample_sizes,
         ) {
             let filtered_blocks = filtered_blocks_for_dict(
@@ -4610,7 +4633,7 @@ fn compress_chunk_with_output_limit(
                 output[bstart_offset..bstart_offset + 4]
                     .copy_from_slice(&(output_pos as i32).to_le_bytes());
 
-                let (block_data, _block_all_zero, _any_literal_stream) =
+                let (block_len, _block_all_zero, _any_literal_stream) =
                     compress_pre_filtered_block_with_scratch(
                         filtered,
                         src.as_ptr(),
@@ -4625,9 +4648,10 @@ fn compress_chunk_with_output_limit(
                         &mut compress_scratch,
                         output_limit.map(|limit| limit.saturating_sub(output_pos)),
                     )?;
-                ensure_len_with_budget(&mut output, output_pos + block_data.len(), output_limit)?;
-                output[output_pos..output_pos + block_data.len()].copy_from_slice(&block_data);
-                output_pos += block_data.len();
+                ensure_len_with_budget(&mut output, output_pos + block_len, output_limit)?;
+                output[output_pos..output_pos + block_len]
+                    .copy_from_slice(&compress_scratch[..block_len]);
+                output_pos += block_len;
             }
 
             let blosc2_flags = BLOSC2_USEDICT;
@@ -4665,7 +4689,7 @@ fn compress_chunk_with_output_limit(
             rayon::join(
                 || {
                     with_compress_scratch(blocksize, |buf1, buf2, compress_buf, prefilter_buf| {
-                        compress_block_with_scratch(
+                        let (len, z, l) = compress_block_with_scratch(
                             src,
                             &src[..blocksize.min(nbytes as usize)],
                             0,
@@ -4680,14 +4704,15 @@ fn compress_chunk_with_output_limit(
                             prefilter_buf,
                             rayon::current_thread_index().unwrap_or(0) as i32,
                             None,
-                        )
+                        )?;
+                        Ok((compress_buf[..len].to_vec(), z, l))
                     })
                 },
                 || {
                     with_compress_scratch(blocksize, |buf1, buf2, compress_buf, prefilter_buf| {
                         let start = blocksize;
                         let end = (start + blocksize).min(nbytes as usize);
-                        compress_block_with_scratch(
+                        let (len, z, l) = compress_block_with_scratch(
                             src,
                             &src[start..end],
                             start,
@@ -4702,7 +4727,8 @@ fn compress_chunk_with_output_limit(
                             prefilter_buf,
                             rayon::current_thread_index().unwrap_or(1) as i32,
                             None,
-                        )
+                        )?;
+                        Ok((compress_buf[..len].to_vec(), z, l))
                     })
                 },
             )
@@ -4767,7 +4793,8 @@ fn compress_chunk_with_output_limit(
                                     prefilter_buf,
                                     rayon::current_thread_index().unwrap_or(0) as i32,
                                     None,
-                                );
+                                )
+                                .map(|(len, z, l)| (compress_buf[..len].to_vec(), z, l));
                                 compressed_blocks[block_idx]
                                     .set(compressed)
                                     .expect("parallel block slot written more than once");
@@ -4851,7 +4878,7 @@ fn compress_chunk_with_output_limit(
                 output[bstart_offset..bstart_offset + 4]
                     .copy_from_slice(&(output_pos as i32).to_le_bytes());
 
-                let (block_data, block_all_zero, block_has_literal) =
+                let (block_len, block_all_zero, block_has_literal) =
                     match compress_block_with_scratch(
                         src,
                         &src[block_start..block_end],
@@ -4884,7 +4911,7 @@ fn compress_chunk_with_output_limit(
                         Err(err) => return Err(err),
                     };
                 if let Err(err) =
-                    ensure_len_with_budget(&mut output, output_pos + block_data.len(), output_limit)
+                    ensure_len_with_budget(&mut output, output_pos + block_len, output_limit)
                 {
                     if let Some(memcpyed) = maybe_memcpy_fallback_for_budget(
                         src,
@@ -4897,8 +4924,9 @@ fn compress_chunk_with_output_limit(
                     }
                     return Err(err);
                 }
-                output[output_pos..output_pos + block_data.len()].copy_from_slice(&block_data);
-                output_pos += block_data.len();
+                output[output_pos..output_pos + block_len]
+                    .copy_from_slice(&compress_buf[..block_len]);
+                output_pos += block_len;
                 if !block_all_zero {
                     all_zero_runs = false;
                 }
@@ -5021,7 +5049,7 @@ fn compress_chunk_with_output_limit(
                 filtered
             };
 
-            let (block_data, block_all_zero_runs, block_has_literal) =
+            let (block_len, block_all_zero_runs, block_has_literal) =
                 match compress_pre_filtered_block_with_scratch(
                     filtered,
                     src.as_ptr(),
@@ -5052,7 +5080,7 @@ fn compress_chunk_with_output_limit(
                     Err(err) => return Err(err),
                 };
             if let Err(err) =
-                ensure_len_with_budget(&mut output, output_pos + block_data.len(), output_limit)
+                ensure_len_with_budget(&mut output, output_pos + block_len, output_limit)
             {
                 if let Some(memcpyed) =
                     maybe_memcpy_fallback_for_budget(src, cparams, flags, blocksize, output_limit)
@@ -5061,8 +5089,8 @@ fn compress_chunk_with_output_limit(
                 }
                 return Err(err);
             }
-            output[output_pos..output_pos + block_data.len()].copy_from_slice(&block_data);
-            output_pos += block_data.len();
+            output[output_pos..output_pos + block_len].copy_from_slice(&compress_buf[..block_len]);
+            output_pos += block_len;
             if !block_all_zero_runs {
                 all_zero_runs = false;
             }
@@ -5400,6 +5428,7 @@ fn compress_vl_blocks_with_output_limit(
             total_nbytes,
             cparams.compcode,
             total_nbytes,
+            bstarts_len,
             &zstd_sample_sizes,
         )
     });
@@ -7228,7 +7257,7 @@ pub fn replace_aligned_blocks(
                 _ => return Err("Filter pipeline failed"),
             }
         };
-        let (block_payload, _, _) = compress_pre_filtered_block_with_scratch(
+        let (block_len, _, _) = compress_pre_filtered_block_with_scratch(
             filtered,
             block_data.as_ptr(),
             cparams,
@@ -7242,7 +7271,7 @@ pub fn replace_aligned_blocks(
             &mut compress_scratch,
             None,
         )?;
-        block_payloads.push(block_payload);
+        block_payloads.push(compress_scratch[..block_len].to_vec());
     }
 
     let total_len = block_payloads
