@@ -387,6 +387,28 @@ fn default_compress_parameters_match_c_example_frame() {
         BLOSC_SHUFFLE
     );
     assert_eq!(schunk.cparams.filters_meta, [0; BLOSC2_MAX_FILTERS]);
+    assert!(!schunk.cparams.use_dict);
+}
+
+#[test]
+fn compress_use_dict_flag_is_stored_in_frame_params() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("input.bin");
+    let compressed = dir.path().join("output.b2frame");
+    fs::write(&input, compressible_data(2_000_000)).unwrap();
+
+    assert_success(run([
+        OsStr::new("compress"),
+        input.as_os_str(),
+        compressed.as_os_str(),
+        OsStr::new("--codec"),
+        OsStr::new("zstd"),
+        OsStr::new("--use-dict"),
+    ]));
+
+    let schunk = Schunk::open_offset(&compressed, 0).unwrap();
+    assert_eq!(schunk.cparams.compcode, BLOSC_ZSTD);
+    assert!(schunk.cparams.use_dict);
 }
 
 #[test]

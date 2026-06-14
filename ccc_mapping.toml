@@ -1,3 +1,109 @@
+## Core one-shot/context API.  Public C wrappers map to the Rust API entry
+## point when that is the auditable surface; C internal engines map to the
+## idiomatic Rust worker that carries the implementation.
+
+[[entries]]
+rust = "blosc2_compress"
+rust_path = "src/compress.rs"
+other = "blosc2_compress"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc1_compress"
+rust_path = "src/compress.rs"
+other = "blosc1_compress"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_decompress"
+rust_path = "src/compress.rs"
+other = "blosc2_decompress"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc1_decompress"
+rust_path = "src/compress.rs"
+other = "blosc1_decompress"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_decompress_ctx"
+rust_path = "src/compress.rs"
+other = "blosc2_decompress_ctx"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_vldecompress_ctx"
+rust_path = "src/compress.rs"
+other = "blosc2_vldecompress_ctx"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_vldecompress_block_ctx"
+rust_path = "src/compress.rs"
+other = "blosc2_vldecompress_block_ctx"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "vlchunk_get_nblocks"
+rust_path = "src/compress.rs"
+other = "blosc2_vlchunk_get_nblocks"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "getitem"
+rust_path = "src/compress.rs"
+other = "blosc2_getitem"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "getitem_with_dparams"
+rust_path = "src/compress.rs"
+other = "_blosc_getitem"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc1_getitem"
+rust_path = "src/compress.rs"
+other = "blosc1_getitem"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_create_cctx"
+rust_path = "src/compress.rs"
+other = "blosc2_create_cctx"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_create_dctx"
+rust_path = "src/compress.rs"
+other = "blosc2_create_dctx"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_free_ctx"
+rust_path = "src/compress.rs"
+other = "blosc2_free_ctx"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_ctx_get_cparams"
+rust_path = "src/compress.rs"
+other = "blosc2_ctx_get_cparams"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_ctx_get_dparams"
+rust_path = "src/compress.rs"
+other = "blosc2_ctx_get_dparams"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_set_maskout"
+rust_path = "src/compress.rs"
+other = "blosc2_set_maskout"
+other_path = "c-blosc2/blosc/blosc2.c"
+
 [[entries]]
 rust = "append_buffer"
 rust_path = "src/schunk.rs"
@@ -6,7 +112,7 @@ other = "blosc2_schunk_append_buffer"
 other_path = "c-blosc2/blosc/schunk.c"
 
 [[entries]]
-rust = "copy_schunk"
+rust = "copy_schunk_with_params"
 rust_path = "src/schunk.rs"
 rust_class = "Schunk"
 other = "blosc2_schunk_copy"
@@ -17,4 +123,571 @@ rust = "save"
 rust_path = "src/b2nd.rs"
 rust_class = "B2ndArray"
 other = "b2nd_save"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "compress_with_output_limit"
+rust_path = "src/compress.rs"
+other = "blosc2_compress_ctx"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "vlcompress_with_output_limit"
+rust_path = "src/compress.rs"
+other = "blosc2_vlcompress_ctx"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "decompress_into_with_header"
+rust_path = "src/compress.rs"
+other = "blosc_run_decompression_with_context"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "compress_block_with_scratch"
+rust_path = "src/compress.rs"
+other = "blosc_c"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "decompress_block_into"
+rust_path = "src/compress.rs"
+other = "blosc_d"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "pipeline_forward_with_context"
+rust_path = "src/filters.rs"
+other = "pipeline_forward"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "pipeline_backward_with_context"
+rust_path = "src/filters.rs"
+other = "pipeline_backward"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "update_compressed_chunk"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_update_chunk"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "insert_chunk"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_insert_chunk"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "append_chunk"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_append_chunk"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "delete_chunk"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_delete_chunk"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "fill_special"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_fill_special"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "concatenate_with_meta"
+rust_path = "src/b2nd.rs"
+rust_class = "B2ndArray"
+other = "b2nd_concatenate"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "get_slice_nchunks"
+rust_path = "src/b2nd.rs"
+rust_class = "B2ndArray"
+other = "b2nd_get_slice_nchunks"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "to_frame"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "frame_from_schunk"
+other_path = "c-blosc2/blosc/frame.c"
+
+[[entries]]
+rust = "copy_array_with_meta"
+rust_path = "src/b2nd.rs"
+rust_class = "B2ndArray"
+other = "b2nd_copy"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "resize_at"
+rust_path = "src/b2nd.rs"
+rust_class = "B2ndArray"
+other = "b2nd_resize"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+## Metadata/query/registry API.
+
+[[entries]]
+rust = "blosc2_compcode_to_compname"
+rust_path = "src/compress.rs"
+other = "blosc2_compcode_to_compname"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_compname_to_compcode"
+rust_path = "src/compress.rs"
+other = "blosc2_compname_to_compcode"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_get_complib_info"
+rust_path = "src/compress.rs"
+other = "blosc2_get_complib_info"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_cbuffer_sizes"
+rust_path = "src/compress.rs"
+other = "blosc2_cbuffer_sizes"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc1_cbuffer_validate"
+rust_path = "src/compress.rs"
+other = "blosc1_cbuffer_validate"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_cbuffer_versions"
+rust_path = "src/compress.rs"
+other = "blosc2_cbuffer_versions"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_cbuffer_complib"
+rust_path = "src/compress.rs"
+other = "blosc2_cbuffer_complib"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_register_filter"
+rust_path = "src/filters.rs"
+other = "blosc2_register_filter"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_register_codec"
+rust_path = "src/codecs.rs"
+other = "blosc2_register_codec"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+## Special chunk helpers.
+
+[[entries]]
+rust = "blosc2_chunk_zeros"
+rust_path = "src/compress.rs"
+other = "blosc2_chunk_zeros"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_chunk_uninit"
+rust_path = "src/compress.rs"
+other = "blosc2_chunk_uninit"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_chunk_nans"
+rust_path = "src/compress.rs"
+other = "blosc2_chunk_nans"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+[[entries]]
+rust = "blosc2_chunk_repeatval"
+rust_path = "src/compress.rs"
+other = "blosc2_chunk_repeatval"
+other_path = "c-blosc2/blosc/blosc2.c"
+
+## Schunk public API and frame internals.  The C frame conversion helper maps
+## to Schunk::from_frame; the public C buffer wrapper maps to the Rust public
+## wrapper of the same name.
+
+[[entries]]
+rust = "new"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_new"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "blosc2_schunk_free_c"
+rust_path = "src/schunk.rs"
+other = "blosc2_schunk_free"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "open"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_open"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "open_offset"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_open_offset"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "to_frame"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_to_buffer"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "to_file_len"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_to_file"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "append_file"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_append_file"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "blosc2_schunk_from_buffer"
+rust_path = "src/schunk.rs"
+other = "blosc2_schunk_from_buffer"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "from_frame"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "frame_to_schunk"
+other_path = "c-blosc2/blosc/frame.c"
+
+[[entries]]
+rust = "compressed_chunk"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_get_chunk"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "lazy_chunk"
+rust_path = "src/schunk.rs"
+rust_class = "LazySchunk"
+other = "blosc2_schunk_get_lazychunk"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "decompress_vlblock"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_get_vlblock"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "decompress_chunk_into"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_decompress_chunk"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "get_slice_nchunks"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "schunk_get_slice_nchunks"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "get_cparams"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_get_cparams"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "get_dparams"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_get_dparams"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "get_slice_items"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_get_slice_buffer"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "set_slice_items"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_set_slice_buffer"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "reorder_offsets_c"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_reorder_offsets"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "frame_len"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_schunk_frame_len"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "frame_get_offsets"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_frame_get_offsets"
+other_path = "c-blosc2/blosc/frame.c"
+
+[[entries]]
+rust = "add_metalayer"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_meta_add"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "update_metalayer"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_meta_update"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "metalayer"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_meta_get"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "try_remove_metalayer"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_meta_delete"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "metalayer_exists"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_meta_exists"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "metalayer_names"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_meta_get_names"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "add_vlmetalayer_with_cparams"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_vlmeta_add"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "update_vlmetalayer_with_cparams"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_vlmeta_update"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "vlmetalayer"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_vlmeta_get"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "try_remove_vlmetalayer"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_vlmeta_delete"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "vlmetalayer_exists"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_vlmeta_exists"
+other_path = "c-blosc2/blosc/schunk.c"
+
+[[entries]]
+rust = "vlmetalayer_names"
+rust_path = "src/schunk.rs"
+rust_class = "Schunk"
+other = "blosc2_vlmeta_get_names"
+other_path = "c-blosc2/blosc/schunk.c"
+
+## B2ND public API.
+
+[[entries]]
+rust = "b2nd_serialize_meta"
+rust_path = "src/b2nd.rs"
+other = "b2nd_serialize_meta"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_deserialize_meta"
+rust_path = "src/b2nd.rs"
+other = "b2nd_deserialize_meta"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_create_ctx"
+rust_path = "src/b2nd.rs"
+other = "b2nd_create_ctx"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_uninit"
+rust_path = "src/b2nd.rs"
+other = "b2nd_uninit"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_empty"
+rust_path = "src/b2nd.rs"
+other = "b2nd_empty"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_zeros"
+rust_path = "src/b2nd.rs"
+other = "b2nd_zeros"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_nans"
+rust_path = "src/b2nd.rs"
+other = "b2nd_nans"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_full"
+rust_path = "src/b2nd.rs"
+other = "b2nd_full"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_from_schunk"
+rust_path = "src/b2nd.rs"
+other = "b2nd_from_schunk"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_to_cframe"
+rust_path = "src/b2nd.rs"
+other = "b2nd_to_cframe"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_from_cframe"
+rust_path = "src/b2nd.rs"
+other = "b2nd_from_cframe"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_from_cbuffer"
+rust_path = "src/b2nd.rs"
+other = "b2nd_from_cbuffer"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_to_cbuffer"
+rust_path = "src/b2nd.rs"
+other = "b2nd_to_cbuffer"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_get_slice_cbuffer"
+rust_path = "src/b2nd.rs"
+other = "b2nd_get_slice_cbuffer"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_set_slice_cbuffer"
+rust_path = "src/b2nd.rs"
+other = "b2nd_set_slice_cbuffer"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_expand_dims"
+rust_path = "src/b2nd.rs"
+other = "b2nd_expand_dims"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_squeeze"
+rust_path = "src/b2nd.rs"
+other = "b2nd_squeeze"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_squeeze_index"
+rust_path = "src/b2nd.rs"
+other = "b2nd_squeeze_index"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_insert"
+rust_path = "src/b2nd.rs"
+other = "b2nd_insert"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_append"
+rust_path = "src/b2nd.rs"
+other = "b2nd_append"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_delete"
+rust_path = "src/b2nd.rs"
+other = "b2nd_delete"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_get_orthogonal_selection"
+rust_path = "src/b2nd.rs"
+other = "b2nd_get_orthogonal_selection"
+other_path = "c-blosc2/blosc/b2nd.c"
+
+[[entries]]
+rust = "b2nd_set_orthogonal_selection"
+rust_path = "src/b2nd.rs"
+other = "b2nd_set_orthogonal_selection"
 other_path = "c-blosc2/blosc/b2nd.c"

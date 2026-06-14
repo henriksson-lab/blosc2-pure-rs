@@ -11,8 +11,8 @@ use blosc2_pure_rs::compress::{
     blosc2_vldecompress_block_ctx as rust_vldecompress_block_ctx,
     blosc2_vldecompress_block_ctx_c as rust_vldecompress_block_ctx_c,
     blosc2_vldecompress_ctx_c as rust_vldecompress_ctx_c, cbuffer_metainfo, cbuffer_sizes,
-    cbuffer_validate, compress, decompress, vlchunk_get_nblocks, vlcompress, vldecompress,
-    vldecompress_block, CParams, DParams,
+    cbuffer_validate, compress, decompress, decompress_into_with_dparams, vlchunk_get_nblocks,
+    vlcompress, vldecompress, vldecompress_block, CParams, DParams, PostfilterParams,
 };
 use blosc2_pure_rs::constants::*;
 use blosc2_pure_rs::header::ChunkHeader;
@@ -23,6 +23,9 @@ use std::ffi::CString;
 use std::fs;
 use std::os::raw::c_void;
 use std::path::PathBuf;
+use zstd_pure_rs::decompress::zstd_ddict::{ZSTD_DDict_dictContent, ZSTD_createDDict};
+
+const ZSTD_DICT_MAGIC_LE: [u8; 4] = 0xEC30_A437u32.to_le_bytes();
 
 unsafe extern "C" {
     fn free(ptr: *mut c_void);
@@ -414,6 +417,49 @@ fn c_decompress_chunk(chunk: &[u8], nbytes: usize) -> (i32, Vec<u8>) {
         )
     };
     (rc, dest)
+}
+
+unsafe fn c_compress_with_params(data: &[u8], cparams: ffi::blosc2_cparams) -> Vec<u8> {
+    let mut compressed = vec![0u8; data.len() + BLOSC2_MAX_OVERHEAD + BLOSC2_MAXDICTSIZE];
+    let cctx = ffi::blosc2_create_cctx(cparams);
+    assert!(!cctx.is_null());
+    let csize = ffi::blosc2_compress_ctx(
+        cctx,
+        data.as_ptr() as *const c_void,
+        data.len() as i32,
+        compressed.as_mut_ptr() as *mut c_void,
+        compressed.len() as i32,
+    );
+    ffi::blosc2_free_ctx(cctx);
+    assert!(csize > 0, "C compression failed: {csize}");
+    compressed.truncate(csize as usize);
+    compressed
+}
+
+fn regular_embedded_dict_len(chunk: &[u8]) -> Option<usize> {
+    let header = ChunkHeader::read(chunk).unwrap();
+    if !header.use_dict() {
+        return None;
+    }
+    let dict_size_pos = header.header_len() + header.nblocks() * 4;
+    Some(i32::from_le_bytes(chunk[dict_size_pos..dict_size_pos + 4].try_into().unwrap()) as usize)
+}
+
+fn regular_embedded_dict(chunk: &[u8]) -> Option<&[u8]> {
+    let header = ChunkHeader::read(chunk).unwrap();
+    if !header.use_dict() {
+        return None;
+    }
+    let dict_size_pos = header.header_len() + header.nblocks() * 4;
+    let dict_start = dict_size_pos + 4;
+    let dict_len =
+        i32::from_le_bytes(chunk[dict_size_pos..dict_start].try_into().unwrap()) as usize;
+    Some(&chunk[dict_start..dict_start + dict_len])
+}
+
+fn zstd_dict_content(dict: &[u8]) -> Vec<u8> {
+    let ddict = ZSTD_createDDict(dict).unwrap();
+    ZSTD_DDict_dictContent(&ddict).to_vec()
 }
 
 #[test]
@@ -1141,6 +1187,50 @@ fn test_cross_compat_filters() {
 }
 
 #[test]
+fn test_zstd_fastcover_dictionary_uses_contiguous_c_training_budget() {
+    let _b = init_blosc2();
+
+    let data: Vec<u8> = (0..240_000u32)
+        .flat_map(|i| i.wrapping_mul(37).rotate_left(11).to_le_bytes())
+        .collect();
+
+    let rust_chunk = compress(
+        &data,
+        &CParams {
+            compcode: BLOSC_ZSTD,
+            clevel: 5,
+            typesize: 1,
+            blocksize: 8192,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0; BLOSC2_MAX_FILTERS],
+            use_dict: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let rust_header = ChunkHeader::read(&rust_chunk).unwrap();
+    assert!(rust_header.use_dict());
+    let rust_dict = regular_embedded_dict(&rust_chunk).unwrap();
+    assert_eq!(&rust_dict[..4], &ZSTD_DICT_MAGIC_LE);
+    let sample_nblocks = rust_header.nblocks().max(8);
+    let sample_size = data.len() / sample_nblocks / 16;
+    let expected_len = BLOSC2_MAXDICTSIZE
+        .min(data.len() / 20)
+        .min(sample_nblocks * sample_size);
+    let content = zstd_dict_content(rust_dict);
+    assert!(content.len() <= expected_len);
+    assert_ne!(
+        content,
+        &data[..content.len()],
+        "high-diversity fixture should exercise fastCover content selection, not prefix-only content"
+    );
+
+    let (c_dsize, c_decompressed) = c_decompress_chunk(&rust_chunk, data.len());
+    assert_eq!(c_dsize, data.len() as i32);
+    assert_eq!(c_decompressed, data);
+}
+
+#[test]
 fn test_zstd_dictionary_cross_compat() {
     let _b = init_blosc2();
 
@@ -1159,6 +1249,10 @@ fn test_zstd_dictionary_cross_compat() {
         ..Default::default()
     };
     let rust_chunk = compress(&data, &rust_params).unwrap();
+    let rust_header = ChunkHeader::read(&rust_chunk).unwrap();
+    assert!(rust_header.use_dict());
+    assert!((BLOSC2_MINUSEFULDICT..=BLOSC2_MAXDICTSIZE)
+        .contains(&regular_embedded_dict_len(&rust_chunk).unwrap()));
     let mut c_decompressed = vec![0u8; data.len()];
     let c_dsize = unsafe {
         ffi::blosc2_decompress(
@@ -1195,9 +1289,245 @@ fn test_zstd_dictionary_cross_compat() {
         result
     };
     assert!(c_csize > 0);
+    c_chunk.truncate(c_csize as usize);
+    let c_header = ChunkHeader::read(&c_chunk).unwrap();
+    assert!(c_header.use_dict());
+    assert!((BLOSC2_MINUSEFULDICT..=BLOSC2_MAXDICTSIZE)
+        .contains(&regular_embedded_dict_len(&c_chunk).unwrap()));
 
-    let rust_decompressed = decompress(&c_chunk[..c_csize as usize]).unwrap();
+    let rust_decompressed = decompress(&c_chunk).unwrap();
     assert_eq!(rust_decompressed, data);
+}
+
+fn c_trained_zstd_dict_regression_data() -> Vec<u8> {
+    include_bytes!("../src/compress.rs").to_vec()
+}
+
+#[test]
+fn test_c_trained_zstd_dictionary_chunk_decodes_in_pure_rust() {
+    let _b = init_blosc2();
+
+    let data = c_trained_zstd_dict_regression_data();
+    let mut cparams: ffi::blosc2_cparams = unsafe { std::mem::zeroed() };
+    cparams.compcode = BLOSC_ZSTD;
+    cparams.clevel = 5;
+    cparams.typesize = 1;
+    cparams.nthreads = 1;
+    cparams.blocksize = 0;
+    cparams.splitmode = BLOSC_FORWARD_COMPAT_SPLIT;
+    cparams.use_dict = 1;
+    cparams.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_SHUFFLE;
+
+    let c_chunk = unsafe { c_compress_with_params(&data, cparams) };
+    let c_header = ChunkHeader::read(&c_chunk).unwrap();
+    assert!(
+        c_header.use_dict(),
+        "C fixture must exercise dictionary path"
+    );
+
+    let (c_dsize, c_decompressed) = c_decompress_chunk(&c_chunk, data.len());
+    assert_eq!(c_dsize, data.len() as i32, "C fixture must self-decode");
+    assert_eq!(c_decompressed, data);
+
+    let rust_decompressed = decompress(&c_chunk).unwrap();
+    assert_eq!(rust_decompressed, data);
+}
+
+#[test]
+fn test_c_trained_zstd_dictionary_lazy_frame_chunk_decodes_in_pure_rust() {
+    let _b = init_blosc2();
+
+    let data = c_trained_zstd_dict_regression_data();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c-zstd-dict.b2frame");
+    let c_path = CString::new(path.to_str().unwrap()).unwrap();
+
+    unsafe {
+        let mut cparams: ffi::blosc2_cparams = std::mem::zeroed();
+        cparams.compcode = BLOSC_ZSTD;
+        cparams.clevel = 5;
+        cparams.typesize = 1;
+        cparams.nthreads = 1;
+        cparams.blocksize = 0;
+        cparams.splitmode = BLOSC_FORWARD_COMPAT_SPLIT;
+        cparams.use_dict = 1;
+        cparams.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_SHUFFLE;
+
+        let mut dparams: ffi::blosc2_dparams = std::mem::zeroed();
+        dparams.nthreads = 1;
+        dparams.typesize = 1;
+
+        let mut storage: ffi::blosc2_storage = std::mem::zeroed();
+        storage.contiguous = true;
+        storage.urlpath = c_path.as_ptr() as *mut _;
+        storage.cparams = &mut cparams;
+        storage.dparams = &mut dparams;
+
+        let c_schunk = ffi::blosc2_schunk_new(&mut storage);
+        assert!(!c_schunk.is_null(), "C failed to create dictionary frame");
+        let rc =
+            ffi::blosc2_schunk_append_buffer(c_schunk, data.as_ptr().cast(), data.len() as i32);
+        assert_eq!(rc, 1, "C failed to append dictionary frame chunk: {rc}");
+        assert_eq!(ffi::blosc2_schunk_free(c_schunk), 0);
+    }
+
+    let lazy = Schunk::open_lazy(&path).unwrap();
+    assert_eq!(lazy.nchunks(), 1);
+    let chunk = lazy.compressed_chunk(0).unwrap();
+    let header = ChunkHeader::read(&chunk).unwrap();
+    assert!(
+        header.use_dict(),
+        "C frame fixture must exercise dictionary path"
+    );
+    let nblocks = header.nblocks();
+    let dict_size_pos = header.header_len() + nblocks * 4;
+    let dict_size =
+        i32::from_le_bytes(chunk[dict_size_pos..dict_size_pos + 4].try_into().unwrap()) as usize;
+
+    let lazy_chunk = lazy.lazy_chunk(0).unwrap();
+    let lazy_header = ChunkHeader::read(&lazy_chunk).unwrap();
+    assert!(lazy_header.use_dict());
+    let lazy_dict_size_pos = lazy_header.header_len() + nblocks * 4;
+    assert_eq!(
+        i32::from_le_bytes(
+            lazy_chunk[lazy_dict_size_pos..lazy_dict_size_pos + 4]
+                .try_into()
+                .unwrap()
+        ) as usize,
+        dict_size
+    );
+    assert_eq!(
+        &lazy_chunk[lazy_dict_size_pos + 4..lazy_dict_size_pos + 4 + dict_size],
+        &chunk[dict_size_pos + 4..dict_size_pos + 4 + dict_size]
+    );
+
+    let restored = lazy.decompress_chunk(0).unwrap();
+    assert_eq!(restored, data);
+
+    let mut oversized_dest = vec![0u8; lazy.chunksize];
+    let written = decompress_into_with_dparams(&chunk, &mut oversized_dest, &lazy.dparams).unwrap();
+    assert_eq!(written, data.len());
+    assert_eq!(&oversized_dest[..written], data.as_slice());
+}
+
+fn identity_postfilter(params: &mut PostfilterParams<'_>) -> i32 {
+    params.output.copy_from_slice(params.input);
+    0
+}
+
+#[test]
+fn test_c_trained_zstd_dictionary_chunk_decodes_without_ffi_fallback() {
+    let _b = init_blosc2();
+    let data = c_trained_zstd_dict_regression_data();
+    let mut cparams: ffi::blosc2_cparams = unsafe { std::mem::zeroed() };
+    cparams.compcode = BLOSC_ZSTD;
+    cparams.clevel = 5;
+    cparams.typesize = 1;
+    cparams.nthreads = 1;
+    cparams.blocksize = 0;
+    cparams.splitmode = BLOSC_FORWARD_COMPAT_SPLIT;
+    cparams.use_dict = 1;
+    cparams.filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_SHUFFLE;
+
+    let c_chunk = unsafe { c_compress_with_params(&data, cparams) };
+    let mut out = vec![0u8; data.len()];
+    let dparams = DParams {
+        postfilter: Some(identity_postfilter),
+        ..Default::default()
+    };
+    let written = decompress_into_with_dparams(&c_chunk, &mut out, &dparams).unwrap();
+    assert_eq!(written, data.len());
+    assert_eq!(out, data);
+}
+
+#[test]
+fn test_zstd_dictionary_regular_fallback_boundary_matches_c() {
+    let _b = init_blosc2();
+
+    let data: Vec<u8> = (0..6000u32).map(|i| i as u8).collect();
+    let mut cparams: ffi::blosc2_cparams = unsafe { std::mem::zeroed() };
+    cparams.compcode = BLOSC_ZSTD;
+    cparams.clevel = 5;
+    cparams.typesize = 1;
+    cparams.nthreads = 1;
+    cparams.blocksize = 1;
+    cparams.splitmode = BLOSC_NEVER_SPLIT;
+    cparams.use_dict = 1;
+
+    let c_chunk = unsafe { c_compress_with_params(&data, cparams) };
+    let c_header = ChunkHeader::read(&c_chunk).unwrap();
+    assert!(
+        !c_header.use_dict(),
+        "C bypasses zstd dictionary training when computed sample_size is zero"
+    );
+    assert_eq!(decompress(&c_chunk).unwrap(), data);
+
+    let rust_params = CParams {
+        compcode: BLOSC_ZSTD,
+        clevel: 5,
+        typesize: 1,
+        blocksize: 1,
+        splitmode: BLOSC_NEVER_SPLIT,
+        filters: [0; BLOSC2_MAX_FILTERS],
+        use_dict: true,
+        ..Default::default()
+    };
+    let rust_chunk = compress(&data, &rust_params).unwrap();
+    let rust_header = ChunkHeader::read(&rust_chunk).unwrap();
+    assert!(
+        !rust_header.use_dict(),
+        "Rust must mirror C's sample_size zero dictionary fallback"
+    );
+    let (c_dsize, c_decompressed) = c_decompress_chunk(&rust_chunk, data.len());
+    assert_eq!(c_dsize, data.len() as i32);
+    assert_eq!(c_decompressed, data);
+}
+
+#[test]
+fn test_zstd_low_diversity_dict_size_tracks_c_training_shape() {
+    let _b = init_blosc2();
+
+    let data = vec![0u8; 200_000];
+    let mut cparams: ffi::blosc2_cparams = unsafe { std::mem::zeroed() };
+    cparams.compcode = BLOSC_ZSTD;
+    cparams.clevel = 5;
+    cparams.typesize = 1;
+    cparams.nthreads = 1;
+    cparams.blocksize = 4096;
+    cparams.splitmode = BLOSC_NEVER_SPLIT;
+    cparams.use_dict = 1;
+
+    let c_chunk = unsafe { c_compress_with_params(&data, cparams) };
+    let c_header = ChunkHeader::read(&c_chunk).unwrap();
+    assert!(c_header.use_dict());
+    assert!(
+        regular_embedded_dict_len(&c_chunk).unwrap() < BLOSC2_MINUSEFULDICT,
+        "C's trained zstd dictionary can be smaller than the pre-training useful-size guard"
+    );
+
+    let rust_chunk = compress(
+        &data,
+        &CParams {
+            compcode: BLOSC_ZSTD,
+            clevel: 5,
+            typesize: 1,
+            blocksize: 4096,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0; BLOSC2_MAX_FILTERS],
+            use_dict: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let rust_header = ChunkHeader::read(&rust_chunk).unwrap();
+    assert!(rust_header.use_dict());
+    let rust_dict = regular_embedded_dict(&rust_chunk).unwrap();
+    assert_eq!(&rust_dict[..4], &ZSTD_DICT_MAGIC_LE);
+    assert!(zstd_dict_content(rust_dict).len() <= 512);
+
+    let (c_dsize, c_decompressed) = c_decompress_chunk(&rust_chunk, data.len());
+    assert_eq!(c_dsize, data.len() as i32);
+    assert_eq!(c_decompressed, data);
 }
 
 fn vl_test_blocks() -> Vec<Vec<u8>> {
@@ -1265,6 +1595,18 @@ fn vl_embedded_dict_len(chunk: &[u8]) -> Option<usize> {
     }
     let dict_size_pos = header.header_len() + header.nblocks() * 4;
     Some(i32::from_le_bytes(chunk[dict_size_pos..dict_size_pos + 4].try_into().unwrap()) as usize)
+}
+
+fn vl_embedded_dict(chunk: &[u8]) -> Option<&[u8]> {
+    let header = ChunkHeader::read(chunk).unwrap();
+    if !header.use_dict() {
+        return None;
+    }
+    let dict_size_pos = header.header_len() + header.nblocks() * 4;
+    let dict_start = dict_size_pos + 4;
+    let dict_len =
+        i32::from_le_bytes(chunk[dict_size_pos..dict_start].try_into().unwrap()) as usize;
+    Some(&chunk[dict_start..dict_start + dict_len])
 }
 
 fn assert_vl_block_layout_matches_c(chunk: &[u8], blocks: &[Vec<u8>]) {
@@ -1718,6 +2060,58 @@ fn test_zstd_dictionary_vlblocks_cross_compat() {
         let c_block = unsafe { c_vl_decompress_block(&rust_chunk, idx as i32) };
         assert_eq!(c_block, blocks[idx]);
     }
+
+    let mut c_decompressed = vec![0u8; expected_concat.len()];
+    let dsize = unsafe {
+        ffi::blosc2_decompress(
+            rust_chunk.as_ptr() as *const c_void,
+            rust_chunk.len() as i32,
+            c_decompressed.as_mut_ptr() as *mut c_void,
+            c_decompressed.len() as i32,
+        )
+    };
+    assert_eq!(dsize, expected_concat.len() as i32);
+    assert_eq!(c_decompressed, expected_concat);
+}
+
+#[test]
+fn test_zstd_low_diversity_vl_dict_size_tracks_c_training_shape() {
+    let _b = init_blosc2();
+    let blocks: Vec<Vec<u8>> = (0..64).map(|_| vec![0u8; 512]).collect();
+    let block_refs: Vec<&[u8]> = blocks.iter().map(Vec::as_slice).collect();
+    let expected_concat: Vec<u8> = blocks.iter().flatten().copied().collect();
+
+    let c_chunk = unsafe { c_vl_compress(&blocks, BLOSC_ZSTD, 1, 1, true) };
+    assert_vl_chunk_header(&c_chunk, blocks.len());
+    assert_ne!(c_chunk[BLOSC2_CHUNK_BLOSC2_FLAGS] & BLOSC2_USEDICT, 0);
+    assert!(
+        vl_embedded_dict_len(&c_chunk).unwrap() < BLOSC2_MINUSEFULDICT,
+        "C's trained zstd VL dictionary can be smaller than the pre-training useful-size guard"
+    );
+
+    let rust_chunk = vlcompress(
+        &block_refs,
+        &CParams {
+            compcode: BLOSC_ZSTD,
+            clevel: 5,
+            typesize: 1,
+            nthreads: 1,
+            splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
+            filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+            use_dict: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_vl_chunk_header(&rust_chunk, blocks.len());
+    assert_ne!(rust_chunk[BLOSC2_CHUNK_BLOSC2_FLAGS] & BLOSC2_USEDICT, 0);
+    let rust_dict = vl_embedded_dict(&rust_chunk).unwrap();
+    assert_eq!(&rust_dict[..4], &ZSTD_DICT_MAGIC_LE);
+    assert!(zstd_dict_content(rust_dict).len() <= 512);
+    assert_eq!(
+        unsafe { c_vl_decompress(&rust_chunk, blocks.len()) },
+        blocks
+    );
 
     let mut c_decompressed = vec![0u8; expected_concat.len()];
     let dsize = unsafe {

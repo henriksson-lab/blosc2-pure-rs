@@ -533,8 +533,49 @@ impl LazySchunk {
             .checked_mul(std::mem::size_of::<i32>())
             .ok_or_else(|| "Invalid frame: lazy chunk size overflow".to_string())?;
         let lazy_header_len = BLOSC_EXTENDED_HEADER_LENGTH;
+        let dict_section_len = if !header.memcpyed() && header.use_dict() {
+            let dict_size_pos = source_header_len
+                .checked_add(bstarts_len)
+                .ok_or_else(|| "Invalid frame: lazy chunk size overflow".to_string())?;
+            let dict_size_end = dict_size_pos
+                .checked_add(4)
+                .ok_or_else(|| "Invalid frame: lazy chunk size overflow".to_string())?;
+            if dict_size_end > chunk_ref.cbytes {
+                return Err("Invalid frame: lazy chunk extends past chunk".into());
+            }
+            let mut dict_size_bytes = [0u8; 4];
+            read_lazy_exact_at(
+                &mut file,
+                chunk_offset
+                    .checked_add(dict_size_pos as u64)
+                    .ok_or_else(|| "Invalid frame: lazy chunk offset overflow".to_string())?,
+                &mut dict_size_bytes,
+                if self.sframe {
+                    "Failed to read sparse frame chunk"
+                } else {
+                    "Failed to read chunk"
+                },
+            )?;
+            let dict_size = i32::from_le_bytes(dict_size_bytes);
+            if dict_size <= 0 || dict_size as usize > BLOSC2_MAXDICTSIZE {
+                return Err("Invalid frame: invalid lazy chunk dictionary".into());
+            }
+            let section_len = 4usize
+                .checked_add(dict_size as usize)
+                .ok_or_else(|| "Invalid frame: lazy chunk size overflow".to_string())?;
+            if dict_size_pos
+                .checked_add(section_len)
+                .is_none_or(|end| end > chunk_ref.cbytes)
+            {
+                return Err("Invalid frame: lazy chunk extends past chunk".into());
+            }
+            section_len
+        } else {
+            0
+        };
         let trailer_offset = lazy_header_len
             .checked_add(bstarts_len)
+            .and_then(|len| len.checked_add(dict_section_len))
             .ok_or_else(|| "Invalid frame: lazy chunk size overflow".to_string())?;
         let trailer_len = std::mem::size_of::<i32>()
             .checked_add(std::mem::size_of::<i64>())
@@ -558,6 +599,7 @@ impl LazySchunk {
         } else {
             source_header_len
                 .checked_add(bstarts_len)
+                .and_then(|len| len.checked_add(dict_section_len))
                 .ok_or_else(|| "Invalid frame: lazy chunk size overflow".to_string())?
         };
         if source_streams_offset > chunk_ref.cbytes {
@@ -597,6 +639,22 @@ impl LazySchunk {
                         "Failed to read chunk"
                     },
                 )?;
+                if dict_section_len > 0 {
+                    let dict_source_start = bstarts_start
+                        .checked_add(bstarts_len as u64)
+                        .ok_or_else(|| "Invalid frame: lazy chunk offset overflow".to_string())?;
+                    let dict_dest_start = lazy_header_len + bstarts_len;
+                    read_lazy_exact_at(
+                        &mut file,
+                        dict_source_start,
+                        &mut lazy[dict_dest_start..dict_dest_start + dict_section_len],
+                        if self.sframe {
+                            "Failed to read sparse frame chunk"
+                        } else {
+                            "Failed to read chunk"
+                        },
+                    )?;
+                }
             }
         }
 

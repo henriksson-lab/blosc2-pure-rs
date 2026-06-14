@@ -50,9 +50,23 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-default = ["zlib-rs"]
+default = [
+    "zlib-rs",
+    "plugin-ndlz",
+    "plugin-bytedelta",
+    "plugin-int-trunc",
+    "plugin-ndcell",
+    "plugin-ndmean",
+    "plugin-zfp",
+]
 cli = ["dep:clap"]
 compare-blosc2-rs = ["dep:blosc2"]
+plugin-ndlz = []
+plugin-bytedelta = []
+plugin-int-trunc = []
+plugin-ndcell = []
+plugin-ndmean = []
+plugin-zfp = ["dep:zfp-rs"]
 # Enable flate2's zlib-rs backend. The dependency always keeps rust_backend
 # available so cargo check --no-default-features still has a valid backend.
 zlib-rs = ["flate2/zlib-rs"]
@@ -70,6 +84,7 @@ rayon = "1"
 lz4-pure = { package = "lz4-pure-rs", version = "0.1.0" }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 zstd-pure-rs = "0.1"
+zfp-rs = { version = "0.1.1", optional = true }
 
 [dev-dependencies]
 criterion = "0.8"

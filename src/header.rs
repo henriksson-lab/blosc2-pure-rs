@@ -229,7 +229,9 @@ impl ChunkHeader {
                     {
                         return Err("Invalid special value typesize");
                     }
-                } else if h.nbytes % h.typesize as i32 != 0 {
+                } else if h.special_type() == BLOSC2_SPECIAL_NAN
+                    && h.nbytes % h.typesize as i32 != 0
+                {
                     return Err("Invalid special chunk nbytes");
                 }
             }

@@ -39,6 +39,23 @@ fn random_bytes(len: usize) -> Vec<u8> {
     out
 }
 
+fn low_diversity_bytes(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 16) as u8).collect()
+}
+
+fn high_diversity_u32_bytes(len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    for i in 0..(len / 4) as u32 {
+        out.extend_from_slice(
+            &i.wrapping_mul(1_103_515_245)
+                .rotate_left(i % 17)
+                .to_le_bytes(),
+        );
+    }
+    out.resize(len, 0);
+    out
+}
+
 fn cparams_with_clevel(
     compcode: u8,
     clevel: u8,
@@ -58,6 +75,14 @@ fn cparams_with_clevel(
         use_dict: false,
         nthreads,
         ..CParams::default()
+    }
+}
+
+fn dict_cparams(compcode: u8, typesize: i32, filter: u8, nthreads: i16) -> CParams {
+    CParams {
+        use_dict: true,
+        blocksize: 4096,
+        ..cparams_with_clevel(compcode, 5, typesize, filter, nthreads)
     }
 }
 
@@ -234,6 +259,44 @@ fn bench_chunks(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_dictionary_chunks(c: &mut Criterion) {
+    let low_diversity = low_diversity_bytes(DATA_SIZE);
+    let high_diversity = high_diversity_u32_bytes(DATA_SIZE);
+    let mut group = c.benchmark_group("dictionary_chunks");
+    group.throughput(Throughput::Bytes(DATA_SIZE as u64));
+
+    for (dataset, data) in [
+        ("low_diversity", &low_diversity),
+        ("high_diversity", &high_diversity),
+    ] {
+        for (name, compcode) in [
+            ("lz4", BLOSC_LZ4),
+            ("lz4hc", BLOSC_LZ4HC),
+            ("zstd", BLOSC_ZSTD),
+        ] {
+            let params = dict_cparams(compcode, 1, BLOSC_NOFILTER, BENCH_NTHREADS);
+            let compressed = compress::compress(data, &params).unwrap();
+
+            group.bench_function(format!("{dataset}/{name}/compress"), |b| {
+                b.iter(|| {
+                    black_box(compress::compress(black_box(data), black_box(&params)).unwrap())
+                });
+            });
+
+            group.bench_function(format!("{dataset}/{name}/decompress"), |b| {
+                b.iter(|| {
+                    black_box(
+                        compress::decompress_with_threads(black_box(&compressed), params.nthreads)
+                            .unwrap(),
+                    )
+                });
+            });
+        }
+    }
+
+    group.finish();
+}
+
 fn bench_schunk_frame(c: &mut Criterion) {
     let data = signal_f32_bytes(DATA_SIZE);
     let chunks: Vec<&[u8]> = data.chunks(SFRAME_BENCH_CHUNK_SIZE).collect();
@@ -337,6 +400,7 @@ criterion_group!(
     bench_filters,
     bench_codec_blocks,
     bench_chunks,
+    bench_dictionary_chunks,
     bench_schunk_frame,
     bench_c_helpers
 );

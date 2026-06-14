@@ -55,7 +55,13 @@ This blurb might be out of date. Go to [this page](https://github.com/henriksson
 
 - B2ND metadata supports the C-Blosc2 16-D limit, but some B2ND C-parity gaps remain: file-backed storage choices, zero-copy/view semantics, append fast paths, string-shuffle coverage, and broader append/insert/delete/resize/selection parity tests.
 - Attached frame and sparse-frame mutation semantics are incomplete for opened file-backed `Schunk`s; some operations currently update in-memory state without C-equivalent persistence guarantees.
-- Dynamic plugin loading is not a current goal. In-process Rust codec/filter registration is supported, and the built-in global plugin paths for NDLZ, BYTEDELTA, INT_TRUNC, NDCELL, and NDMEAN are implemented via lower-level APIs/constants rather than the high-level `Codec`/`Filter` CLI enum. Other C global plugins, including ZFP modes, are not implemented.
+- Dynamic plugin loading is not a current goal. In-process Rust codec/filter registration is supported, and the built-in global plugin paths for NDLZ, ZFP, BYTEDELTA, INT_TRUNC, NDCELL, and NDMEAN are implemented via lower-level APIs/constants rather than the high-level `Codec`/`Filter` CLI enum. Other C global plugins are not implemented.
+
+Default Cargo features statically enable the ported C global plugin algorithms:
+`plugin-ndlz`, `plugin-bytedelta`, `plugin-int-trunc`, `plugin-ndcell`, and
+`plugin-ndmean`. Disabling default features keeps the IDs/API constants visible
+but leaves those built-in algorithms unavailable. There is no dynamic plugin
+loader.
 - The `*_c` helpers are Rust-shaped C-name compatibility adapters, not `extern "C"` ABI exports. Full C ABI compatibility would require a separate pointer-ownership and struct-layout layer.
 - B2ND does not currently model C's internal `chunk_cache_s`; this is treated as a performance gap rather than a correctness requirement until profiling shows otherwise.
 - Rust-generated frames target format compatibility with C-Blosc2, not byte-for-byte identical output for every offsets chunk or special-value encoding strategy.
@@ -101,6 +107,7 @@ blosc2 compress input.bin output.b2frame --codec zstd --clevel 9
 blosc2 compress input.bin output.b2frame -c lz4 -l 5 -t 4 -f shuffle
 blosc2 compress floats.bin floats.b2frame -c zstd -l 7 -t 4 -b 262144 --chunksize 4194304 --splitmode forward
 blosc2 compress floats.bin floats-trunc.b2frame -f truncprec --filter-meta 16 -t 4
+blosc2 compress input.bin dict.b2frame -c zstd --use-dict
 ```
 
 Options:
@@ -108,11 +115,12 @@ Options:
 - `-l, --clevel`: Compression level (0-9). Default: `9`
 - `-t, --typesize`: Element type size in bytes. Default: `1`
 - `-b, --blocksize`: Explicit block size in bytes (`0` = automatic). Default: `0`
-- `--chunksize`: Input bytes per frame chunk. Default: `4194304` (4 MiB).
+- `--chunksize`: Input bytes per frame chunk. Default: `1000000`.
 - `-s, --splitmode`: Split mode (`always`, `never`, `auto`, `forward`). Default: `forward`
 - `-n, --nthreads`: Number of threads. Default: `4`
 - `-f, --filter`: Filter (`nofilter`, `shuffle`, `bitshuffle`, `delta`, `truncprec`). Default: `shuffle`
 - `--filter-meta`: Filter metadata byte. For `truncprec`, this is the retained precision in bits. Default: `0`
+- `--use-dict`: Enable codec dictionary training for supported codecs (`lz4`, `lz4hc`, `zstd`). Default: disabled.
 
 Chunk-size guidance: keep the default for general file compression unless you have workload-specific measurements showing a better setting.
 
@@ -136,8 +144,8 @@ local CMake build of the vendored `c-blosc2/` tree. Pass `--rust-bin` or
 `--c-helper` to benchmark prebuilt binaries.
 
 Profiles:
-- `quick`: small smoke matrix over `blosclz`, `lz4`, `zstd`, shuffle/no-filter, and 1/4 threads.
-- `publish`: broader real-data matrix over all built-in codecs, core filters, levels, split modes, and chunk sizes.
+- `quick`: small smoke matrix over `blosclz`, `lz4`, `zstd`, shuffle/no-filter, dictionary-enabled LZ4/Zstd shuffle cases, and 1/4 threads.
+- `publish`: broader real-data matrix over all built-in codecs, core filters, levels, split modes, chunk sizes, and dictionary-enabled LZ4/LZ4HC/Zstd cases.
 - `full`: larger matrix intended for overnight/local investigation.
 
 Manifest format:
@@ -155,9 +163,15 @@ typesizes = [1]
 ```
 
 CSV rows include dataset, implementation (`rust` or `c`), mode (`compress` or
-`decompress`), codec, filter, type size, thread count, chunk size, compressed
-size, ratio, wall time, max RSS, throughput, verification status, and process
-status.
+`decompress`), frame producer (`rust`, `c`, or `self` for compression), codec,
+filter, dictionary mode, type size, thread count, chunk size, compressed size,
+ratio, wall time, max RSS, throughput, verification status, process status, and
+failure classification with captured stdout/stderr. Decompression rows cover
+both self-roundtrips and cross-decompression of Rust-produced frames with C and
+C-produced frames with Rust. The harness only attempts Rust-on-C-frame
+cross-decompression after C's own self-roundtrip for that frame succeeds, so
+C reference frame failures are not double-counted as Rust compatibility
+failures.
 
 ### Decompress
 

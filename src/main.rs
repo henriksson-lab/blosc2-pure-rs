@@ -2,8 +2,8 @@
 //!
 //! Provides `compress` and `decompress` subcommands that read and write Blosc2 frame files
 //! (`.b2frame`). Compression parameters (codec, level, type size, block size, split mode,
-//! filter, thread count) are exposed as flags; decompression can optionally override the frame
-//! thread count.
+//! filter, dictionary mode, thread count) are exposed as flags; decompression can optionally
+//! override the frame thread count.
 
 use blosc2_pure_rs::compress::{self, CParams, DParams};
 use blosc2_pure_rs::constants::*;
@@ -64,6 +64,9 @@ enum Commands {
         /// Filter metadata byte; for truncprec this is the precision in bits
         #[arg(long, default_value_t = 0)]
         filter_meta: u8,
+        /// Enable codec dictionary training for supported codecs
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        use_dict: bool,
     },
     /// Decompress a Blosc2 frame file
     Decompress {
@@ -90,6 +93,7 @@ struct CompressOptions {
     nthreads: i16,
     filter: u8,
     filter_meta: u8,
+    use_dict: bool,
 }
 
 fn parse_chunksize(value: &str) -> Result<usize, String> {
@@ -130,7 +134,7 @@ fn compress_file(input: &Path, output: &Path, options: CompressOptions) -> io::R
         splitmode: options.splitmode,
         filters: [0, 0, 0, 0, 0, options.filter],
         filters_meta,
-        use_dict: false,
+        use_dict: options.use_dict,
         nthreads: options.nthreads,
         ..Default::default()
     };
@@ -688,6 +692,7 @@ mod tests {
             nthreads: 1,
             filter: BLOSC_SHUFFLE as u8,
             filter_meta: 0,
+            use_dict: false,
         }
     }
 
@@ -1059,6 +1064,7 @@ fn main() {
             nthreads,
             filter,
             filter_meta,
+            use_dict,
         } => {
             let codec = parse_codec(codec).unwrap_or_else(|| {
                 eprintln!(
@@ -1094,6 +1100,7 @@ fn main() {
                     nthreads: *nthreads,
                     filter,
                     filter_meta: *filter_meta,
+                    use_dict: *use_dict,
                 },
             )
         }

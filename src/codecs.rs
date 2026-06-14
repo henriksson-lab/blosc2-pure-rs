@@ -15,9 +15,17 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::{OnceLock, RwLock};
+#[cfg(feature = "plugin-zfp")]
+use zfp_rs::{
+    types::ZFP_MAX_PREC, ZfpBitStream, ZfpConfig, ZfpDimensionality, ZfpField, ZfpFieldMut,
+    ZfpScalarType, ZfpStreamAlignment,
+};
 use zstd_pure_rs::common::error::{ErrorCode, ERROR};
 use zstd_pure_rs::common::xxhash::XXH64_state_t;
-use zstd_pure_rs::decompress::zstd_ddict::{ZSTD_DDict_dictContent, ZSTD_createDDict};
+use zstd_pure_rs::decompress::zstd_ddict::{ZSTD_DDict, ZSTD_DDict_dictContent, ZSTD_createDDict};
+use zstd_pure_rs::decompress::zstd_decompress::{
+    ZSTD_decompressFrame_withOpStart, ZSTD_loadDEntropy,
+};
 use zstd_pure_rs::decompress::zstd_decompress_block::{ZSTD_DCtx, ZSTD_decoder_entropy_rep};
 use zstd_pure_rs::prelude::*;
 
@@ -491,6 +499,11 @@ pub fn is_known_zfp_codec(compcode: u8) -> bool {
             | BLOSC_CODEC_ZFP_FIXED_PRECISION
             | BLOSC_CODEC_ZFP_FIXED_RATE
     )
+}
+
+pub fn is_static_global_codec_enabled(compcode: u8) -> bool {
+    (cfg!(feature = "plugin-ndlz") && compcode == BLOSC_CODEC_NDLZ)
+        || (cfg!(feature = "plugin-zfp") && is_known_zfp_codec(compcode))
 }
 
 static USER_CODECS: OnceLock<RwLock<HashMap<u8, UserCodec>>> = OnceLock::new();
@@ -1150,7 +1163,12 @@ pub fn compress_block_with_context(
         BLOSC_LZ4HC => lz4hc_compress(clevel, src, dest),
         BLOSC_ZLIB => zlib_compress(src, dest, clevel),
         BLOSC_ZSTD => zstd_compress(src, dest, clevel),
+        #[cfg(feature = "plugin-ndlz")]
         BLOSC_CODEC_NDLZ => ndlz_compress(meta, src, dest, context.as_ref()),
+        #[cfg(feature = "plugin-zfp")]
+        BLOSC_CODEC_ZFP_FIXED_ACCURACY
+        | BLOSC_CODEC_ZFP_FIXED_PRECISION
+        | BLOSC_CODEC_ZFP_FIXED_RATE => zfp_compress(compcode, meta, src, dest, context.as_ref()),
         _ => match user_codecs()
             .read()
             .ok()
@@ -1241,7 +1259,12 @@ pub fn decompress_block_with_context(
         BLOSC_LZ4 | BLOSC_LZ4HC => lz4_decompress(src, dest),
         BLOSC_ZLIB => zlib_decompress(src, dest),
         BLOSC_ZSTD => zstd_decompress(src, dest),
+        #[cfg(feature = "plugin-ndlz")]
         BLOSC_CODEC_NDLZ => ndlz_decompress(meta, src, dest),
+        #[cfg(feature = "plugin-zfp")]
+        BLOSC_CODEC_ZFP_FIXED_ACCURACY
+        | BLOSC_CODEC_ZFP_FIXED_PRECISION
+        | BLOSC_CODEC_ZFP_FIXED_RATE => zfp_decompress(compcode, meta, src, dest, context.as_ref()),
         _ => match user_codecs()
             .read()
             .ok()
@@ -1592,10 +1615,27 @@ fn zstd_decompress_with_dict(src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
         let Some(ddict) = ZSTD_createDDict(dict) else {
             return ERROR(ErrorCode::DictionaryCorrupted);
         };
-        let n = ZSTD_decompress_usingDDict(&mut dctx, dest, src, &ddict);
+        let n = zstd_decompress_using_ddict_with_active_entropy(&mut dctx, dest, src, &ddict);
         if ERR_isError(n) {
-            let content = ZSTD_DDict_dictContent(&ddict);
-            ZSTD_decompress_usingDict(&mut dctx, dest, src, content)
+            if zstd_dict_has_magic(dict) {
+                *dctx = ZSTD_createDCtx();
+                let load = ZSTD_DCtx_loadDictionary(&mut dctx, dict);
+                if !ERR_isError(load) {
+                    let mut entropy_rep = ZSTD_decoder_entropy_rep::default();
+                    let mut xxh = XXH64_state_t::default();
+                    let n = ZSTD_decompressDCtx(&mut dctx, &mut entropy_rep, &mut xxh, dest, src);
+                    if !ERR_isError(n) {
+                        return n;
+                    }
+                }
+            }
+            let n = ZSTD_decompress_usingDict(&mut dctx, dest, src, dict);
+            if ERR_isError(n) {
+                let content = ZSTD_DDict_dictContent(&ddict);
+                ZSTD_decompress_usingDict(&mut dctx, dest, src, content)
+            } else {
+                n
+            }
         } else {
             n
         }
@@ -1605,6 +1645,90 @@ fn zstd_decompress_with_dict(src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
     } else {
         n as i32
     }
+}
+
+fn zstd_decompress_using_ddict_with_active_entropy(
+    dctx: &mut ZSTD_DCtx,
+    dest: &mut [u8],
+    src: &[u8],
+    ddict: &ZSTD_DDict,
+) -> usize {
+    let frame_dict_id = ZSTD_getDictID_fromFrame(src);
+    if frame_dict_id != 0 && ddict.dictID != 0 && frame_dict_id != ddict.dictID {
+        return ERROR(ErrorCode::DictionaryWrong);
+    }
+
+    let declared = ZSTD_getFrameContentSize(src);
+    let out_size = if declared == ZSTD_CONTENTSIZE_UNKNOWN || declared == ZSTD_CONTENTSIZE_ERROR {
+        dest.len()
+    } else {
+        declared as usize
+    };
+    if out_size > dest.len() {
+        return ERROR(ErrorCode::DstSizeTooSmall);
+    }
+
+    let rc = ZSTD_decompressBegin(dctx);
+    if ERR_isError(rc) {
+        return rc;
+    }
+    let content = ZSTD_DDict_dictContent(ddict);
+    dctx.stream_dict = content.to_vec();
+    dctx.dictID = ddict.dictID;
+    if ddict.entropyPresent != 0 {
+        let mut rep = [0u32; 3];
+        let rc = ZSTD_loadDEntropy(dctx, &mut rep, &ddict.dictBuffer);
+        if ERR_isError(rc) {
+            return rc;
+        }
+        dctx.ddict_rep = rep;
+        dctx.litEntropy = 1;
+        dctx.fseEntropy = 1;
+        dctx.fse_ll_fresh = true;
+        dctx.fse_of_fresh = true;
+        dctx.fse_ml_fresh = true;
+        dctx.ll_default_active = false;
+        dctx.of_default_active = false;
+        dctx.ml_default_active = false;
+    } else {
+        dctx.litEntropy = 0;
+        dctx.fseEntropy = 0;
+        dctx.fse_ll_fresh = false;
+        dctx.fse_of_fresh = false;
+        dctx.fse_ml_fresh = false;
+        dctx.ll_default_active = true;
+        dctx.of_default_active = true;
+        dctx.ml_default_active = true;
+    }
+
+    let mut combined = vec![0u8; content.len() + out_size];
+    combined[..content.len()].copy_from_slice(content);
+    let mut rep = ZSTD_decoder_entropy_rep {
+        rep: dctx.ddict_rep,
+    };
+    let mut xxh = XXH64_state_t::default();
+    let mut consumed = 0usize;
+    let decoded = ZSTD_decompressFrame_withOpStart(
+        dctx,
+        &mut rep,
+        &mut xxh,
+        &mut combined,
+        content.len(),
+        src,
+        &mut consumed,
+    );
+    if ERR_isError(decoded) {
+        return decoded;
+    }
+    dest[..decoded].copy_from_slice(&combined[content.len()..content.len() + decoded]);
+    decoded
+}
+
+fn zstd_dict_has_magic(dict: &[u8]) -> bool {
+    const ZSTD_MAGIC_DICTIONARY: u32 = 0xEC30_A437;
+    dict.get(..4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .is_some_and(|bytes| u32::from_le_bytes(bytes) == ZSTD_MAGIC_DICTIONARY)
 }
 
 fn read_u16_le(src: &[u8], pos: usize) -> Option<u16> {
@@ -1722,6 +1846,154 @@ fn ndlz_decompress(meta: u8, src: &[u8], dest: &mut [u8]) -> i32 {
     match meta {
         4 | 8 => ndlz_decompress_cell(meta as usize, src, dest),
         _ => -1,
+    }
+}
+
+#[cfg(feature = "plugin-zfp")]
+fn zfp_compress(
+    compcode: u8,
+    meta: u8,
+    src: &[u8],
+    dest: &mut [u8],
+    context: Option<&CodecCallbackContext<'_>>,
+) -> i32 {
+    let Some(context) = context else {
+        return 0;
+    };
+    let Some(cparams) = context.cparams else {
+        return 0;
+    };
+    let Ok(desc) = zfp_descriptor(context.b2nd_metalayer, cparams.typesize, src.len()) else {
+        return BLOSC2_ERROR_FAILURE;
+    };
+    let config = zfp_config(compcode, meta, desc.scalar_type, desc.dimensionality);
+    let capacity = config
+        .maximum_size(desc.scalar_type, &desc.dims[..desc.ndim])
+        .max(dest.len());
+    let field =
+        unsafe { ZfpField::from_raw(src.as_ptr(), src.len(), desc.scalar_type, desc.dims, [0; 4]) };
+    let mut stream = ZfpBitStream::new(capacity);
+    let Ok(cbytes) = stream.compress(&config, &field) else {
+        return 0;
+    };
+    if cbytes == 0 || cbytes >= src.len() {
+        return 0;
+    }
+    if cbytes > dest.len() || i32::try_from(cbytes).is_err() {
+        return 0;
+    }
+    dest[..cbytes].copy_from_slice(&stream.as_bytes()[..cbytes]);
+    cbytes as i32
+}
+
+#[cfg(feature = "plugin-zfp")]
+fn zfp_decompress(
+    compcode: u8,
+    meta: u8,
+    src: &[u8],
+    dest: &mut [u8],
+    context: Option<&CodecCallbackContext<'_>>,
+) -> i32 {
+    let Some(context) = context else {
+        return 0;
+    };
+    let Some(dparams) = context.dparams else {
+        return 0;
+    };
+    let Ok(desc) = zfp_descriptor(context.b2nd_metalayer, dparams.typesize, dest.len()) else {
+        return BLOSC2_ERROR_FAILURE;
+    };
+    let config = zfp_config(compcode, meta, desc.scalar_type, desc.dimensionality);
+    let mut field = unsafe {
+        ZfpFieldMut::from_raw(
+            dest.as_mut_ptr(),
+            dest.len(),
+            desc.scalar_type,
+            desc.dims,
+            [0; 4],
+        )
+    };
+    let mut stream = ZfpBitStream::from_bytes(src);
+    match stream.decompress(&config, &mut field) {
+        Ok(0) | Err(_) => 0,
+        Ok(_) => i32::try_from(dest.len()).unwrap_or(BLOSC2_ERROR_DATA),
+    }
+}
+
+#[cfg(feature = "plugin-zfp")]
+#[derive(Clone, Copy)]
+struct ZfpBlockDescriptor {
+    ndim: usize,
+    dims: [usize; 4],
+    scalar_type: ZfpScalarType,
+    dimensionality: ZfpDimensionality,
+}
+
+#[cfg(feature = "plugin-zfp")]
+fn zfp_descriptor(
+    b2nd_metalayer: Option<&[u8]>,
+    typesize: i32,
+    data_len: usize,
+) -> Result<ZfpBlockDescriptor, ()> {
+    let b2nd_metalayer = b2nd_metalayer.ok_or(())?;
+    let b2nd_meta = B2ndMeta::deserialize(b2nd_metalayer).map_err(|_| ())?;
+    let ndim = b2nd_meta.blockshape.len();
+    let dimensionality = match ndim {
+        1 => ZfpDimensionality::D1,
+        2 => ZfpDimensionality::D2,
+        3 => ZfpDimensionality::D3,
+        4 => ZfpDimensionality::D4,
+        _ => return Err(()),
+    };
+    let scalar_type = match typesize {
+        4 => ZfpScalarType::Float,
+        8 => ZfpScalarType::Double,
+        _ => return Err(()),
+    };
+    let mut dims = [0usize; 4];
+    let mut values = 1usize;
+    for i in 0..ndim {
+        let block_dim = b2nd_meta.blockshape[i];
+        if block_dim < 4 {
+            return Err(());
+        }
+        let dim = usize::try_from(block_dim).map_err(|_| ())?;
+        dims[i] = usize::try_from(b2nd_meta.blockshape[ndim - 1 - i]).map_err(|_| ())?;
+        values = values.checked_mul(dim).ok_or(())?;
+    }
+    let expected = values
+        .checked_mul(usize::try_from(typesize).map_err(|_| ())?)
+        .ok_or(())?;
+    if data_len < expected {
+        return Err(());
+    }
+    Ok(ZfpBlockDescriptor {
+        ndim,
+        dims,
+        scalar_type,
+        dimensionality,
+    })
+}
+
+#[cfg(feature = "plugin-zfp")]
+fn zfp_config(
+    compcode: u8,
+    meta: u8,
+    scalar_type: ZfpScalarType,
+    dimensionality: ZfpDimensionality,
+) -> ZfpConfig {
+    match compcode {
+        BLOSC_CODEC_ZFP_FIXED_ACCURACY => ZfpConfig::fixed_accuracy(10f64.powi(meta as i8 as i32)),
+        BLOSC_CODEC_ZFP_FIXED_PRECISION => {
+            let offset = 2 * u32::from(dimensionality) + 3;
+            ZfpConfig::fixed_precision((u32::from(meta) + offset).min(ZFP_MAX_PREC))
+        }
+        BLOSC_CODEC_ZFP_FIXED_RATE => {
+            let ratio = f64::from(meta) / 100.0;
+            let rate = ratio * scalar_type.size() as f64 * 8.0;
+            ZfpConfig::fixed_rate(rate, scalar_type, dimensionality, ZfpStreamAlignment::None)
+        }
+        _ => ZfpConfig::new(),
     }
 }
 
@@ -2671,11 +2943,11 @@ mod tests {
         let mut decompressed = vec![0u8; 128];
 
         assert_eq!(
-            compress_block(BLOSC_CODEC_ZFP_FIXED_RATE, 5, b"payload", &mut compressed),
+            compress_block(BLOSC_CODEC_OPENHTJ2K, 5, b"payload", &mut compressed),
             BLOSC2_ERROR_CODEC_SUPPORT
         );
         assert_eq!(
-            decompress_block(BLOSC_CODEC_ZFP_FIXED_RATE, b"payload", &mut decompressed),
+            decompress_block(BLOSC_CODEC_OPENHTJ2K, b"payload", &mut decompressed),
             BLOSC2_ERROR_CODEC_SUPPORT
         );
         assert_eq!(
@@ -2786,6 +3058,19 @@ mod tests {
             },
             b2nd_metalayer,
             user_data: 0,
+        }
+    }
+
+    #[cfg(feature = "plugin-zfp")]
+    fn zfp_test_chunk_context() -> CodecChunkContext {
+        CodecChunkContext {
+            schunk: 1,
+            nchunk: 0,
+            nblock: 0,
+            chunk_source: 0,
+            block_offset: 0,
+            blocksize: 64,
+            bsize: 64,
         }
     }
 
@@ -3679,6 +3964,95 @@ mod tests {
             ),
             -1
         );
+    }
+
+    #[cfg(feature = "plugin-zfp")]
+    #[test]
+    fn zfp_fixed_precision_meta_clamps_to_c_max_precision() {
+        let config = zfp_config(
+            BLOSC_CODEC_ZFP_FIXED_PRECISION,
+            u8::MAX,
+            ZfpScalarType::Float,
+            ZfpDimensionality::D4,
+        );
+
+        assert_eq!(config.max_prec(), ZFP_MAX_PREC);
+    }
+
+    #[cfg(feature = "plugin-zfp")]
+    #[test]
+    fn zfp_fixed_rate_roundtrip_uses_b2nd_blockshape_context() {
+        let b2nd_meta = B2ndMeta::new(vec![4, 4], vec![4, 4], vec![4, 4], "<f4", 0)
+            .unwrap()
+            .serialize()
+            .unwrap();
+        let cparams = CodecCParamsContext {
+            compcode: BLOSC_CODEC_ZFP_FIXED_RATE,
+            compcode_meta: 25,
+            clevel: 5,
+            use_dict: 0,
+            typesize: 4,
+            blocksize: 64,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [BLOSC_NOFILTER; BLOSC2_MAX_FILTERS],
+            filters_meta: [0; BLOSC2_MAX_FILTERS],
+            nthreads: 1,
+            nchunk: 0,
+            user_data: 0,
+            instr_codec: false,
+            codec_params: 0,
+        };
+        let dparams = CodecDParamsContext {
+            nthreads: 1,
+            typesize: 4,
+            nchunk: 0,
+            user_data: 0,
+        };
+        let chunk = zfp_test_chunk_context();
+        let input: Vec<u8> = (0..16)
+            .flat_map(|i| ((i as f32) * 0.25 + 1.0).to_ne_bytes())
+            .collect();
+        let mut encoded = vec![0; 128];
+        let cbytes = compress_block_with_context(
+            BLOSC_CODEC_ZFP_FIXED_RATE,
+            5,
+            25,
+            &input,
+            &mut encoded,
+            Some(CodecCallbackContext {
+                compcode: BLOSC_CODEC_ZFP_FIXED_RATE,
+                complib: None,
+                meta: 25,
+                clevel: 5,
+                cparams: Some(&cparams),
+                dparams: None,
+                chunk,
+                b2nd_metalayer: Some(&b2nd_meta),
+                user_data: 0,
+            }),
+        );
+        assert!(cbytes > 0 && cbytes < input.len() as i32);
+
+        let mut decoded = vec![0; input.len()];
+        let dbytes = decompress_block_with_context(
+            BLOSC_CODEC_ZFP_FIXED_RATE,
+            25,
+            &encoded[..cbytes as usize],
+            &mut decoded,
+            Some(CodecCallbackContext {
+                compcode: BLOSC_CODEC_ZFP_FIXED_RATE,
+                complib: None,
+                meta: 25,
+                clevel: 5,
+                cparams: None,
+                dparams: Some(&dparams),
+                chunk,
+                b2nd_metalayer: Some(&b2nd_meta),
+                user_data: 0,
+            }),
+        );
+        assert_eq!(dbytes, input.len() as i32);
+        assert!(decoded.iter().any(|&byte| byte != 0));
     }
 
     #[test]

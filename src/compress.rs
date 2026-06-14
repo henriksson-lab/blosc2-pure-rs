@@ -25,6 +25,25 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use zstd_pure_rs::common::bits::ZSTD_highbit32;
+use zstd_pure_rs::common::error::ERR_isError;
+use zstd_pure_rs::common::xxhash::XXH64;
+use zstd_pure_rs::compress::fse_compress::FSE_normalizeCount;
+use zstd_pure_rs::compress::fse_compress::FSE_writeNCount;
+use zstd_pure_rs::compress::huf_compress::{
+    HUF_buildCTable_wksp, HUF_optimalTableLog, HUF_readCTableHeader, HUF_writeCTable,
+    HUF_CTABLE_WORKSPACE_SIZE_U32,
+};
+use zstd_pure_rs::compress::zstd_compress::{
+    ZSTD_compressBegin_usingCDict_deprecated, ZSTD_compressBlock_deprecated, ZSTD_compressBound,
+    ZSTD_compress_usingCDict, ZSTD_createCCtx, ZSTD_createCDict, ZSTD_createCDict_byReference,
+    ZSTD_getSeqStore,
+};
+use zstd_pure_rs::compress::zstd_hashes::ZSTD_hashPtr;
+use zstd_pure_rs::decompress::zstd_decompress::ZSTD_MAGIC_DICTIONARY;
+use zstd_pure_rs::decompress::zstd_decompress_block::{
+    LLFSELog, MLFSELog, MaxLL, MaxML, MaxOff, OffFSELog,
+};
 
 #[cfg(feature = "_ffi")]
 use std::ffi::c_void;
@@ -248,17 +267,31 @@ fn codec_version_for_header(compcode: u8) -> u8 {
 }
 
 fn unsupported_global_codec_error(compcode: u8) -> Option<&'static str> {
-    if codecs::is_known_zfp_codec(compcode) {
+    if codecs::is_known_zfp_codec(compcode) && !codecs::is_static_global_codec_enabled(compcode) {
         Some("ZFP plugin codecs are not supported")
-    } else if compcode != BLOSC_CODEC_NDLZ && codecs::is_known_global_codec(compcode) {
+    } else if codecs::is_known_global_codec(compcode)
+        && !codecs::is_static_global_codec_enabled(compcode)
+    {
         Some("Global plugin codec is not supported")
     } else {
         None
     }
 }
 
-fn unsupported_global_filter_error(_filter: u8) -> Option<&'static str> {
-    None
+fn unsupported_global_filter_error(filter: u8) -> Option<&'static str> {
+    if filters::is_known_global_filter(filter) && !filters::is_static_global_filter_enabled(filter)
+    {
+        Some("Global plugin filter is not supported")
+    } else {
+        None
+    }
+}
+
+fn supported_core_or_static_codec(compcode: u8) -> bool {
+    matches!(
+        compcode,
+        BLOSC_BLOSCLZ | BLOSC_LZ4 | BLOSC_LZ4HC | BLOSC_ZLIB | BLOSC_ZSTD
+    ) || codecs::is_static_global_codec_enabled(compcode)
 }
 
 fn unsupported_global_filter_for_cparams(filter: u8, cparams: &CParams) -> Option<&'static str> {
@@ -1715,10 +1748,8 @@ pub(crate) fn validate_cparams(cparams: &CParams, nbytes: usize) -> Result<(), &
     if let Some(err) = unsupported_global_codec_error(cparams.compcode) {
         return Err(err);
     }
-    if !matches!(
-        cparams.compcode,
-        BLOSC_BLOSCLZ | BLOSC_LZ4 | BLOSC_LZ4HC | BLOSC_ZLIB | BLOSC_ZSTD | BLOSC_CODEC_NDLZ
-    ) && !codecs::is_registered_codec(cparams.compcode)
+    if !supported_core_or_static_codec(cparams.compcode)
+        && !codecs::is_registered_codec(cparams.compcode)
     {
         return Err("Unsupported codec");
     }
@@ -1855,9 +1886,6 @@ fn validate_header(header: &ChunkHeader, chunk_len: usize) -> Result<(), &'stati
         BLOSC2_SPECIAL_ZERO | BLOSC2_SPECIAL_UNINIT => {
             if !header.use_dict() && cbytes < header_len {
                 return Err("Invalid special chunk size");
-            }
-            if !nbytes.is_multiple_of(header.typesize as usize) {
-                return Err("Invalid special value nbytes");
             }
         }
         BLOSC2_NO_SPECIAL => {}
@@ -2201,8 +2229,7 @@ fn maybe_memcpy_fallback_for_budget(
     blocksize: usize,
     output_limit: Option<usize>,
 ) -> Option<Vec<u8>> {
-    let limit = output_limit?;
-    if limit < BLOSC_EXTENDED_HEADER_LENGTH + src.len() {
+    if output_limit.is_some_and(|limit| limit < BLOSC_EXTENDED_HEADER_LENGTH + src.len()) {
         return None;
     }
     if cparams.clevel != 0 && cparams.use_dict {
@@ -2979,6 +3006,7 @@ fn compress_block_with_scratch(
     compress_buf: &mut Vec<u8>,
     prefilter_buf: &mut Vec<u8>,
     tid: i32,
+    block_output_limit: Option<usize>,
 ) -> Result<(Vec<u8>, bool, bool), &'static str> {
     let mut skip_filters = false;
     let mut force_zero_run = false;
@@ -3020,6 +3048,7 @@ fn compress_block_with_scratch(
             blocksize,
             (block_start / blocksize) as i32,
             compress_buf,
+            block_output_limit,
         );
     }
 
@@ -3043,6 +3072,7 @@ fn compress_block_with_scratch(
             blocksize,
             (block_start / blocksize) as i32,
             compress_buf,
+            block_output_limit,
         );
     }
 
@@ -3113,6 +3143,7 @@ fn compress_block_with_scratch(
         blocksize,
         (block_start / blocksize) as i32,
         compress_buf,
+        block_output_limit,
     )
 }
 
@@ -3345,6 +3376,7 @@ fn compress_pre_filtered_block_with_scratch(
     blocksize: usize,
     nblock: i32,
     _compressed: &mut Vec<u8>,
+    output_limit: Option<usize>,
 ) -> Result<(Vec<u8>, bool, bool), &'static str> {
     #[inline(always)]
     unsafe fn push_bytes(dst: &mut Vec<u8>, pos: &mut usize, src: &[u8]) {
@@ -3373,9 +3405,11 @@ fn compress_pre_filtered_block_with_scratch(
 
         if let Some(val) = get_run(stream_data) {
             if val == 0 {
+                check_output_budget(result_len + 4, output_limit)?;
                 unsafe { push_i32(&mut result, &mut result_len, 0) };
             } else {
                 all_zero_runs = false;
+                check_output_budget(result_len + 5, output_limit)?;
                 unsafe {
                     push_i32(&mut result, &mut result_len, -(val as i32));
                     *result.as_mut_ptr().add(result_len) = 0x01;
@@ -3434,6 +3468,7 @@ fn compress_pre_filtered_block_with_scratch(
         }
         if cbytes == 0 || cbytes as usize >= neblock {
             any_literal_stream = true;
+            check_output_budget(payload_pos + neblock, output_limit)?;
             unsafe {
                 result.set_len(payload_pos + neblock);
                 std::ptr::copy_nonoverlapping(
@@ -3449,6 +3484,7 @@ fn compress_pre_filtered_block_with_scratch(
             }
             result_len = payload_pos + neblock;
         } else {
+            check_output_budget(payload_pos + cbytes as usize, output_limit)?;
             unsafe {
                 result.set_len(payload_pos + cbytes as usize);
                 std::ptr::copy_nonoverlapping(
@@ -3476,15 +3512,26 @@ fn filtered_blocks_for_dict(
     nblocks: usize,
     typesize: usize,
     filters_are_noop: bool,
+    emulate_source_alias: bool,
 ) -> Result<Vec<Vec<u8>>, &'static str> {
     let single_shuffle = single_shuffle_filter(&cparams.filters, &cparams.filters_meta, typesize);
     let mut scratch: Vec<u8> = Vec::new();
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(nblocks);
     let mut prefilter_scratch: Vec<u8> = Vec::new();
+    let mut filter_source =
+        (emulate_source_alias && c_forward_pipeline_writes_source(cparams)).then(|| src.to_vec());
+    let source_write_ordinal = c_source_write_active_ordinal(cparams);
+    let mut source_write_buf1 = Vec::new();
+    let mut source_write_buf2 = Vec::new();
     for block_idx in 0..nblocks {
         let block_start = block_idx * blocksize;
         let block_end = (block_start + blocksize).min(src.len());
-        let block_data = &src[block_start..block_end];
+        let block_storage = filter_source
+            .as_ref()
+            .map(|source| source[block_start..block_end].to_vec());
+        let block_data = block_storage
+            .as_deref()
+            .unwrap_or(&src[block_start..block_end]);
         let mut skip_filters = false;
         let block_data = if let Some(filtered) = apply_prefilter(
             cparams,
@@ -3544,8 +3591,46 @@ fn filtered_blocks_for_dict(
             }),
         );
         match fb {
-            1 => out.push(buf1),
+            1 => {
+                if let Some(source) = filter_source.as_mut() {
+                    if let Some(ordinal) = source_write_ordinal {
+                        let source_write_data = source_alias_filtered_block(
+                            cparams,
+                            block_data,
+                            source,
+                            block_start,
+                            blocksize,
+                            bsize,
+                            typesize,
+                            ordinal,
+                            &mut source_write_buf1,
+                            &mut source_write_buf2,
+                        )?;
+                        source[block_start..block_start + bsize]
+                            .copy_from_slice(&source_write_data);
+                    }
+                }
+                out.push(buf1);
+            }
             2 => {
+                if let Some(source) = filter_source.as_mut() {
+                    if let Some(ordinal) = source_write_ordinal {
+                        let source_write_data = source_alias_filtered_block(
+                            cparams,
+                            block_data,
+                            source,
+                            block_start,
+                            blocksize,
+                            bsize,
+                            typesize,
+                            ordinal,
+                            &mut source_write_buf1,
+                            &mut source_write_buf2,
+                        )?;
+                        source[block_start..block_start + bsize]
+                            .copy_from_slice(&source_write_data);
+                    }
+                }
                 std::mem::swap(&mut buf1, &mut scratch);
                 buf1.truncate(bsize);
                 out.push(buf1);
@@ -3556,70 +3641,702 @@ fn filtered_blocks_for_dict(
     Ok(out)
 }
 
-/// Build a Zstd-style dictionary from the trailing portions of the filtered samples,
-/// returning `None` if there is not enough material to be useful.
-fn train_zstd_dict(samples: &[Vec<u8>], nbytes: usize) -> Option<Vec<u8>> {
+#[allow(clippy::too_many_arguments)]
+fn source_alias_filtered_block(
+    cparams: &CParams,
+    block_data: &[u8],
+    source: &[u8],
+    block_start: usize,
+    blocksize: usize,
+    bsize: usize,
+    typesize: usize,
+    ordinal: usize,
+    buf1: &mut Vec<u8>,
+    buf2: &mut Vec<u8>,
+) -> Result<Vec<u8>, &'static str> {
+    let prefix_filters = filter_prefix_through_active_ordinal(&cparams.filters, ordinal);
+    ensure_scratch_len_uninit(buf1, bsize);
+    ensure_scratch_len_uninit(buf2, bsize);
+    let delta_ref_storage = if block_start == 0 {
+        None
+    } else {
+        delta_reference_block(source, cparams, blocksize, 0)?
+    };
+    let filter_cparams = filter_cparams_context(cparams, blocksize as i32);
+    let fb = filters::pipeline_forward_with_context(
+        block_data,
+        &mut buf1[..bsize],
+        &mut buf2[..bsize],
+        &prefix_filters,
+        &cparams.filters_meta,
+        typesize,
+        block_start,
+        delta_ref_storage.as_deref(),
+        Some(filters::FilterPipelineContext {
+            cparams: Some(&filter_cparams),
+            dparams: None,
+            chunk: filters::FilterChunkContext {
+                schunk: cparams.schunk,
+                nchunk: cparams.nchunk,
+                nblock: (block_start / blocksize) as i32,
+                block_offset: block_start,
+                blocksize,
+                bsize,
+            },
+            b2nd_metalayer: cparams.b2nd_metalayer.as_deref(),
+            user_data: cparams.prefilter_user_data,
+        }),
+    );
+    match fb {
+        1 => Ok(buf1[..bsize].to_vec()),
+        2 => Ok(buf2[..bsize].to_vec()),
+        _ => Err("Filter pipeline failed"),
+    }
+}
+
+/// Build a pure-Rust fallback Zstd dictionary from the same sample window C feeds
+/// into `ZDICT_trainFromBuffer()`. This is not a replacement for ZDICT training,
+/// but it keeps the sample guard, ordering, and byte budget aligned with C while
+/// this crate remains pure Rust.
+fn train_zstd_dict(
+    samples_buffer: &[u8],
+    nbytes: usize,
+    sample_sizes: &[usize],
+) -> Option<Vec<u8>> {
     let dict_maxsize = BLOSC2_MAXDICTSIZE.min(nbytes / 20);
-    if dict_maxsize < BLOSC2_MINUSEFULDICT || samples.is_empty() {
+    if dict_maxsize < BLOSC2_MINUSEFULDICT || samples_buffer.is_empty() || sample_sizes.is_empty() {
         return None;
     }
 
-    let mut dict = Vec::with_capacity(dict_maxsize);
-    for sample in samples {
-        if sample.is_empty() {
-            return None;
+    let samples_len = sample_sizes.iter().try_fold(0usize, |acc, &size| {
+        if size == 0 {
+            None
+        } else {
+            acc.checked_add(size)
         }
-        let remaining = dict_maxsize.saturating_sub(dict.len());
-        if remaining == 0 {
-            break;
-        }
-        let take = remaining.min(sample.len());
-        dict.extend_from_slice(&sample[sample.len() - take..]);
+    })?;
+    let target = dict_maxsize.min(samples_len);
+    if target < BLOSC2_MINUSEFULDICT || samples_buffer.len() < samples_len {
+        return None;
     }
 
-    (dict.len() >= BLOSC2_MINUSEFULDICT).then_some(dict)
+    let mut content = zstd_fastcover_content(samples_buffer, sample_sizes, target)?;
+
+    if let Some(cap) = low_diversity_zstd_content_cap(&content) {
+        content.truncate(cap.min(content.len()));
+    }
+
+    let training_sample_count =
+        zstd_fastcover_training_count(sample_sizes).unwrap_or(sample_sizes.len());
+    let entropy_len = sample_sizes[..training_sample_count]
+        .iter()
+        .try_fold(0usize, |acc, &size| acc.checked_add(size))?;
+    let entropy_samples = &samples_buffer[..entropy_len];
+    let entropy_sample_sizes = &sample_sizes[..training_sample_count];
+    finalize_zstd_fallback_dict(
+        &content,
+        entropy_samples,
+        entropy_sample_sizes,
+        dict_maxsize,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct FastCoverSegment {
+    begin: usize,
+    end: usize,
+    score: u32,
+}
+
+fn zstd_fastcover_content(
+    samples_buffer: &[u8],
+    sample_sizes: &[usize],
+    dict_capacity: usize,
+) -> Option<Vec<u8>> {
+    const D: usize = 8;
+    const DEFAULT_K_CANDIDATES: [usize; 5] = [50, 537, 1024, 1511, 1998];
+
+    if dict_capacity < BLOSC2_MINUSEFULDICT || sample_sizes.len() < 5 {
+        return None;
+    }
+    let training_sample_count = sample_sizes.len() * 3 / 4;
+    if training_sample_count < 5 || training_sample_count >= sample_sizes.len() {
+        return None;
+    }
+    let mut offsets = Vec::with_capacity(sample_sizes.len() + 1);
+    offsets.push(0usize);
+    for &size in sample_sizes {
+        offsets.push(offsets.last()?.checked_add(size)?);
+    }
+    let total_size = offsets[training_sample_count];
+    if *offsets.last()? > samples_buffer.len() || total_size < D {
+        return None;
+    }
+
+    let nb_dmers = total_size.checked_sub(D)?.checked_add(1)?;
+    let mut best = Vec::new();
+    let mut best_score = usize::MAX;
+    let training_offsets = &offsets[..=training_sample_count];
+    let entropy_samples = &samples_buffer[..total_size];
+    for k in DEFAULT_K_CANDIDATES
+        .into_iter()
+        .filter(|&k| k >= D && k <= dict_capacity)
+    {
+        let Some(candidate) = fastcover_build_dictionary(
+            samples_buffer,
+            training_offsets,
+            nb_dmers,
+            k,
+            dict_capacity,
+        ) else {
+            continue;
+        };
+        let Some(score) = fastcover_candidate_score(
+            samples_buffer,
+            sample_sizes,
+            &offsets,
+            training_sample_count,
+            &candidate,
+            entropy_samples,
+            &sample_sizes[..training_sample_count],
+            dict_capacity,
+        ) else {
+            continue;
+        };
+        if score < best_score {
+            best_score = score;
+            best = candidate;
+        }
+    }
+    (!best.is_empty()).then_some(best)
+}
+
+fn fastcover_candidate_score(
+    samples_buffer: &[u8],
+    sample_sizes: &[usize],
+    offsets: &[usize],
+    test_sample_start: usize,
+    content: &[u8],
+    entropy_samples: &[u8],
+    entropy_sample_sizes: &[usize],
+    dict_capacity: usize,
+) -> Option<usize> {
+    let effective_content;
+    let content = if let Some(cap) = low_diversity_zstd_content_cap(content) {
+        effective_content = content[..cap.min(content.len())].to_vec();
+        &effective_content
+    } else {
+        content
+    };
+    let dict = finalize_zstd_fallback_dict(
+        content,
+        entropy_samples,
+        entropy_sample_sizes,
+        dict_capacity,
+    )?;
+    let cdict = ZSTD_createCDict(&dict, 3)?;
+    let max_sample_size = sample_sizes[test_sample_start..].iter().copied().max()?;
+    let mut dst = vec![0u8; ZSTD_compressBound(max_sample_size)];
+    let mut cctx = ZSTD_createCCtx()?;
+    let mut score = dict.len();
+    for idx in test_sample_start..sample_sizes.len() {
+        let sample = &samples_buffer[offsets[idx]..offsets[idx + 1]];
+        let written = ZSTD_compress_usingCDict(&mut cctx, &mut dst, sample, &cdict);
+        if ERR_isError(written) {
+            return None;
+        }
+        score = score.checked_add(written)?;
+    }
+    Some(score)
+}
+
+fn zstd_fastcover_training_count(sample_sizes: &[usize]) -> Option<usize> {
+    let training_sample_count = sample_sizes.len() * 3 / 4;
+    if training_sample_count < 5 || training_sample_count >= sample_sizes.len() {
+        return None;
+    }
+    Some(training_sample_count)
+}
+
+fn fastcover_build_dictionary(
+    samples_buffer: &[u8],
+    offsets: &[usize],
+    nb_dmers: usize,
+    k: usize,
+    dict_capacity: usize,
+) -> Option<Vec<u8>> {
+    const D: usize = 8;
+    const F: u32 = 20;
+    const MAX_ZERO_SCORE_RUN: usize = 10;
+
+    let mut freqs = fastcover_compute_frequencies(samples_buffer, offsets)?;
+    let (num_epochs, epoch_size) = fastcover_compute_epochs(dict_capacity, nb_dmers, k);
+    if num_epochs == 0 || epoch_size == 0 {
+        return None;
+    }
+
+    let mut segment_freqs = vec![0u16; 1usize << F];
+    let mut dict = vec![0u8; dict_capacity];
+    let mut tail = dict_capacity;
+    let mut zero_score_run = 0usize;
+    let mut epoch = 0usize;
+
+    while tail > 0 {
+        let epoch_begin = epoch.checked_mul(epoch_size)?;
+        let segment = fastcover_select_segment(
+            samples_buffer,
+            &mut freqs,
+            epoch_begin,
+            epoch_begin + epoch_size,
+            k,
+            &mut segment_freqs,
+        )?;
+        if segment.score == 0 {
+            zero_score_run += 1;
+            if zero_score_run >= MAX_ZERO_SCORE_RUN {
+                break;
+            }
+            epoch = (epoch + 1) % num_epochs;
+            continue;
+        }
+        zero_score_run = 0;
+
+        let segment_size = (segment.end - segment.begin + D - 1).min(tail);
+        if segment_size < D {
+            break;
+        }
+        tail -= segment_size;
+        dict[tail..tail + segment_size]
+            .copy_from_slice(&samples_buffer[segment.begin..segment.begin + segment_size]);
+        epoch = (epoch + 1) % num_epochs;
+    }
+
+    (tail < dict_capacity).then(|| dict[tail..].to_vec())
+}
+
+fn fastcover_compute_frequencies(samples_buffer: &[u8], offsets: &[usize]) -> Option<Vec<u32>> {
+    const D: usize = 8;
+    const F: u32 = 20;
+
+    let mut freqs = vec![0u32; 1usize << F];
+    for window in offsets.windows(2) {
+        let mut pos = window[0];
+        let end = window[1];
+        while pos + D <= end {
+            let idx = ZSTD_hashPtr(&samples_buffer[pos..], F, D as u32);
+            freqs[idx] = freqs[idx].wrapping_add(1);
+            pos += 1;
+        }
+    }
+    Some(freqs)
+}
+
+fn fastcover_compute_epochs(max_dict_size: usize, nb_dmers: usize, k: usize) -> (usize, usize) {
+    let min_epoch_size = k * 10;
+    let mut num = (max_dict_size / k).max(1);
+    let mut size = nb_dmers / num;
+    if size >= min_epoch_size {
+        return (num, size);
+    }
+    size = min_epoch_size.min(nb_dmers);
+    num = nb_dmers / size;
+    (num.max(1), size)
+}
+
+fn fastcover_select_segment(
+    samples_buffer: &[u8],
+    freqs: &mut [u32],
+    begin: usize,
+    end: usize,
+    k: usize,
+    segment_freqs: &mut [u16],
+) -> Option<FastCoverSegment> {
+    const D: usize = 8;
+    const F: u32 = 20;
+
+    let dmers_in_k = k - D + 1;
+    let mut best = FastCoverSegment {
+        begin: 0,
+        end: 0,
+        score: 0,
+    };
+    let mut active = FastCoverSegment {
+        begin,
+        end: begin,
+        score: 0,
+    };
+
+    while active.end < end {
+        let idx = ZSTD_hashPtr(&samples_buffer[active.end..], F, D as u32);
+        if segment_freqs[idx] == 0 {
+            active.score = active.score.wrapping_add(freqs[idx]);
+        }
+        active.end += 1;
+        segment_freqs[idx] = segment_freqs[idx].wrapping_add(1);
+
+        if active.end - active.begin == dmers_in_k + 1 {
+            let del_idx = ZSTD_hashPtr(&samples_buffer[active.begin..], F, D as u32);
+            segment_freqs[del_idx] = segment_freqs[del_idx].wrapping_sub(1);
+            if segment_freqs[del_idx] == 0 {
+                active.score = active.score.wrapping_sub(freqs[del_idx]);
+            }
+            active.begin += 1;
+        }
+
+        if active.score > best.score {
+            best = active;
+        }
+    }
+
+    while active.begin < end {
+        let del_idx = ZSTD_hashPtr(&samples_buffer[active.begin..], F, D as u32);
+        segment_freqs[del_idx] = segment_freqs[del_idx].wrapping_sub(1);
+        active.begin += 1;
+    }
+
+    for pos in best.begin..best.end {
+        let idx = ZSTD_hashPtr(&samples_buffer[pos..], F, D as u32);
+        freqs[idx] = 0;
+    }
+
+    Some(best)
+}
+
+fn finalize_zstd_fallback_dict(
+    content: &[u8],
+    entropy_samples: &[u8],
+    entropy_sample_sizes: &[usize],
+    dict_maxsize: usize,
+) -> Option<Vec<u8>> {
+    if content.is_empty() || dict_maxsize < BLOSC2_MINUSEFULDICT {
+        return None;
+    }
+
+    build_minimal_zstd_dict(content, entropy_samples, entropy_sample_sizes, dict_maxsize)
+}
+
+fn build_minimal_zstd_dict(
+    content: &[u8],
+    entropy_samples: &[u8],
+    entropy_sample_sizes: &[usize],
+    dict_capacity: usize,
+) -> Option<Vec<u8>> {
+    const MIN_CONTENT_SIZE: usize = 8;
+
+    if content.is_empty() || dict_capacity < BLOSC2_MINUSEFULDICT || dict_capacity < content.len() {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(content.len() + 256);
+    out.extend_from_slice(&ZSTD_MAGIC_DICTIONARY.to_le_bytes());
+    let random_id = XXH64(content, 0);
+    let compliant_id = (random_id % ((1u64 << 31) - 32768)) + 32768;
+    out.extend_from_slice(&(compliant_id as u32).to_le_bytes());
+
+    let entropy_start = out.len();
+    if append_zstd_entropy_tables_from_block_samples(
+        &mut out,
+        content,
+        entropy_samples,
+        entropy_sample_sizes,
+    )
+    .is_none()
+    {
+        out.truncate(entropy_start);
+        let sample_len = entropy_samples.len().min(content.len());
+        let huf_source = if sample_len == 0 {
+            content
+        } else {
+            &entropy_samples[..sample_len]
+        };
+        if append_minimal_zstd_huf_table(&mut out, huf_source).is_none() {
+            out.truncate(entropy_start);
+            append_minimal_zstd_huf_table(&mut out, content)?;
+        }
+        append_zstd_fallback_sequence_tables(&mut out, content.len())?;
+    }
+
+    let header_len = out.len() + 12;
+    if header_len > dict_capacity {
+        return None;
+    }
+    let content_len = content.len().min(dict_capacity - header_len);
+    if content_len < MIN_CONTENT_SIZE && header_len + MIN_CONTENT_SIZE > dict_capacity {
+        return None;
+    }
+    let padding_len = MIN_CONTENT_SIZE.saturating_sub(content_len);
+    for rep in [1u32, 4, 8] {
+        out.extend_from_slice(&rep.to_le_bytes());
+    }
+    out.resize(out.len() + padding_len, 0);
+    out.extend_from_slice(&content[..content_len]);
+    if out.len() > dict_capacity {
+        return None;
+    }
+    Some(out)
+}
+
+fn append_zstd_entropy_tables_from_block_samples(
+    out: &mut Vec<u8>,
+    content: &[u8],
+    entropy_samples: &[u8],
+    entropy_sample_sizes: &[usize],
+) -> Option<()> {
+    const ZDICT_OFFCODE_MAX: u32 = 30;
+    const ZSTD_BLOCKSIZE_MAX: usize = 128 * 1024;
+
+    let samples_len = entropy_sample_sizes
+        .iter()
+        .try_fold(0usize, |acc, &size| acc.checked_add(size))?;
+    if samples_len == 0 || samples_len > entropy_samples.len() {
+        return None;
+    }
+
+    let offcode_max = ZSTD_highbit32((content.len() + ZSTD_BLOCKSIZE_MAX) as u32);
+    if offcode_max > ZDICT_OFFCODE_MAX || offcode_max > MaxOff {
+        return None;
+    }
+
+    let mut literal_count = [1u32; 256];
+    let mut offcode_count = zstd_seeded_offcode_counts(offcode_max);
+    let mut ml_count = vec![1u32; (MaxML + 1) as usize];
+    let mut ll_count = vec![1u32; (MaxLL + 1) as usize];
+
+    let cdict = ZSTD_createCDict_byReference(content, 3)?;
+    let mut cctx = ZSTD_createCCtx()?;
+    let mut work_place = vec![0u8; ZSTD_BLOCKSIZE_MAX];
+    let mut sample_offset = 0usize;
+    for &sample_size in entropy_sample_sizes {
+        let sample_end = sample_offset.checked_add(sample_size)?;
+        let sample = &entropy_samples[sample_offset..sample_end];
+        let sample = &sample[..sample.len().min(ZSTD_BLOCKSIZE_MAX)];
+        sample_offset = sample_end;
+        if sample.is_empty() {
+            continue;
+        }
+
+        if ERR_isError(ZSTD_compressBegin_usingCDict_deprecated(&mut cctx, &cdict)) {
+            return None;
+        }
+        let csize = ZSTD_compressBlock_deprecated(&mut cctx, &mut work_place, sample);
+        if ERR_isError(csize) {
+            return None;
+        }
+        if csize == 0 {
+            continue;
+        }
+
+        let seq_store = ZSTD_getSeqStore(&cctx)?;
+        for &literal in &seq_store.literals {
+            literal_count[literal as usize] = literal_count[literal as usize].saturating_add(1);
+        }
+        for idx in 0..seq_store.sequences.len() {
+            let offcode = *seq_store.ofCode.get(idx)? as u32;
+            if offcode > offcode_max {
+                return None;
+            }
+            offcode_count[offcode as usize] = offcode_count[offcode as usize].saturating_add(1);
+
+            let ml_code = *seq_store.mlCode.get(idx)? as u32;
+            let ll_code = *seq_store.llCode.get(idx)? as u32;
+            if ml_code > MaxML || ll_code > MaxLL {
+                return None;
+            }
+            ml_count[ml_code as usize] = ml_count[ml_code as usize].saturating_add(1);
+            ll_count[ll_code as usize] = ll_count[ll_code as usize].saturating_add(1);
+        }
+    }
+
+    append_zstd_huf_table_from_counts(out, &literal_count)?;
+    append_normalized_zstd_count(
+        out,
+        &offcode_count,
+        offcode_max,
+        ZDICT_OFFCODE_MAX,
+        OffFSELog,
+    )?;
+    append_normalized_zstd_count(out, &ml_count, MaxML, MaxML, MLFSELog)?;
+    append_normalized_zstd_count(out, &ll_count, MaxLL, MaxLL, LLFSELog)?;
+    Some(())
+}
+
+fn append_zstd_fallback_sequence_tables(out: &mut Vec<u8>, dict_content_len: usize) -> Option<()> {
+    const ZDICT_OFFCODE_MAX: u32 = 30;
+
+    let offcode_max = ZSTD_highbit32((dict_content_len + (128 * 1024)) as u32);
+    if offcode_max > ZDICT_OFFCODE_MAX || offcode_max > MaxOff {
+        return None;
+    }
+    let offcode_count = zstd_seeded_offcode_counts(offcode_max);
+    let ml_count = vec![1u32; (MaxML + 1) as usize];
+    let ll_count = vec![1u32; (MaxLL + 1) as usize];
+    append_normalized_zstd_count(
+        out,
+        &offcode_count,
+        offcode_max,
+        ZDICT_OFFCODE_MAX,
+        OffFSELog,
+    )?;
+    append_normalized_zstd_count(out, &ml_count, MaxML, MaxML, MLFSELog)?;
+    append_normalized_zstd_count(out, &ll_count, MaxLL, MaxLL, LLFSELog)?;
+    Some(())
+}
+
+fn zstd_seeded_offcode_counts(offcode_max: u32) -> Vec<u32> {
+    let mut offcode_count = vec![0u32; (MaxOff + 1) as usize];
+    for count in offcode_count.iter_mut().take(offcode_max as usize + 1) {
+        *count = 1;
+    }
+    offcode_count
+}
+
+fn append_normalized_zstd_count(
+    out: &mut Vec<u8>,
+    count: &[u32],
+    normalize_max_symbol: u32,
+    write_max_symbol: u32,
+    table_log: u32,
+) -> Option<()> {
+    let total = count
+        .iter()
+        .take(normalize_max_symbol as usize + 1)
+        .map(|&count| count as usize)
+        .sum::<usize>();
+    let mut normalized = vec![0i16; count.len()];
+    let normalized_log = FSE_normalizeCount(
+        &mut normalized,
+        table_log,
+        count,
+        total,
+        normalize_max_symbol,
+        1,
+    );
+    if ERR_isError(normalized_log) || normalized_log == 0 {
+        return None;
+    }
+    let mut fse_header = vec![0u8; 256];
+    let written = FSE_writeNCount(
+        &mut fse_header,
+        &normalized,
+        write_max_symbol,
+        normalized_log as u32,
+    );
+    if ERR_isError(written) {
+        return None;
+    }
+    out.extend_from_slice(&fse_header[..written]);
+    Some(())
+}
+
+fn append_minimal_zstd_huf_table(out: &mut Vec<u8>, huf_source: &[u8]) -> Option<()> {
+    let mut count = [1u32; 256];
+    for &byte in huf_source {
+        count[byte as usize] += 1;
+    }
+    append_zstd_huf_table_from_counts(out, &count)
+}
+
+fn append_zstd_huf_table_from_counts(out: &mut Vec<u8>, count: &[u32; 256]) -> Option<()> {
+    let max_symbol_value = 255;
+    let total_count = count.iter().sum::<u32>() as usize;
+    let table_log = HUF_optimalTableLog(11, total_count, max_symbol_value);
+    let mut ctable = vec![0u64; 257];
+    let mut workspace = vec![0u32; HUF_CTABLE_WORKSPACE_SIZE_U32];
+    let rc = HUF_buildCTable_wksp(
+        &mut ctable,
+        count,
+        max_symbol_value,
+        table_log,
+        &mut workspace,
+    );
+    if ERR_isError(rc) {
+        return None;
+    }
+    if rc == 8 {
+        let mut flat_count = [2u32; 256];
+        flat_count[0] = 4;
+        flat_count[253] = 1;
+        flat_count[254] = 1;
+        return append_zstd_huf_table_from_counts(out, &flat_count);
+    }
+    let table_log = HUF_readCTableHeader(&ctable).tableLog as u32;
+    let mut huf_header = vec![0u8; 512];
+    let written = HUF_writeCTable(&mut huf_header, &ctable, max_symbol_value, table_log);
+    if ERR_isError(written) {
+        return None;
+    }
+    out.extend_from_slice(&huf_header[..written]);
+    Some(())
+}
+
+fn low_diversity_zstd_content_cap(dict: &[u8]) -> Option<usize> {
+    if dict.len() <= 512 {
+        return None;
+    }
+
+    let mut unique_windows = [0u64; 513];
+    let mut unique_count = 0usize;
+    for window in dict.windows(8).step_by(8) {
+        let value = u64::from_le_bytes(window.try_into().ok()?);
+        if unique_windows[..unique_count].contains(&value) {
+            continue;
+        }
+        if unique_count == unique_windows.len() {
+            return None;
+        }
+        unique_windows[unique_count] = value;
+        unique_count += 1;
+        if unique_count > 512 {
+            return None;
+        }
+    }
+
+    Some(512)
 }
 
 /// Build an LZ4-style dictionary from the leading portions of the filtered samples.
-fn build_lz4_dict(samples: &[Vec<u8>], nbytes: usize, dict_target: usize) -> Option<Vec<u8>> {
+fn build_lz4_dict(samples_buffer: &[u8], nbytes: usize, dict_target: usize) -> Option<Vec<u8>> {
     let dict_maxsize = BLOSC2_MAXDICTSIZE.min(nbytes / 20);
     let dict_target = dict_target.min(dict_maxsize);
-    if dict_target < BLOSC2_MINUSEFULDICT || samples.is_empty() {
+    if dict_target < BLOSC2_MINUSEFULDICT || samples_buffer.len() < dict_target {
         return None;
     }
 
-    let mut dict = Vec::with_capacity(dict_target);
-    for sample in samples {
-        if sample.is_empty() {
-            return None;
-        }
-        let remaining = dict_target.saturating_sub(dict.len());
-        if remaining == 0 {
-            break;
-        }
-        let take = remaining.min(sample.len());
-        dict.extend_from_slice(&sample[..take]);
-    }
-
-    if dict.len() < BLOSC2_MINUSEFULDICT {
-        None
-    } else {
-        Some(dict)
-    }
+    Some(samples_buffer[..dict_target].to_vec())
 }
 
 /// Dispatch to the dictionary builder appropriate for `compcode`. Returns `None` for codecs without dictionary support.
 fn build_codec_dictionary(
-    samples: &[Vec<u8>],
+    samples_buffer: &[u8],
     nbytes: usize,
     compcode: u8,
     lz4_dict_target: usize,
+    zstd_sample_sizes: &[usize],
 ) -> Option<Vec<u8>> {
     match compcode {
-        BLOSC_LZ4 | BLOSC_LZ4HC => build_lz4_dict(samples, nbytes, lz4_dict_target),
-        BLOSC_ZSTD => train_zstd_dict(samples, nbytes),
+        BLOSC_LZ4 | BLOSC_LZ4HC => build_lz4_dict(samples_buffer, nbytes, lz4_dict_target),
+        BLOSC_ZSTD => train_zstd_dict(samples_buffer, nbytes, zstd_sample_sizes),
         _ => None,
     }
+}
+
+fn dictionary_training_buffer(filtered_blocks: &[Vec<u8>], limit: usize) -> Option<Vec<u8>> {
+    let available = filtered_blocks
+        .iter()
+        .try_fold(0usize, |acc, block| acc.checked_add(block.len()))?;
+    if available < limit {
+        return None;
+    }
+
+    let mut buffer = Vec::with_capacity(limit);
+    for block in filtered_blocks {
+        let remaining = limit - buffer.len();
+        if remaining == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&block[..remaining.min(block.len())]);
+    }
+    Some(buffer)
 }
 
 /// Compress `src` into a Blosc2 chunk using the supplied compression parameters.
@@ -3725,8 +4442,15 @@ fn compress_with_output_limit(
     }
 
     if cparams.use_dict && codecs::codec_supports_dict(cparams.compcode) && cparams.clevel > 0 {
-        let filtered_blocks =
-            filtered_blocks_for_dict(src, cparams, blocksize, nblocks, typesize, filters_are_noop)?;
+        let training_blocks = filtered_blocks_for_dict(
+            src,
+            cparams,
+            blocksize,
+            nblocks,
+            typesize,
+            filters_are_noop,
+            true,
+        )?;
         let sample_nblocks = if dont_split {
             nblocks
         } else {
@@ -3734,13 +4458,25 @@ fn compress_with_output_limit(
         }
         .max(8);
         let sample_size = (nbytes as usize) / sample_nblocks / 16;
-        let lz4_dict_target = sample_nblocks.saturating_mul(sample_size);
+        let training_buffer_len = sample_nblocks.saturating_mul(sample_size);
+        let training_buffer = dictionary_training_buffer(&training_blocks, training_buffer_len);
+        let zstd_sample_sizes = vec![sample_size; sample_nblocks];
         if let Some(dict) = build_codec_dictionary(
-            &filtered_blocks,
+            training_buffer.as_deref().unwrap_or(&[]),
             nbytes as usize,
             cparams.compcode,
-            lz4_dict_target,
+            training_buffer_len,
+            &zstd_sample_sizes,
         ) {
+            let filtered_blocks = filtered_blocks_for_dict(
+                src,
+                cparams,
+                blocksize,
+                nblocks,
+                typesize,
+                filters_are_noop,
+                false,
+            )?;
             let dict_section_len = 4 + dict.len();
             let table_and_dict_end = header_len
                 .checked_add(bstarts_len)
@@ -3779,6 +4515,7 @@ fn compress_with_output_limit(
                         blocksize,
                         block_idx as i32,
                         &mut compress_scratch,
+                        output_limit.map(|limit| limit.saturating_sub(output_pos)),
                     )?;
                 ensure_len_with_budget(&mut output, output_pos + block_data.len(), output_limit)?;
                 output[output_pos..output_pos + block_data.len()].copy_from_slice(&block_data);
@@ -3834,6 +4571,7 @@ fn compress_with_output_limit(
                             compress_buf,
                             prefilter_buf,
                             rayon::current_thread_index().unwrap_or(0) as i32,
+                            None,
                         )
                     })
                 },
@@ -3855,6 +4593,7 @@ fn compress_with_output_limit(
                             compress_buf,
                             prefilter_buf,
                             rayon::current_thread_index().unwrap_or(1) as i32,
+                            None,
                         )
                     })
                 },
@@ -3919,6 +4658,7 @@ fn compress_with_output_limit(
                                     compress_buf,
                                     prefilter_buf,
                                     rayon::current_thread_index().unwrap_or(0) as i32,
+                                    None,
                                 );
                                 compressed_blocks[block_idx]
                                     .set(compressed)
@@ -3997,6 +4737,69 @@ fn compress_with_output_limit(
             let block_end = (block_start + blocksize).min(nbytes as usize);
             let original_bsize = block_end - block_start;
             let is_leftover = block_idx == nblocks - 1 && original_bsize < blocksize;
+
+            if !c_mutates_filter_source {
+                let bstart_offset = header_len + block_idx * 4;
+                output[bstart_offset..bstart_offset + 4]
+                    .copy_from_slice(&(output_pos as i32).to_le_bytes());
+
+                let (block_data, block_all_zero, block_has_literal) =
+                    match compress_block_with_scratch(
+                        src,
+                        &src[block_start..block_end],
+                        block_start,
+                        blocksize,
+                        is_leftover,
+                        cparams,
+                        dont_split,
+                        typesize,
+                        &mut buf1,
+                        &mut buf2,
+                        &mut compress_buf,
+                        &mut prefilter_buf,
+                        0,
+                        output_limit.map(|limit| limit.saturating_sub(output_pos)),
+                    ) {
+                        Ok(block) => block,
+                        Err("Destination too small") => {
+                            if let Some(memcpyed) = maybe_memcpy_fallback_for_budget(
+                                src,
+                                cparams,
+                                flags,
+                                blocksize,
+                                output_limit,
+                            ) {
+                                return Ok(memcpyed);
+                            }
+                            return Err("Destination too small");
+                        }
+                        Err(err) => return Err(err),
+                    };
+                if let Err(err) =
+                    ensure_len_with_budget(&mut output, output_pos + block_data.len(), output_limit)
+                {
+                    if let Some(memcpyed) = maybe_memcpy_fallback_for_budget(
+                        src,
+                        cparams,
+                        flags,
+                        blocksize,
+                        output_limit,
+                    ) {
+                        return Ok(memcpyed);
+                    }
+                    return Err(err);
+                }
+                output[output_pos..output_pos + block_data.len()].copy_from_slice(&block_data);
+                output_pos += block_data.len();
+                if !block_all_zero {
+                    all_zero_runs = false;
+                }
+                if block_has_literal {
+                    any_literal_stream = true;
+                }
+                continue;
+            }
+
             let block_storage = filter_source
                 .as_ref()
                 .map(|source| source[block_start..block_end].to_vec());
@@ -4087,45 +4890,18 @@ fn compress_with_output_limit(
                 let source_write_data: &[u8] = if filters_are_noop || skip_filters {
                     filtered
                 } else if let Some(ordinal) = source_write_ordinal {
-                    let prefix_filters =
-                        filter_prefix_through_active_ordinal(&cparams.filters, ordinal);
-                    ensure_scratch_len_uninit(&mut source_write_buf1, bsize);
-                    ensure_scratch_len_uninit(&mut source_write_buf2, bsize);
-                    let delta_ref_storage = if block_start == 0 {
-                        None
-                    } else {
-                        delta_reference_block(source, cparams, blocksize, 0)?
-                    };
-                    let filter_cparams = filter_cparams_context(cparams, blocksize as i32);
-                    let fb = filters::pipeline_forward_with_context(
+                    source_write_owned = source_alias_filtered_block(
+                        cparams,
                         block_data,
-                        &mut source_write_buf1[..bsize],
-                        &mut source_write_buf2[..bsize],
-                        &prefix_filters,
-                        &cparams.filters_meta,
-                        typesize,
+                        source,
                         block_start,
-                        delta_ref_storage.as_deref(),
-                        Some(filters::FilterPipelineContext {
-                            cparams: Some(&filter_cparams),
-                            dparams: None,
-                            chunk: filters::FilterChunkContext {
-                                schunk: cparams.schunk,
-                                nchunk: cparams.nchunk,
-                                nblock: block_idx as i32,
-                                block_offset: block_start,
-                                blocksize,
-                                bsize,
-                            },
-                            b2nd_metalayer: cparams.b2nd_metalayer.as_deref(),
-                            user_data: cparams.prefilter_user_data,
-                        }),
-                    );
-                    source_write_owned = match fb {
-                        1 => source_write_buf1[..bsize].to_vec(),
-                        2 => source_write_buf2[..bsize].to_vec(),
-                        _ => return Err("Filter pipeline failed"),
-                    };
+                        blocksize,
+                        bsize,
+                        typesize,
+                        ordinal,
+                        &mut source_write_buf1,
+                        &mut source_write_buf2,
+                    )?;
                     &source_write_owned[..]
                 } else {
                     filtered
@@ -4137,100 +4913,23 @@ fn compress_with_output_limit(
                 filtered
             };
 
-            let nstreams = stream_count(dont_split, is_leftover, typesize, bsize);
-            let neblock = bsize / nstreams;
-            let mut block_all_zero_runs = true;
-
-            for stream_idx in 0..nstreams {
-                let stream_start = stream_idx * neblock;
-                let stream_data = &filtered[stream_start..stream_start + neblock];
-
-                if let Some(val) = get_run(stream_data) {
-                    if val == 0 {
-                        if let Err(err) =
-                            ensure_len_with_budget(&mut output, output_pos + 4, output_limit)
-                        {
-                            if let Some(memcpyed) = maybe_memcpy_fallback_for_budget(
-                                src,
-                                cparams,
-                                flags,
-                                blocksize,
-                                output_limit,
-                            ) {
-                                return Ok(memcpyed);
-                            }
-                            return Err(err);
-                        }
-                        output[output_pos..output_pos + 4].copy_from_slice(&0i32.to_le_bytes());
-                        output_pos += 4;
-                    } else {
-                        block_all_zero_runs = false;
-                        if let Err(err) =
-                            ensure_len_with_budget(&mut output, output_pos + 5, output_limit)
-                        {
-                            if let Some(memcpyed) = maybe_memcpy_fallback_for_budget(
-                                src,
-                                cparams,
-                                flags,
-                                blocksize,
-                                output_limit,
-                            ) {
-                                return Ok(memcpyed);
-                            }
-                            return Err(err);
-                        }
-                        output[output_pos..output_pos + 4]
-                            .copy_from_slice(&(-(val as i32)).to_le_bytes());
-                        output_pos += 4;
-                        output[output_pos] = 0x01;
-                        output_pos += 1;
-                    }
-                    continue;
-                }
-
-                block_all_zero_runs = false;
-
-                let max_out = neblock;
-                if max_out > compress_buf.len() {
-                    compress_buf.resize(max_out, 0);
-                }
-
-                let codec_cparams = codec_cparams_context(cparams, blocksize as i32);
-                let cbytes = codecs::compress_block_with_context(
-                    cparams.compcode,
-                    cparams.clevel,
-                    cparams.compcode_meta,
-                    stream_data,
-                    &mut compress_buf[..max_out],
-                    Some(codecs::CodecCallbackContext {
-                        compcode: cparams.compcode,
-                        complib: None,
-                        meta: cparams.compcode_meta,
-                        clevel: cparams.clevel,
-                        cparams: Some(&codec_cparams),
-                        dparams: None,
-                        chunk: codecs::CodecChunkContext {
-                            schunk: cparams.schunk,
-                            nchunk: cparams.nchunk,
-                            nblock: block_idx as i32,
-                            chunk_source: src.as_ptr() as usize,
-                            block_offset: block_start,
-                            blocksize,
-                            bsize,
-                        },
-                        b2nd_metalayer: cparams.b2nd_metalayer.as_deref(),
-                        user_data: cparams.prefilter_user_data,
-                    }),
-                );
-
-                if cbytes < 0 {
-                    return Err("Codec compression failed");
-                }
-                if cbytes == 0 || cbytes as usize >= neblock {
-                    any_literal_stream = true;
-                    if let Err(err) =
-                        ensure_len_with_budget(&mut output, output_pos + 4 + neblock, output_limit)
-                    {
+            let (block_data, block_all_zero_runs, block_has_literal) =
+                match compress_pre_filtered_block_with_scratch(
+                    filtered,
+                    src.as_ptr(),
+                    cparams,
+                    dont_split,
+                    typesize,
+                    is_leftover,
+                    None,
+                    block_start,
+                    blocksize,
+                    block_idx as i32,
+                    &mut compress_buf,
+                    output_limit.map(|limit| limit.saturating_sub(output_pos)),
+                ) {
+                    Ok(block) => block,
+                    Err("Destination too small") => {
                         if let Some(memcpyed) = maybe_memcpy_fallback_for_budget(
                             src,
                             cparams,
@@ -4240,40 +4939,27 @@ fn compress_with_output_limit(
                         ) {
                             return Ok(memcpyed);
                         }
-                        return Err(err);
+                        return Err("Destination too small");
                     }
-                    output[output_pos..output_pos + 4]
-                        .copy_from_slice(&(neblock as i32).to_le_bytes());
-                    output_pos += 4;
-                    output[output_pos..output_pos + neblock].copy_from_slice(stream_data);
-                    output_pos += neblock;
-                } else {
-                    let cbytes = cbytes as usize;
-                    if let Err(err) =
-                        ensure_len_with_budget(&mut output, output_pos + 4 + cbytes, output_limit)
-                    {
-                        if let Some(memcpyed) = maybe_memcpy_fallback_for_budget(
-                            src,
-                            cparams,
-                            flags,
-                            blocksize,
-                            output_limit,
-                        ) {
-                            return Ok(memcpyed);
-                        }
-                        return Err(err);
-                    }
-                    output[output_pos..output_pos + 4]
-                        .copy_from_slice(&(cbytes as i32).to_le_bytes());
-                    output_pos += 4;
-                    output[output_pos..output_pos + cbytes]
-                        .copy_from_slice(&compress_buf[..cbytes]);
-                    output_pos += cbytes;
+                    Err(err) => return Err(err),
+                };
+            if let Err(err) =
+                ensure_len_with_budget(&mut output, output_pos + block_data.len(), output_limit)
+            {
+                if let Some(memcpyed) =
+                    maybe_memcpy_fallback_for_budget(src, cparams, flags, blocksize, output_limit)
+                {
+                    return Ok(memcpyed);
                 }
+                return Err(err);
             }
-
+            output[output_pos..output_pos + block_data.len()].copy_from_slice(&block_data);
+            output_pos += block_data.len();
             if !block_all_zero_runs {
                 all_zero_runs = false;
+            }
+            if block_has_literal {
+                any_literal_stream = true;
             }
         }
     }
@@ -4291,9 +4977,22 @@ fn compress_with_output_limit(
         ));
     }
 
+    if !all_zero_runs
+        && output_pos
+            >= BLOSC_EXTENDED_HEADER_LENGTH
+                .checked_add(src.len())
+                .ok_or("Input too large")?
+    {
+        if let Some(memcpyed) =
+            maybe_memcpy_fallback_for_budget(src, cparams, flags, blocksize, output_limit)
+        {
+            return Ok(memcpyed);
+        }
+    }
+
     // Handle special case: all blocks are zero runs
     let mut blosc2_flags = 0u8;
-    if all_zero_runs && (nbytes as usize).is_multiple_of(typesize) {
+    if all_zero_runs {
         blosc2_flags |= BLOSC2_SPECIAL_ZERO << 4;
         output_pos = header_len;
     }
@@ -4577,7 +5276,16 @@ fn vlcompress_with_output_limit(
         None
     };
     let dict = filtered_blocks.as_ref().and_then(|filtered| {
-        build_codec_dictionary(filtered, total_nbytes, cparams.compcode, total_nbytes)
+        let training_buffer_len = total_nbytes;
+        let training_buffer = dictionary_training_buffer(filtered, training_buffer_len)?;
+        let zstd_sample_sizes: Vec<usize> = filtered.iter().map(Vec::len).collect();
+        build_codec_dictionary(
+            &training_buffer,
+            total_nbytes,
+            cparams.compcode,
+            total_nbytes,
+            &zstd_sample_sizes,
+        )
     });
     let dict = dict.as_deref();
 
@@ -6385,6 +7093,7 @@ pub fn replace_aligned_blocks(
             blocksize,
             block_idx as i32,
             &mut compress_scratch,
+            None,
         )?;
         block_payloads.push(block_payload);
     }
@@ -7340,23 +8049,7 @@ fn decompress_into_with_header(
                         0,
                     )?;
                 }
-                let block0_ref_storage = if block_is_masked(maskout, 0) {
-                    Some(decompress_block_data(
-                        chunk,
-                        0,
-                        0,
-                        block0_end,
-                        blocksize,
-                        nblocks == 1 && block0_end < blocksize,
-                        header,
-                        None,
-                        dict,
-                        dparams,
-                    )?)
-                } else {
-                    None
-                };
-                let dref: &[u8] = block0_ref_storage.as_deref().unwrap_or(first_block);
+                let dref: &[u8] = first_block;
 
                 for block_idx in 1..nblocks {
                     if block_is_masked(maskout, block_idx) {
@@ -9122,24 +9815,8 @@ mod tests {
     }
 
     #[test]
-    fn test_known_global_plugin_codecs_reject_compression_until_ported() {
+    fn test_known_global_plugin_codecs_validate_static_support() {
         let data = b"plugin codec validation";
-        for compcode in [
-            BLOSC_CODEC_ZFP_FIXED_ACCURACY,
-            BLOSC_CODEC_ZFP_FIXED_PRECISION,
-            BLOSC_CODEC_ZFP_FIXED_RATE,
-        ] {
-            let err = compress(
-                data,
-                &CParams {
-                    compcode,
-                    ..CParams::default()
-                },
-            )
-            .unwrap_err();
-            assert_eq!(err, "ZFP plugin codecs are not supported");
-        }
-
         for compcode in [BLOSC_CODEC_OPENHTJ2K, BLOSC_CODEC_GROK, BLOSC_CODEC_OPENZL] {
             let err = compress(
                 data,
@@ -9904,7 +10581,7 @@ mod tests {
     }
 
     #[test]
-    fn test_delta_maskout_masked_block_zero_still_decodes_later_blocks() {
+    fn test_delta_maskout_masked_block_zero_matches_c_reference_state() {
         let data: Vec<u8> = (0..512u32)
             .flat_map(|i| i.wrapping_mul(17).to_le_bytes())
             .collect();
@@ -9928,12 +10605,26 @@ mod tests {
             decompress_into_with_dparams(&chunk, &mut dest, &dparams).unwrap(),
             data.len()
         );
+        let mut expected = vec![0u8; data.len() - 512];
+        for block_idx in 1..4 {
+            let block_start = block_idx * 512;
+            for i in 0..512 {
+                expected[(block_idx - 1) * 512 + i] = data[block_start + i] ^ data[i] ^ 0xA5;
+            }
+        }
         assert_eq!(&dest[..512], &[0xA5; 512]);
-        assert_eq!(&dest[512..], &data[512..]);
+        assert_eq!(&dest[512..], &expected);
 
         let allocated = decompress_with_dparams(&chunk, &dparams).unwrap();
+        let mut allocated_expected = vec![0u8; data.len() - 512];
+        for block_idx in 1..4 {
+            let block_start = block_idx * 512;
+            for i in 0..512 {
+                allocated_expected[(block_idx - 1) * 512 + i] = data[block_start + i] ^ data[i];
+            }
+        }
         assert_eq!(&allocated[..512], &[0; 512]);
-        assert_eq!(&allocated[512..], &data[512..]);
+        assert_eq!(&allocated[512..], &allocated_expected);
     }
 
     #[test]
@@ -10676,6 +11367,46 @@ mod tests {
     }
 
     #[test]
+    fn test_block_encoder_reports_destination_too_small_like_c_blosc_c() {
+        let data: Vec<u8> = (0..128u32)
+            .map(|i| ((i.wrapping_mul(1_103_515_245).wrapping_add(12_345)) >> 16) as u8)
+            .collect();
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 1,
+            blocksize: data.len() as i32,
+            filters: [0; BLOSC2_MAX_FILTERS],
+            nthreads: 1,
+            ..Default::default()
+        };
+        let mut buf1 = Vec::new();
+        let mut buf2 = Vec::new();
+        let mut compress_buf = Vec::new();
+        let mut prefilter_buf = Vec::new();
+
+        assert_eq!(
+            compress_block_with_scratch(
+                &data,
+                &data,
+                0,
+                data.len(),
+                false,
+                &cparams,
+                true,
+                1,
+                &mut buf1,
+                &mut buf2,
+                &mut compress_buf,
+                &mut prefilter_buf,
+                0,
+                Some(4),
+            ),
+            Err("Destination too small")
+        );
+    }
+
+    #[test]
     fn test_bounded_memcpy_last_chance_runs_prefilter_like_c() {
         let data: Vec<u8> = (0..96u32)
             .map(|i| ((i.wrapping_mul(1_103_515_245).wrapping_add(12_345)) >> 16) as u8)
@@ -10987,6 +11718,27 @@ mod tests {
     }
 
     #[test]
+    fn test_all_zero_partial_typesize_chunk_uses_special_zero() {
+        let data = vec![0u8; 4097];
+        let cparams = CParams {
+            compcode: BLOSC_BLOSCLZ,
+            clevel: 1,
+            typesize: 4,
+            blocksize: 0,
+            splitmode: BLOSC_FORWARD_COMPAT_SPLIT,
+            filters: [0, 0, 0, BLOSC_NOFILTER, BLOSC_DELTA, BLOSC_SHUFFLE],
+            nthreads: 1,
+            ..Default::default()
+        };
+
+        let compressed = compress(&data, &cparams).unwrap();
+        let header = ChunkHeader::read(&compressed).unwrap();
+
+        assert_eq!(header.special_type(), BLOSC2_SPECIAL_ZERO);
+        assert_eq!(decompress(&compressed).unwrap(), data);
+    }
+
+    #[test]
     fn test_c_source_write_ordinal_matches_c_buffer_rotation() {
         let mut filters = [BLOSC_NOFILTER; BLOSC2_MAX_FILTERS];
         filters[0] = BLOSC_SHUFFLE;
@@ -11005,6 +11757,47 @@ mod tests {
             ..cparams
         };
         assert_eq!(c_source_write_active_ordinal(&cparams), None);
+    }
+
+    #[test]
+    fn test_dictionary_training_samples_emulate_c_source_alias() {
+        let mut filters = [BLOSC_NOFILTER; BLOSC2_MAX_FILTERS];
+        filters[0] = BLOSC_SHUFFLE;
+        filters[1] = BLOSC_BITSHUFFLE;
+        filters[2] = BLOSC_DELTA;
+        let data: Vec<u8> = (0..4096u32)
+            .flat_map(|i| i.wrapping_mul(37).rotate_left(5).to_le_bytes())
+            .collect();
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 4,
+            blocksize: 1024,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters,
+            use_dict: true,
+            nthreads: 1,
+            ..Default::default()
+        };
+        let blocksize = compute_blocksize(&cparams, data.len() as i32) as usize;
+        let nblocks = data.len().div_ceil(blocksize);
+
+        assert!(c_forward_pipeline_writes_source(&cparams));
+        assert!(
+            filtered_blocks_for_dict(&data, &cparams, blocksize, nblocks, 4, false, true)
+                .unwrap()
+                .len()
+                > 1
+        );
+
+        let safe_cparams = CParams {
+            filters: [0, 0, 0, 0, BLOSC_DELTA, BLOSC_SHUFFLE],
+            ..cparams
+        };
+        let compressed = compress(&data, &safe_cparams).unwrap();
+        let header = ChunkHeader::read(&compressed).unwrap();
+        assert!(header.use_dict());
+        assert_eq!(decompress(&compressed).unwrap(), data);
     }
 
     #[test]
@@ -13933,6 +14726,154 @@ mod tests {
     }
 
     #[test]
+    fn test_zstd_dictionary_falls_back_when_c_sample_size_is_zero() {
+        let data: Vec<u8> = (0..6000u32).map(|i| i as u8).collect();
+        let cparams = CParams {
+            compcode: BLOSC_ZSTD,
+            clevel: 5,
+            typesize: 1,
+            blocksize: 1,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0; BLOSC2_MAX_FILTERS],
+            use_dict: true,
+            ..Default::default()
+        };
+
+        let compressed = compress(&data, &cparams).unwrap();
+        let header = ChunkHeader::read(&compressed).unwrap();
+        assert!(!header.use_dict());
+        assert_eq!(decompress(&compressed).unwrap(), data);
+    }
+
+    #[test]
+    fn test_zstd_low_diversity_dictionary_content_is_capped() {
+        let data = vec![0u8; 200_000];
+        let cparams = CParams {
+            compcode: BLOSC_ZSTD,
+            clevel: 5,
+            typesize: 1,
+            blocksize: 4096,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0; BLOSC2_MAX_FILTERS],
+            use_dict: true,
+            ..Default::default()
+        };
+
+        let compressed = compress(&data, &cparams).unwrap();
+        let header = ChunkHeader::read(&compressed).unwrap();
+        assert!(header.use_dict());
+        let dict = embedded_dictionary(&compressed, &header).unwrap().unwrap();
+        let ddict = zstd_pure_rs::decompress::zstd_ddict::ZSTD_createDDict(dict).unwrap();
+        let content = zstd_pure_rs::decompress::zstd_ddict::ZSTD_DDict_dictContent(&ddict);
+        assert!(content.len() <= 512);
+        assert_eq!(&dict[..4], &ZSTD_MAGIC_DICTIONARY.to_le_bytes());
+        assert_eq!(decompress(&compressed).unwrap(), data);
+    }
+
+    #[test]
+    fn test_zstd_high_diversity_dictionary_content_is_not_capped() {
+        let data: Vec<u8> = (0..200_000u32)
+            .flat_map(|i| {
+                i.wrapping_mul(1_103_515_245)
+                    .rotate_left(i % 17)
+                    .to_le_bytes()
+            })
+            .collect();
+        let cparams = CParams {
+            compcode: BLOSC_ZSTD,
+            clevel: 5,
+            typesize: 1,
+            blocksize: 4096,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [0; BLOSC2_MAX_FILTERS],
+            use_dict: true,
+            ..Default::default()
+        };
+
+        let compressed = compress(&data, &cparams).unwrap();
+        let header = ChunkHeader::read(&compressed).unwrap();
+        assert!(header.use_dict());
+        let dict = embedded_dictionary(&compressed, &header).unwrap().unwrap();
+        assert!(dict.len() > 512);
+        assert!(dict.len() <= BLOSC2_MAXDICTSIZE);
+        assert_eq!(&dict[..4], &ZSTD_MAGIC_DICTIONARY.to_le_bytes());
+        assert_eq!(decompress(&compressed).unwrap(), data);
+    }
+
+    #[test]
+    fn test_zstd_dictionary_training_honors_declared_sample_sizes() {
+        let sample_sizes = [512usize; 8];
+        let mut samples = Vec::new();
+        for idx in 0..sample_sizes.len() {
+            samples.extend(std::iter::repeat_n(0x11 + idx as u8, sample_sizes[idx]));
+        }
+        let trailer = vec![0xfe; 1024];
+        samples.extend_from_slice(&trailer);
+
+        let dict = train_zstd_dict(&samples, 200_000, &sample_sizes).unwrap();
+        assert_eq!(&dict[..4], &ZSTD_MAGIC_DICTIONARY.to_le_bytes());
+        let ddict = zstd_pure_rs::decompress::zstd_ddict::ZSTD_createDDict(&dict).unwrap();
+        let content = zstd_pure_rs::decompress::zstd_ddict::ZSTD_DDict_dictContent(&ddict);
+        assert!(!content.contains(&0xfe));
+    }
+
+    #[test]
+    fn test_zstd_dictionary_uses_default_rep_start_values_like_c() {
+        let samples: Vec<u8> = (0..4096u32)
+            .flat_map(|i| i.wrapping_mul(2654435761).to_le_bytes())
+            .collect();
+        let dict = train_zstd_dict(&samples, 200_000, &[512; 32]).unwrap();
+        let content = zstd_pure_rs::decompress::zstd_ddict::ZSTD_createDDict(&dict).unwrap();
+        let content = zstd_pure_rs::decompress::zstd_ddict::ZSTD_DDict_dictContent(&content);
+        let rep_start = dict.len() - content.len() - 12;
+        assert_eq!(&dict[rep_start..rep_start + 4], &1u32.to_le_bytes());
+        assert_eq!(&dict[rep_start + 4..rep_start + 8], &4u32.to_le_bytes());
+        assert_eq!(&dict[rep_start + 8..rep_start + 12], &8u32.to_le_bytes());
+    }
+
+    #[test]
+    fn test_zstd_finalize_shrinks_content_after_full_content_dict_id_like_c() {
+        let content: Vec<u8> = (0..512u32)
+            .map(|i| i.wrapping_mul(1_103_515_245).rotate_left(i % 11) as u8)
+            .collect();
+        let entropy_samples: Vec<u8> = (0..1024u32)
+            .map(|i| i.wrapping_mul(2_654_435_761).rotate_right(i % 13) as u8)
+            .collect();
+        let sample_sizes = [128usize; 8];
+
+        let dict =
+            build_minimal_zstd_dict(&content, &entropy_samples, &sample_sizes, content.len())
+                .unwrap();
+        assert!(dict.len() <= content.len());
+
+        let random_id = XXH64(&content, 0);
+        let compliant_id = (random_id % ((1u64 << 31) - 32768)) + 32768;
+        assert_eq!(&dict[4..8], &(compliant_id as u32).to_le_bytes());
+
+        let ddict = zstd_pure_rs::decompress::zstd_ddict::ZSTD_createDDict(&dict).unwrap();
+        let emitted_content = zstd_pure_rs::decompress::zstd_ddict::ZSTD_DDict_dictContent(&ddict);
+        assert!(emitted_content.len() < content.len());
+        assert_eq!(emitted_content, &content[..emitted_content.len()]);
+    }
+
+    #[test]
+    fn test_zstd_finalize_uses_original_capacity_for_short_content_like_c() {
+        let content: Vec<u8> = (0..512u32)
+            .map(|i| i.wrapping_mul(747_796_405).rotate_left(i % 7) as u8)
+            .collect();
+        let entropy_samples: Vec<u8> = (0..4096u32)
+            .flat_map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes())
+            .collect();
+        let sample_sizes = [512usize; 32];
+
+        let dict =
+            build_minimal_zstd_dict(&content, &entropy_samples, &sample_sizes, 4096).unwrap();
+        let ddict = zstd_pure_rs::decompress::zstd_ddict::ZSTD_createDDict(&dict).unwrap();
+        let emitted_content = zstd_pure_rs::decompress::zstd_ddict::ZSTD_DDict_dictContent(&ddict);
+        assert_eq!(emitted_content, &content[..]);
+    }
+
+    #[test]
     fn test_vlblocks_roundtrip() {
         let blocks: [&[u8]; 3] = [b"red\0", b"green-green\0", b"blue-blue-blue-blue\0"];
         let cparams = CParams {
@@ -14089,6 +15030,81 @@ mod tests {
             blocks
         );
         assert_eq!(VL_POSTFILTER_OFFSET_SUM.load(AtomicOrdering::SeqCst), 21);
+    }
+
+    #[test]
+    fn test_vl_decompression_paths_share_filter_postfilter_framing() {
+        const FILTER_ID: u8 = BLOSC2_USER_DEFINED_FILTERS_START + 42;
+        let _ = crate::filters::register_filter(
+            FILTER_ID,
+            xor_user_filter_with_offset,
+            xor_user_filter_with_offset,
+        );
+        let blocks: Vec<Vec<u8>> = vec![
+            b"alpha-variable-block".to_vec(),
+            b"b".repeat(71),
+            (0..97u8).map(|value| value.wrapping_mul(13)).collect(),
+        ];
+        let block_refs: Vec<&[u8]> = blocks.iter().map(Vec::as_slice).collect();
+        let cparams = CParams {
+            compcode: BLOSC_LZ4,
+            clevel: 5,
+            typesize: 1,
+            filters: [0, 0, 0, 0, BLOSC_SHUFFLE, FILTER_ID],
+            filters_meta: [0, 0, 0, 0, 0, 0x33],
+            ..Default::default()
+        };
+        let dparams = DParams {
+            postfilter: Some(xor_postfilter),
+            typesize: 1,
+            ..Default::default()
+        };
+        let compressed = vlcompress(&block_refs, &cparams).unwrap();
+
+        let expected_blocks: Vec<Vec<u8>> = blocks
+            .iter()
+            .map(|block| block.iter().map(|byte| byte ^ 0x5a).collect())
+            .collect();
+        let expected_concat: Vec<u8> = expected_blocks.iter().flatten().copied().collect();
+
+        assert_eq!(
+            vldecompress_with_params(&compressed, &dparams).unwrap(),
+            expected_blocks
+        );
+        for (idx, expected) in expected_blocks.iter().enumerate() {
+            assert_eq!(
+                vldecompress_block_with_params(&compressed, idx, &dparams).unwrap(),
+                *expected
+            );
+        }
+        assert_eq!(
+            decompress_with_dparams(&compressed, &dparams).unwrap(),
+            expected_concat
+        );
+        let mut dest = vec![0xa5; expected_concat.len()];
+        assert_eq!(
+            decompress_into_with_dparams(&compressed, &mut dest, &dparams).unwrap(),
+            expected_concat.len()
+        );
+        assert_eq!(dest, expected_concat);
+
+        let masked_dparams = DParams {
+            postfilter: Some(xor_postfilter),
+            block_maskout: Some(vec![false, true, false]),
+            typesize: 1,
+            ..Default::default()
+        };
+        let mut masked_blocks = expected_blocks.clone();
+        masked_blocks[1] = vec![0; blocks[1].len()];
+        assert_eq!(
+            vldecompress_with_params(&compressed, &masked_dparams).unwrap(),
+            masked_blocks
+        );
+        let expected_masked_concat: Vec<u8> = masked_blocks.iter().flatten().copied().collect();
+        assert_eq!(
+            decompress_with_dparams(&compressed, &masked_dparams).unwrap(),
+            expected_masked_concat
+        );
     }
 
     #[test]

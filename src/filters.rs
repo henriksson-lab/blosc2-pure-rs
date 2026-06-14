@@ -1200,22 +1200,27 @@ fn known_global_filter_by_id(filter_id: u8) -> Option<KnownGlobalFilter> {
 fn known_global_filter_descriptor(filter_id: u8) -> Option<UserFilter> {
     let filter = known_global_filter_by_id(filter_id)?;
     let (forward, backward) = match filter.filter_id {
+        #[cfg(feature = "plugin-ndcell")]
         BLOSC_FILTER_NDCELL => (
             UserFilterForward::Context(ndcell_forward_impl),
             UserFilterBackward::Context(ndcell_backward_impl),
         ),
+        #[cfg(feature = "plugin-ndmean")]
         BLOSC_FILTER_NDMEAN => (
             UserFilterForward::Context(ndmean_forward_impl),
             UserFilterBackward::Context(ndmean_backward_impl),
         ),
+        #[cfg(feature = "plugin-bytedelta")]
         BLOSC_FILTER_BYTEDELTA_BUGGY => (
             UserFilterForward::Context(bytedelta_buggy_forward_impl),
             UserFilterBackward::Context(bytedelta_buggy_backward_impl),
         ),
+        #[cfg(feature = "plugin-bytedelta")]
         BLOSC_FILTER_BYTEDELTA => (
             UserFilterForward::Context(bytedelta_forward_impl),
             UserFilterBackward::Context(bytedelta_backward_impl),
         ),
+        #[cfg(feature = "plugin-int-trunc")]
         BLOSC_FILTER_INT_TRUNC => (
             UserFilterForward::Context(int_trunc_context_forward_impl),
             UserFilterBackward::Context(int_trunc_context_backward_impl),
@@ -1231,6 +1236,16 @@ fn known_global_filter_descriptor(filter_id: u8) -> Option<UserFilter> {
         forward,
         backward,
     })
+}
+
+pub fn is_static_global_filter_enabled(filter_id: u8) -> bool {
+    match filter_id {
+        BLOSC_FILTER_NDCELL => cfg!(feature = "plugin-ndcell"),
+        BLOSC_FILTER_NDMEAN => cfg!(feature = "plugin-ndmean"),
+        BLOSC_FILTER_BYTEDELTA_BUGGY | BLOSC_FILTER_BYTEDELTA => cfg!(feature = "plugin-bytedelta"),
+        BLOSC_FILTER_INT_TRUNC => cfg!(feature = "plugin-int-trunc"),
+        _ => false,
+    }
 }
 
 fn ensure_known_global_filters_registered() {

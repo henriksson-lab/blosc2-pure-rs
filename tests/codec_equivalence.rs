@@ -1,9 +1,12 @@
 #![cfg(feature = "_ffi")]
+use blosc2_pure_rs::b2nd::{B2ndArray, B2ndMeta};
 use blosc2_pure_rs::compress::{CParams, DParams};
 use blosc2_pure_rs::constants::*;
 use blosc2_pure_rs::{codecs, compress};
+use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use zstd_pure_rs::decompress::zstd_decompress::ZSTD_MAGIC_DICTIONARY;
 mod common;
 use common::ffi;
 
@@ -33,6 +36,10 @@ static RAW_CODEC_LAST_ENCODER_OUTPUT_LEN: AtomicI32 = AtomicI32::new(i32::MIN);
 static RAW_CODEC_LAST_DECODER_INPUT_LEN: AtomicI32 = AtomicI32::new(i32::MIN);
 static RAW_CODEC_LAST_DECODER_OUTPUT_LEN: AtomicI32 = AtomicI32::new(i32::MIN);
 static CODEC_REGISTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+unsafe extern "C" {
+    fn free(ptr: *mut c_void);
+}
 
 fn user_codec_encoder(clevel: u8, meta: u8, src: &[u8], dest: &mut [u8]) -> i32 {
     if dest.len() < src.len() {
@@ -268,6 +275,118 @@ fn c_decompress_chunk(chunk: &[u8], nbytes: usize, context: &str) -> Vec<u8> {
     decoded
 }
 
+fn zfp_b2nd_fixture_data() -> Vec<u8> {
+    (0..16)
+        .flat_map(|i| {
+            let x = i as f32;
+            (x.sin() * 3.25 + x * 0.125 + 1.0).to_ne_bytes()
+        })
+        .collect()
+}
+
+fn zfp_b2nd_meta() -> B2ndMeta {
+    B2ndMeta::new(vec![4, 4], vec![4, 4], vec![4, 4], "<f4", 0).unwrap()
+}
+
+fn rust_b2nd_zfp_array(compcode: u8, meta: u8, data: &[u8]) -> B2ndArray {
+    B2ndArray::from_cbuffer(
+        zfp_b2nd_meta(),
+        data,
+        CParams {
+            compcode,
+            compcode_meta: meta,
+            clevel: 5,
+            typesize: 4,
+            splitmode: BLOSC_NEVER_SPLIT,
+            filters: [BLOSC_NOFILTER; BLOSC2_MAX_FILTERS],
+            nthreads: 1,
+            ..Default::default()
+        },
+        DParams {
+            typesize: 4,
+            nthreads: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+fn c_b2nd_zfp_dense_and_chunks(compcode: u8, meta: u8, data: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
+    unsafe {
+        let mut cparams = ffi::blosc2_get_blosc2_cparams_defaults();
+        cparams.compcode = compcode;
+        cparams.compcode_meta = meta;
+        cparams.clevel = 5;
+        cparams.typesize = 4;
+        cparams.nthreads = 1;
+        cparams.splitmode = BLOSC_NEVER_SPLIT;
+        cparams.filters = [BLOSC_NOFILTER; BLOSC2_MAX_FILTERS];
+
+        let mut dparams = ffi::blosc2_get_blosc2_dparams_defaults();
+        dparams.nthreads = 1;
+        dparams.typesize = 4;
+
+        let mut storage: ffi::blosc2_storage = std::mem::zeroed();
+        storage.contiguous = true;
+        storage.cparams = &mut cparams;
+        storage.dparams = &mut dparams;
+
+        let shape = [4i64, 4];
+        let chunkshape = [4i32, 4];
+        let blockshape = [4i32, 4];
+        let dtype = CString::new("<f4").unwrap();
+        let ctx = ffi::b2nd_create_ctx(
+            &storage,
+            2,
+            shape.as_ptr(),
+            chunkshape.as_ptr(),
+            blockshape.as_ptr(),
+            dtype.as_ptr(),
+            ffi::DTYPE_NUMPY_FORMAT as i8,
+            std::ptr::null(),
+            0,
+        );
+        assert!(!ctx.is_null(), "C b2nd_create_ctx failed for ZFP");
+
+        let mut array: *mut ffi::b2nd_array_t = std::ptr::null_mut();
+        let rc = ffi::b2nd_from_cbuffer(ctx, &mut array, data.as_ptr().cast(), data.len() as i64);
+        assert_eq!(rc, 0, "C b2nd_from_cbuffer failed for ZFP: {rc}");
+        assert!(!array.is_null(), "C b2nd_from_cbuffer returned NULL array");
+
+        let mut dense = vec![0; data.len()];
+        let rc = ffi::b2nd_to_cbuffer(array, dense.as_mut_ptr().cast(), dense.len() as i64);
+        assert_eq!(rc, 0, "C b2nd_to_cbuffer failed for ZFP: {rc}");
+
+        let schunk = (*array).sc;
+        assert!(!schunk.is_null(), "C B2ND array has NULL schunk");
+        let nchunks = (*schunk).nchunks;
+        assert!(nchunks > 0, "C B2ND ZFP array has no chunks");
+        let mut chunks = Vec::new();
+        for nchunk in 0..nchunks {
+            let mut chunk_ptr: *mut u8 = std::ptr::null_mut();
+            let mut needs_free = false;
+            let cbytes =
+                ffi::blosc2_schunk_get_chunk(schunk, nchunk, &mut chunk_ptr, &mut needs_free);
+            assert!(
+                cbytes > 0,
+                "C get_chunk failed for chunk {nchunk}: {cbytes}"
+            );
+            assert!(
+                !chunk_ptr.is_null(),
+                "C get_chunk returned NULL for chunk {nchunk}"
+            );
+            chunks.push(std::slice::from_raw_parts(chunk_ptr, cbytes as usize).to_vec());
+            if needs_free {
+                free(chunk_ptr.cast());
+            }
+        }
+
+        assert_eq!(ffi::b2nd_free(array), 0);
+        assert_eq!(ffi::b2nd_free_ctx(ctx), 0);
+        (dense, chunks)
+    }
+}
+
 fn assert_dictionary_chunk(chunk: &[u8], context: &str) {
     assert!(
         chunk.len() > BLOSC2_CHUNK_BLOSC2_FLAGS,
@@ -278,6 +397,17 @@ fn assert_dictionary_chunk(chunk: &[u8], context: &str) {
         0,
         "{context} must carry the C usedict chunk flag"
     );
+}
+
+fn embedded_dict_bytes(chunk: &[u8]) -> Vec<u8> {
+    let (nbytes, _cbytes, blocksize) = compress::cbuffer_sizes(chunk).unwrap();
+    let nblocks = nbytes.div_ceil(blocksize);
+    let dict_size_pos = BLOSC_EXTENDED_HEADER_LENGTH + nblocks * 4;
+    let dict_size = i32::from_le_bytes(chunk[dict_size_pos..dict_size_pos + 4].try_into().unwrap());
+    assert!(dict_size > 0, "dictionary size must be positive");
+    let dict_start = dict_size_pos + 4;
+    let dict_end = dict_start + dict_size as usize;
+    chunk[dict_start..dict_end].to_vec()
 }
 
 fn assert_udcodec_header(chunk: &[u8], compcode: u8, compcode_meta: u8, context: &str) {
@@ -454,7 +584,7 @@ fn test_ndlz_c_plugin_sentinel_error_fixtures() {
 }
 
 #[test]
-fn test_zfp_c_plugin_modes_are_explicitly_unsupported_until_codec_abi_exists() {
+fn test_zfp_plugin_modes_require_b2nd_context_metadata() {
     let _b = init_blosc2();
 
     for (compcode, compcode_meta) in [
@@ -472,11 +602,53 @@ fn test_zfp_c_plugin_modes_are_explicitly_unsupported_until_codec_abi_exists() {
         };
 
         assert!(compress::blosc2_create_cctx(cparams.clone()).is_ok());
+        let input: Vec<u8> = (0..32)
+            .flat_map(|i| ((i as f32) * 0.5 + 1.0).to_ne_bytes())
+            .collect();
         assert_eq!(
-            compress::compress(&[0u8; 128], &cparams).unwrap_err(),
-            "ZFP plugin codecs are not supported",
-            "ZFP compcode={compcode} compression must fail before writing data"
+            compress::compress(&input, &cparams).unwrap_err(),
+            "Codec compression failed",
+            "ZFP compcode={compcode} compression must require b2nd metadata"
         );
+    }
+}
+
+#[test]
+fn test_zfp_b2nd_static_codec_matches_c_plugin_fixture() {
+    let _b = init_blosc2();
+    let data = zfp_b2nd_fixture_data();
+
+    for (compcode, compcode_meta) in [
+        (BLOSC_CODEC_ZFP_FIXED_ACCURACY, (-2i8) as u8),
+        (BLOSC_CODEC_ZFP_FIXED_PRECISION, 25),
+        (BLOSC_CODEC_ZFP_FIXED_RATE, 45),
+    ] {
+        let rust_array = rust_b2nd_zfp_array(compcode, compcode_meta, &data);
+        let rust_dense = rust_array.to_cbuffer().unwrap();
+        let rust_chunks = rust_array.schunk.chunks.clone();
+        let (c_dense, c_chunks) = c_b2nd_zfp_dense_and_chunks(compcode, compcode_meta, &data);
+
+        assert_eq!(
+            rust_dense, c_dense,
+            "ZFP decoded dense buffer mismatch for compcode={compcode} meta={compcode_meta}"
+        );
+        assert_eq!(
+            rust_chunks.len(),
+            c_chunks.len(),
+            "ZFP chunk count mismatch for compcode={compcode} meta={compcode_meta}"
+        );
+        for (idx, (rust_chunk, c_chunk)) in rust_chunks.iter().zip(c_chunks.iter()).enumerate() {
+            assert_eq!(
+                rust_chunk.len(),
+                c_chunk.len(),
+                "ZFP compressed chunk size mismatch for compcode={compcode} meta={compcode_meta} chunk={idx}"
+            );
+            assert_eq!(
+                rust_chunk,
+                c_chunk,
+                "ZFP compressed chunk bytes mismatch for compcode={compcode} meta={compcode_meta} chunk={idx}"
+            );
+        }
     }
 }
 
@@ -539,6 +711,72 @@ fn test_dictionary_codecs_rust_compress_c_and_rust_decompress_parity() {
         );
         assert_eq!(c_decoded, data, "Rust→C dict mismatch for codec={compcode}");
     }
+}
+
+#[test]
+fn test_zstd_dictionary_training_gap_is_explicit() {
+    let _b = init_blosc2();
+    let data = dictionary_fixture_data();
+    let c_chunk = c_compress_chunk(&data, BLOSC_ZSTD, true);
+    let cparams = CParams {
+        compcode: BLOSC_ZSTD,
+        clevel: 5,
+        typesize: 4,
+        blocksize: 4096,
+        splitmode: BLOSC_NEVER_SPLIT,
+        filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+        use_dict: true,
+        ..Default::default()
+    };
+    let rust_chunk = compress::compress(&data, &cparams).unwrap();
+
+    assert_dictionary_chunk(&c_chunk, "C Zstd dict");
+    assert_dictionary_chunk(&rust_chunk, "Rust Zstd dict");
+    assert_eq!(compress::decompress(&c_chunk).unwrap(), data);
+    assert_eq!(
+        c_decompress_chunk(&rust_chunk, data.len(), "Rust Zstd dict"),
+        data
+    );
+
+    let c_dict = embedded_dict_bytes(&c_chunk);
+    let rust_dict = embedded_dict_bytes(&rust_chunk);
+    assert_ne!(
+        rust_dict, c_dict,
+        "Rust still uses an independent pure-Rust dictionary trainer; this should become equal once ZDICT fastCover training is ported byte-for-byte"
+    );
+    assert_eq!(&c_dict[..4], &ZSTD_MAGIC_DICTIONARY.to_le_bytes());
+    assert_eq!(&rust_dict[..4], &ZSTD_MAGIC_DICTIONARY.to_le_bytes());
+}
+
+#[test]
+fn test_zstd_low_diversity_dictionary_use_matches_c() {
+    let _b = init_blosc2();
+    let data: Vec<u8> = (0..200_000usize)
+        .map(|idx| [0x11, 0x22, 0x33, 0x44][idx % 4])
+        .collect();
+    let c_chunk = c_compress_chunk(&data, BLOSC_ZSTD, true);
+    let cparams = CParams {
+        compcode: BLOSC_ZSTD,
+        clevel: 5,
+        typesize: 4,
+        blocksize: 4096,
+        splitmode: BLOSC_NEVER_SPLIT,
+        filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
+        use_dict: true,
+        ..Default::default()
+    };
+    let rust_chunk = compress::compress(&data, &cparams).unwrap();
+
+    assert_eq!(
+        c_chunk[BLOSC2_CHUNK_BLOSC2_FLAGS] & BLOSC2_USEDICT,
+        rust_chunk[BLOSC2_CHUNK_BLOSC2_FLAGS] & BLOSC2_USEDICT,
+        "low-diversity Zstd dictionary fallback must match C use_dict flag"
+    );
+    assert_eq!(compress::decompress(&c_chunk).unwrap(), data);
+    assert_eq!(
+        c_decompress_chunk(&rust_chunk, data.len(), "Rust low-diversity Zstd"),
+        data
+    );
 }
 
 #[test]
