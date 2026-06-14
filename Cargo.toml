@@ -26,18 +26,12 @@ include = [
     "/Cargo.toml",
     "/README.md",
     "/LICENSE.txt",
-    "/c-blosc2/CMakeLists.txt",
-    "/c-blosc2/Blosc2Config.cmake.in",
-    "/c-blosc2/blosc2.pc.in",
-    "/c-blosc2/cmake_uninstall.cmake.in",
+    # Only the vendored zstd that build.rs compiles for byte-identical dictionary
+    # training ships in the crate. The original C-Blosc2 source (blosc/, plugins/,
+    # include/, cmake) is for the internal `_ffi` test feature only and is not shipped.
     "/c-blosc2/LICENSE.txt",
-    "/c-blosc2/README.rst",
     "/c-blosc2/LICENSES/**",
-    "/c-blosc2/blosc/**",
-    "/c-blosc2/cmake/**",
-    "/c-blosc2/include/**",
-    "/c-blosc2/internal-complibs/**",
-    "/c-blosc2/plugins/**",
+    "/c-blosc2/internal-complibs/zstd-1.5.7/**",
 ]
 
 [lib]
