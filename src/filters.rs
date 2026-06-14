@@ -743,7 +743,7 @@ fn ndcell_copy_backward(
     (ip == src.len() && final_ind + final_last_dim == src.len() / typesize).then_some(())
 }
 
-fn ndcell_forward_impl(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
+fn apply_ndcell_filter(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
     let Some((b2nd, cellshape, index_shape)) =
         ndcell_layout(ctx.meta, ctx.typesize, src.len(), ctx.b2nd_metalayer, false)
     else {
@@ -754,7 +754,7 @@ fn ndcell_forward_impl(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &m
         .unwrap_or(BLOSC2_ERROR_FAILURE)
 }
 
-fn ndcell_backward_impl(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
+fn undo_ndcell_filter(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
     let Some((b2nd, cellshape, index_shape)) =
         ndcell_layout(ctx.meta, ctx.typesize, src.len(), ctx.b2nd_metalayer, false)
     else {
@@ -765,7 +765,7 @@ fn ndcell_backward_impl(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &
         .unwrap_or(BLOSC2_ERROR_FAILURE)
 }
 
-fn ndmean_forward_impl(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
+fn apply_ndmean_filter(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
     if !matches!(ctx.typesize, 4 | 8) {
         return BLOSC2_ERROR_FAILURE;
     }
@@ -895,7 +895,7 @@ fn ndmean_forward_impl(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &m
     }
 }
 
-fn ndmean_backward_impl(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
+fn undo_ndmean_filter(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
     let Some((b2nd, cellshape, index_shape)) =
         ndcell_layout(ctx.meta, ctx.typesize, src.len(), ctx.b2nd_metalayer, true)
     else {
@@ -962,18 +962,14 @@ fn bytedelta_backward_core(typesize: usize, src: &[u8], dest: &mut [u8]) -> i32 
     0
 }
 
-fn bytedelta_forward_impl(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
+fn apply_bytedelta_filter(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
     let Some(typesize) = bytedelta_context_typesize(ctx) else {
         return BLOSC2_ERROR_FAILURE;
     };
     bytedelta_forward_core(typesize, src, dest)
 }
 
-fn bytedelta_backward_impl(
-    ctx: &mut FilterCallbackContext<'_>,
-    src: &[u8],
-    dest: &mut [u8],
-) -> i32 {
+fn undo_bytedelta_filter(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
     let Some(typesize) = bytedelta_context_typesize(ctx) else {
         return BLOSC2_ERROR_FAILURE;
     };
@@ -1163,11 +1159,7 @@ fn int_trunc_forward_core(meta: u8, typesize: usize, src: &[u8], dest: &mut [u8]
     0
 }
 
-fn int_trunc_context_forward_impl(
-    ctx: &mut FilterCallbackContext<'_>,
-    src: &[u8],
-    dest: &mut [u8],
-) -> i32 {
+fn apply_int_trunc_filter(ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
     let typesize = ctx
         .cparams
         .and_then(|cparams| usize::try_from(cparams.typesize).ok())
@@ -1178,11 +1170,7 @@ fn int_trunc_context_forward_impl(
     }
 }
 
-fn int_trunc_context_backward_impl(
-    _ctx: &mut FilterCallbackContext<'_>,
-    src: &[u8],
-    dest: &mut [u8],
-) -> i32 {
+fn undo_int_trunc_filter(_ctx: &mut FilterCallbackContext<'_>, src: &[u8], dest: &mut [u8]) -> i32 {
     if dest.len() < src.len() {
         return BLOSC2_ERROR_FAILURE;
     }
@@ -1202,13 +1190,13 @@ fn known_global_filter_descriptor(filter_id: u8) -> Option<UserFilter> {
     let (forward, backward) = match filter.filter_id {
         #[cfg(feature = "plugin-ndcell")]
         BLOSC_FILTER_NDCELL => (
-            UserFilterForward::Context(ndcell_forward_impl),
-            UserFilterBackward::Context(ndcell_backward_impl),
+            UserFilterForward::Context(apply_ndcell_filter),
+            UserFilterBackward::Context(undo_ndcell_filter),
         ),
         #[cfg(feature = "plugin-ndmean")]
         BLOSC_FILTER_NDMEAN => (
-            UserFilterForward::Context(ndmean_forward_impl),
-            UserFilterBackward::Context(ndmean_backward_impl),
+            UserFilterForward::Context(apply_ndmean_filter),
+            UserFilterBackward::Context(undo_ndmean_filter),
         ),
         #[cfg(feature = "plugin-bytedelta")]
         BLOSC_FILTER_BYTEDELTA_BUGGY => (
@@ -1217,13 +1205,13 @@ fn known_global_filter_descriptor(filter_id: u8) -> Option<UserFilter> {
         ),
         #[cfg(feature = "plugin-bytedelta")]
         BLOSC_FILTER_BYTEDELTA => (
-            UserFilterForward::Context(bytedelta_forward_impl),
-            UserFilterBackward::Context(bytedelta_backward_impl),
+            UserFilterForward::Context(apply_bytedelta_filter),
+            UserFilterBackward::Context(undo_bytedelta_filter),
         ),
         #[cfg(feature = "plugin-int-trunc")]
         BLOSC_FILTER_INT_TRUNC => (
-            UserFilterForward::Context(int_trunc_context_forward_impl),
-            UserFilterBackward::Context(int_trunc_context_backward_impl),
+            UserFilterForward::Context(apply_int_trunc_filter),
+            UserFilterBackward::Context(undo_int_trunc_filter),
         ),
         _ => (
             UserFilterForward::Fallible(unsupported_known_global_filter),
@@ -3355,7 +3343,7 @@ pub struct FilterPipelineContext<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn pipeline_forward(
+pub fn apply_filter_pipeline_for_compression(
     src: &[u8],
     buf1: &mut [u8],
     buf2: &mut [u8],
@@ -3365,7 +3353,7 @@ pub fn pipeline_forward(
     block_offset: usize,
     dref: Option<&[u8]>,
 ) -> usize {
-    pipeline_forward_with_context(
+    apply_filter_pipeline_for_compression_with_context(
         src,
         buf1,
         buf2,
@@ -3380,7 +3368,7 @@ pub fn pipeline_forward(
 
 /// Apply the configured filter pipeline in encode order with plugin context.
 #[allow(clippy::too_many_arguments)]
-pub fn pipeline_forward_with_context(
+pub fn apply_filter_pipeline_for_compression_with_context(
     src: &[u8],
     buf1: &mut [u8],
     buf2: &mut [u8],
@@ -3411,7 +3399,7 @@ pub fn pipeline_forward_with_context(
     });
 
     // Track current data location: 0 = src (read-only), 1 = buf1, 2 = buf2.
-    // Match C's pipeline_forward: first active filter writes to dest (buf1),
+    // Match C's apply_filter_pipeline_for_compression: first active filter writes to dest (buf1),
     // then the destination cycles through the temporary buffer.
     let mut current = 0u8;
 
@@ -3546,7 +3534,7 @@ pub fn pipeline_forward_with_context(
 ///
 /// Returns the index (1 or 2) of the buffer holding the decoded output.
 #[allow(clippy::too_many_arguments)]
-pub fn pipeline_backward(
+pub fn apply_filter_pipeline_for_decompression(
     buf1: &mut [u8],
     buf2: &mut [u8],
     bsize: usize,
@@ -3558,7 +3546,7 @@ pub fn pipeline_backward(
     dref: Option<&[u8]>,
     current_buf: usize,
 ) -> usize {
-    pipeline_backward_with_context(
+    apply_filter_pipeline_for_decompression_with_context(
         buf1,
         buf2,
         bsize,
@@ -3575,7 +3563,7 @@ pub fn pipeline_backward(
 
 /// Apply the configured filter pipeline in decode order with plugin context.
 #[allow(clippy::too_many_arguments)]
-pub fn pipeline_backward_with_context(
+pub fn apply_filter_pipeline_for_decompression_with_context(
     buf1: &mut [u8],
     buf2: &mut [u8],
     bsize: usize,
@@ -4301,7 +4289,7 @@ mod tests {
 
         let mut encoded = vec![0u8; src.len()];
         let mut scratch = vec![0u8; src.len()];
-        let current = pipeline_forward_with_context(
+        let current = apply_filter_pipeline_for_compression_with_context(
             &src,
             &mut encoded,
             &mut scratch,
@@ -4324,7 +4312,7 @@ mod tests {
         assert_eq!(encoded, expected_encoded);
 
         let mut decoded_scratch = vec![0u8; src.len()];
-        let current = pipeline_backward_with_context(
+        let current = apply_filter_pipeline_for_decompression_with_context(
             &mut encoded,
             &mut decoded_scratch,
             src.len(),
@@ -4406,7 +4394,7 @@ mod tests {
 
         let mut encoded = vec![0u8; src.len()];
         let mut scratch = vec![0u8; src.len()];
-        let current = pipeline_forward(
+        let current = apply_filter_pipeline_for_compression(
             &src,
             &mut encoded,
             &mut scratch,
@@ -4422,7 +4410,7 @@ mod tests {
         assert_eq!(encoded, expected_encoded);
 
         let mut decoded_scratch = vec![0u8; src.len()];
-        let current = pipeline_backward(
+        let current = apply_filter_pipeline_for_decompression(
             &mut encoded,
             &mut decoded_scratch,
             src.len(),
@@ -4487,7 +4475,7 @@ mod tests {
         let filters_meta = [0; BLOSC2_MAX_FILTERS];
         filters[BLOSC2_MAX_FILTERS - 1] = NULL_CALLBACK_ID;
         assert_eq!(
-            pipeline_forward(
+            apply_filter_pipeline_for_compression(
                 &src,
                 &mut encoded,
                 &mut scratch,
@@ -4501,7 +4489,7 @@ mod tests {
         );
         encoded.copy_from_slice(&src);
         assert_eq!(
-            pipeline_backward(
+            apply_filter_pipeline_for_decompression(
                 &mut encoded,
                 &mut scratch,
                 src.len(),
@@ -4595,11 +4583,7 @@ mod tests {
             Err("User-defined filter IDs must be >= 160")
         );
         assert_eq!(
-            register_context_filter(
-                BLOSC_FILTER_NDCELL,
-                ndmean_forward_impl,
-                ndmean_backward_impl
-            ),
+            register_context_filter(BLOSC_FILTER_NDCELL, apply_ndmean_filter, undo_ndmean_filter),
             Err("User-defined filter IDs must be >= 160")
         );
 
@@ -4620,8 +4604,8 @@ mod tests {
             register_named_global_context_filter(
                 BLOSC_FILTER_NDCELL,
                 "other-ndcell",
-                ndcell_forward_impl,
-                ndcell_backward_impl
+                apply_ndcell_filter,
+                undo_ndcell_filter
             ),
             Err("Global plugin filter ID already registered")
         );
@@ -4673,8 +4657,8 @@ mod tests {
         assert_eq!(
             register_global_context_filter(
                 BLOSC_FILTER_NDCELL,
-                ndmean_forward_impl,
-                ndmean_backward_impl
+                apply_ndmean_filter,
+                undo_ndmean_filter
             ),
             Err("Global plugin filter ID already registered")
         );
@@ -4682,8 +4666,8 @@ mod tests {
             register_named_global_context_filter(
                 BLOSC_FILTER_NDCELL,
                 "ndcell",
-                ndmean_forward_impl,
-                ndmean_backward_impl
+                apply_ndmean_filter,
+                undo_ndmean_filter
             ),
             Ok(())
         );
@@ -4693,8 +4677,8 @@ mod tests {
                 BLOSC_FILTER_NDCELL,
                 "ndcell",
                 1,
-                ndcell_forward_impl,
-                ndcell_backward_impl
+                apply_ndcell_filter,
+                undo_ndcell_filter
             ),
             Ok(())
         );
@@ -4720,7 +4704,7 @@ mod tests {
             let mut buf1 = vec![0u8; src.len()];
             let mut buf2 = vec![0u8; src.len()];
             assert_eq!(
-                pipeline_forward(
+                apply_filter_pipeline_for_compression(
                     &src,
                     &mut buf1,
                     &mut buf2,
@@ -4771,11 +4755,11 @@ mod tests {
             assert!(ndcell_layout(meta, 1, src.len(), Some(&b2nd_meta), false).is_none());
             ctx.meta = meta;
             assert_eq!(
-                ndcell_forward_impl(&mut ctx, &src, &mut dest),
+                apply_ndcell_filter(&mut ctx, &src, &mut dest),
                 BLOSC2_ERROR_FAILURE
             );
             assert_eq!(
-                ndcell_backward_impl(&mut ctx, &src, &mut dest),
+                undo_ndcell_filter(&mut ctx, &src, &mut dest),
                 BLOSC2_ERROR_FAILURE
             );
         }
@@ -4792,11 +4776,11 @@ mod tests {
         for meta in [0, 0x80, 0xff] {
             ctx.meta = meta;
             assert_eq!(
-                ndmean_forward_impl(&mut ctx, &src_f32, &mut dest_f32),
+                apply_ndmean_filter(&mut ctx, &src_f32, &mut dest_f32),
                 BLOSC2_ERROR_FAILURE
             );
             assert_eq!(
-                ndmean_backward_impl(&mut ctx, &src_f32, &mut dest_f32),
+                undo_ndmean_filter(&mut ctx, &src_f32, &mut dest_f32),
                 BLOSC2_ERROR_FAILURE
             );
         }
@@ -4812,7 +4796,7 @@ mod tests {
         filters_meta[BLOSC2_MAX_FILTERS - 1] = 4;
         let mut encoded = vec![0u8; src.len()];
         let mut scratch = vec![0u8; src.len()];
-        let current = pipeline_forward(
+        let current = apply_filter_pipeline_for_compression(
             &src,
             &mut encoded,
             &mut scratch,
@@ -4828,7 +4812,7 @@ mod tests {
 
         let mut decoded = encoded.clone();
         let mut scratch = vec![0u8; src.len()];
-        let current = pipeline_backward(
+        let current = apply_filter_pipeline_for_decompression(
             &mut decoded,
             &mut scratch,
             src.len(),
@@ -4894,7 +4878,7 @@ mod tests {
         };
         let mut encoded = vec![0u8; src.len()];
         let mut scratch = vec![0u8; src.len()];
-        let current = pipeline_forward_with_context(
+        let current = apply_filter_pipeline_for_compression_with_context(
             &src,
             &mut encoded,
             &mut scratch,
@@ -4909,7 +4893,7 @@ mod tests {
         let mut encoded = if current == 1 { encoded } else { scratch };
 
         let mut decoded_scratch = vec![0u8; src.len()];
-        let current = pipeline_backward_with_context(
+        let current = apply_filter_pipeline_for_decompression_with_context(
             &mut encoded,
             &mut decoded_scratch,
             src.len(),
@@ -4936,7 +4920,7 @@ mod tests {
         };
         assert_eq!(decoded, src);
 
-        let missing_context = pipeline_forward(
+        let missing_context = apply_filter_pipeline_for_compression(
             &src,
             &mut vec![0u8; src.len()],
             &mut vec![0u8; src.len()],
@@ -4961,7 +4945,7 @@ mod tests {
         };
         let mut dest = vec![0u8; src.len()];
         for forward in [
-            bytedelta_forward_impl as ContextFilterForwardFn,
+            apply_bytedelta_filter as ContextFilterForwardFn,
             bytedelta_buggy_forward_impl,
         ] {
             assert_eq!(forward(&mut ctx, &src, &mut dest), BLOSC2_ERROR_FAILURE);
@@ -4970,7 +4954,7 @@ mod tests {
         ctx.cparams = None;
         ctx.dparams = Some(&dparams);
         for backward in [
-            bytedelta_backward_impl as ContextFilterBackwardFn,
+            undo_bytedelta_filter as ContextFilterBackwardFn,
             bytedelta_buggy_backward_impl,
         ] {
             assert_eq!(backward(&mut ctx, &src, &mut dest), BLOSC2_ERROR_FAILURE);
@@ -4979,10 +4963,10 @@ mod tests {
         ctx.chunk.schunk = 0x2000;
         ctx.cparams = None;
         ctx.dparams = None;
-        assert_eq!(bytedelta_forward_impl(&mut ctx, &src, &mut dest), 0);
+        assert_eq!(apply_bytedelta_filter(&mut ctx, &src, &mut dest), 0);
         assert_ne!(dest, src);
         let mut decoded = vec![0u8; src.len()];
-        assert_eq!(bytedelta_backward_impl(&mut ctx, &dest, &mut decoded), 0);
+        assert_eq!(undo_bytedelta_filter(&mut ctx, &dest, &mut decoded), 0);
         assert_eq!(decoded, src);
         assert_eq!(bytedelta_buggy_forward_impl(&mut ctx, &src, &mut dest), 0);
     }
@@ -4997,7 +4981,7 @@ mod tests {
         let mut encoded = vec![0u8; src.len()];
         let mut scratch = vec![0u8; src.len()];
 
-        let current = pipeline_forward(
+        let current = apply_filter_pipeline_for_compression(
             &src,
             &mut encoded,
             &mut scratch,
@@ -5011,7 +4995,7 @@ mod tests {
 
         let mut decoded = src.clone();
         let mut decode_scratch = vec![0u8; src.len()];
-        let current = pipeline_backward(
+        let current = apply_filter_pipeline_for_decompression(
             &mut decoded,
             &mut decode_scratch,
             src.len(),
@@ -5026,7 +5010,7 @@ mod tests {
         assert_eq!(current, 0);
 
         assert_eq!(
-            pipeline_forward(
+            apply_filter_pipeline_for_compression(
                 &src,
                 &mut encoded,
                 &mut scratch,
@@ -5041,7 +5025,7 @@ mod tests {
 
         filters_meta[BLOSC2_MAX_FILTERS - 1] = 4;
         let src_with_tail = &src[..src.len() - 1];
-        let current = pipeline_forward(
+        let current = apply_filter_pipeline_for_compression(
             src_with_tail,
             &mut encoded[..src_with_tail.len()],
             &mut scratch[..src_with_tail.len()],
@@ -5061,7 +5045,7 @@ mod tests {
 
         let mut decoded = encoded.to_vec();
         let mut scratch = vec![0u8; src_with_tail.len()];
-        let current = pipeline_backward(
+        let current = apply_filter_pipeline_for_decompression(
             &mut decoded,
             &mut scratch,
             src_with_tail.len(),
@@ -5086,7 +5070,7 @@ mod tests {
         filters_meta[BLOSC2_MAX_FILTERS - 1] = 2;
         let mut encoded = vec![0u8; src.len()];
         let mut scratch = vec![0u8; src.len()];
-        let current = pipeline_forward(
+        let current = apply_filter_pipeline_for_compression(
             &src,
             &mut encoded,
             &mut scratch,
@@ -5120,7 +5104,7 @@ mod tests {
 
         let mut decoded = encoded.clone();
         let mut scratch = vec![0u8; src.len()];
-        let current = pipeline_backward(
+        let current = apply_filter_pipeline_for_decompression(
             &mut decoded,
             &mut scratch,
             src.len(),
@@ -5214,7 +5198,7 @@ mod tests {
         filters_meta[BLOSC2_MAX_FILTERS - 1] = 20;
         let mut encoded = vec![0u8; src.len()];
         let mut scratch = vec![0u8; src.len()];
-        let current = pipeline_forward(
+        let current = apply_filter_pipeline_for_compression(
             &src,
             &mut encoded,
             &mut scratch,
@@ -5235,7 +5219,7 @@ mod tests {
 
         let mut decoded = encoded.clone();
         let mut scratch = vec![0u8; src.len()];
-        let current = pipeline_backward(
+        let current = apply_filter_pipeline_for_decompression(
             &mut decoded,
             &mut scratch,
             src.len(),
@@ -5254,7 +5238,7 @@ mod tests {
         let src_with_tail = [&src[..], &[0xAA, 0xBB][..]].concat();
         let mut encoded = vec![0xA5u8; src_with_tail.len()];
         let mut scratch = vec![0x5Au8; src_with_tail.len()];
-        let current = pipeline_forward(
+        let current = apply_filter_pipeline_for_compression(
             &src_with_tail,
             &mut encoded,
             &mut scratch,
@@ -5270,7 +5254,7 @@ mod tests {
 
         let mut decoded = encoded.clone();
         let mut scratch = vec![0x5Au8; src_with_tail.len()];
-        let current = pipeline_backward(
+        let current = apply_filter_pipeline_for_decompression(
             &mut decoded,
             &mut scratch,
             src_with_tail.len(),
@@ -5330,7 +5314,7 @@ mod tests {
         let mut encoded = vec![0u8; src.len()];
         let mut scratch = vec![0u8; src.len()];
 
-        let current = pipeline_forward_with_context(
+        let current = apply_filter_pipeline_for_compression_with_context(
             &src,
             &mut encoded,
             &mut scratch,
@@ -5373,12 +5357,12 @@ mod tests {
         };
         let mut bad_dest = vec![0u8; src.len()];
         assert_eq!(
-            int_trunc_context_forward_impl(&mut bad_ctx, &src, &mut bad_dest),
+            apply_int_trunc_filter(&mut bad_ctx, &src, &mut bad_dest),
             BLOSC2_ERROR_FAILURE
         );
         let mut short_dest = vec![0u8; src.len() - 1];
         assert_eq!(
-            int_trunc_context_backward_impl(&mut bad_ctx, &src, &mut short_dest),
+            undo_int_trunc_filter(&mut bad_ctx, &src, &mut short_dest),
             BLOSC2_ERROR_FAILURE
         );
     }
@@ -5501,14 +5485,18 @@ mod tests {
 
         filters[BLOSC2_MAX_FILTERS - 1] = FORWARD_FAIL_ID;
         assert_eq!(
-            pipeline_forward(&src, &mut buf1, &mut buf2, &filters, &meta, 1, 0, None),
+            apply_filter_pipeline_for_compression(
+                &src, &mut buf1, &mut buf2, &filters, &meta, 1, 0, None
+            ),
             0
         );
 
         filters[BLOSC2_MAX_FILTERS - 1] = BACKWARD_FAIL_ID;
         buf1.copy_from_slice(&src);
         assert_eq!(
-            pipeline_backward(&mut buf1, &mut buf2, 4, &filters, &meta, 1, 1, 0, None, 1),
+            apply_filter_pipeline_for_decompression(
+                &mut buf1, &mut buf2, 4, &filters, &meta, 1, 1, 0, None, 1
+            ),
             0
         );
     }
@@ -5523,7 +5511,9 @@ mod tests {
 
         filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_LAST_FILTER;
         assert_eq!(
-            pipeline_forward(&src, &mut buf1, &mut buf2, &filters, &meta, 1, 0, None),
+            apply_filter_pipeline_for_compression(
+                &src, &mut buf1, &mut buf2, &filters, &meta, 1, 0, None
+            ),
             0
         );
     }
@@ -5538,7 +5528,7 @@ mod tests {
         filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_BITSHUFFLE;
 
         assert_eq!(
-            pipeline_forward(
+            apply_filter_pipeline_for_compression(
                 &src,
                 &mut buf1,
                 &mut buf2,
@@ -5562,7 +5552,7 @@ mod tests {
         filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_SHUFFLE;
 
         assert_eq!(
-            pipeline_forward(
+            apply_filter_pipeline_for_compression(
                 &src,
                 &mut buf1,
                 &mut buf2,
@@ -5577,7 +5567,7 @@ mod tests {
         assert_eq!(buf1, vec![0xA5; src.len()]);
 
         assert_eq!(
-            pipeline_backward(
+            apply_filter_pipeline_for_decompression(
                 &mut buf1,
                 &mut buf2,
                 src.len(),
@@ -5611,12 +5601,16 @@ mod tests {
         let meta = [0u8; BLOSC2_MAX_FILTERS];
 
         filters[BLOSC2_MAX_FILTERS - 1] = FILTER_ID;
-        let current = pipeline_forward(&src, &mut buf1, &mut buf2, &filters, &meta, 1, 0, None);
+        let current = apply_filter_pipeline_for_compression(
+            &src, &mut buf1, &mut buf2, &filters, &meta, 1, 0, None,
+        );
         assert_eq!(if current == 1 { buf1 } else { buf2 }, [0xA5u8; 4]);
 
         buf1 = [0xA5; 4];
         buf2 = [0x5A; 4];
-        let current = pipeline_backward(&mut buf1, &mut buf2, 4, &filters, &meta, 1, 1, 0, None, 1);
+        let current = apply_filter_pipeline_for_decompression(
+            &mut buf1, &mut buf2, 4, &filters, &meta, 1, 1, 0, None, 1,
+        );
         assert_eq!(if current == 1 { buf1 } else { buf2 }, [0x5Au8; 4]);
     }
 
@@ -5639,7 +5633,7 @@ mod tests {
 
         filters[0] = PREFIX_FAIL_ID;
         filters[1] = BLOSC_DELTA;
-        let current = pipeline_backward(
+        let current = apply_filter_pipeline_for_decompression(
             &mut buf1,
             &mut buf2,
             8,
@@ -5943,7 +5937,7 @@ mod tests {
         let filters = [BLOSC_SHUFFLE, BLOSC_DELTA, 0, 0, 0, 0];
         let filters_meta = [0u8; BLOSC2_MAX_FILTERS];
 
-        let current = pipeline_forward(
+        let current = apply_filter_pipeline_for_compression(
             &src,
             &mut buf1,
             &mut buf2,
@@ -5975,7 +5969,7 @@ mod tests {
 
         let mut buf1 = encoded;
         let mut buf2 = vec![0u8; src.len()];
-        let current = pipeline_backward(
+        let current = apply_filter_pipeline_for_decompression(
             &mut buf1,
             &mut buf2,
             src.len(),
@@ -6003,7 +5997,7 @@ mod tests {
             0xA0, 0xA1, 0xA2, 0xB0, 0xB1, 0xB2, 0xC0, 0xC1, 0xC2, 0xD0, 0xD1, 0xD2,
         ];
         let mut encoded = vec![0u8; 12];
-        // dref=src for offset==0 per pipeline_forward convention.
+        // dref=src for offset==0 per apply_filter_pipeline_for_compression convention.
         delta_encode(&src, 0, 12, 3, &src, &mut encoded);
 
         // Expected (what C does): typesize=1 fallback.
@@ -6150,7 +6144,7 @@ mod tests {
         let filters_meta = [0; BLOSC2_MAX_FILTERS];
 
         assert_eq!(
-            pipeline_forward(
+            apply_filter_pipeline_for_compression(
                 &src,
                 &mut short_buf,
                 &mut buf2,
@@ -6165,7 +6159,7 @@ mod tests {
         assert_eq!(buf2, vec![0x5A; 16]);
 
         assert_eq!(
-            pipeline_forward(
+            apply_filter_pipeline_for_compression(
                 &src,
                 &mut buf1,
                 &mut short_buf,
@@ -6180,7 +6174,7 @@ mod tests {
         assert_eq!(buf1, vec![0xA5; 16]);
 
         assert_eq!(
-            pipeline_backward(
+            apply_filter_pipeline_for_decompression(
                 &mut buf1,
                 &mut buf2,
                 16,
@@ -6196,7 +6190,7 @@ mod tests {
         );
 
         assert_eq!(
-            pipeline_backward(
+            apply_filter_pipeline_for_decompression(
                 &mut short_buf,
                 &mut buf2,
                 16,
@@ -6221,7 +6215,7 @@ mod tests {
         let filters_meta = [0; BLOSC2_MAX_FILTERS];
 
         assert_eq!(
-            pipeline_forward(
+            apply_filter_pipeline_for_compression(
                 &src,
                 &mut buf1,
                 &mut buf2,
@@ -6239,7 +6233,7 @@ mod tests {
         buf1.copy_from_slice(&src);
         buf2.fill(0x5A);
         assert_eq!(
-            pipeline_backward(
+            apply_filter_pipeline_for_decompression(
                 &mut buf1,
                 &mut buf2,
                 16,
@@ -6266,7 +6260,7 @@ mod tests {
         let filters_meta = [0; BLOSC2_MAX_FILTERS];
 
         assert_eq!(
-            pipeline_backward(
+            apply_filter_pipeline_for_decompression(
                 &mut buf1,
                 &mut buf2,
                 16,
@@ -6293,7 +6287,7 @@ mod tests {
         let filters = [BLOSC_TRUNC_PREC, 0, 0, 0, 0, 0];
         let filters_meta = [16; BLOSC2_MAX_FILTERS];
         assert_eq!(
-            pipeline_forward(
+            apply_filter_pipeline_for_compression(
                 &src,
                 &mut buf1,
                 &mut buf2,
@@ -6312,7 +6306,7 @@ mod tests {
         buf1.fill(0xA5);
         buf2.fill(0x5A);
         assert_eq!(
-            pipeline_forward(
+            apply_filter_pipeline_for_compression(
                 &src,
                 &mut buf1,
                 &mut buf2,
@@ -6339,7 +6333,7 @@ mod tests {
         let mut buf1 = vec![0u8; src.len()];
         let mut buf2 = vec![0u8; src.len()];
 
-        let current = pipeline_forward(
+        let current = apply_filter_pipeline_for_compression(
             &src,
             &mut buf1,
             &mut buf2,
@@ -6356,7 +6350,7 @@ mod tests {
         assert_eq!(buf1, expected);
 
         let before_other_buffer = buf2.clone();
-        let current = pipeline_backward(
+        let current = apply_filter_pipeline_for_decompression(
             &mut buf1,
             &mut buf2,
             src.len(),
@@ -6382,7 +6376,7 @@ mod tests {
         let filters_meta = [0; BLOSC2_MAX_FILTERS];
 
         assert_eq!(
-            pipeline_forward(
+            apply_filter_pipeline_for_compression(
                 &src,
                 &mut buf1,
                 &mut buf2,
@@ -6399,7 +6393,7 @@ mod tests {
 
         buf1.copy_from_slice(&src);
         assert_eq!(
-            pipeline_backward(
+            apply_filter_pipeline_for_decompression(
                 &mut buf1,
                 &mut buf2,
                 16,

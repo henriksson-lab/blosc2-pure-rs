@@ -65,13 +65,13 @@ fn msgpack_str(content: &str) -> Vec<u8> {
 fn f64_array() -> Result<B2ndArray, &'static str> {
     let meta = B2ndMeta::with_default_dtype(vec![10, 10], vec![4, 4], vec![2, 2], 8)?;
     let data = f64_bytes((0..100).map(|i| i as f64));
-    B2ndArray::from_cbuffer(meta, &data, CParams::default(), DParams::default())
+    B2ndArray::from_dense_buffer(meta, &data, CParams::default(), DParams::default())
 }
 
 fn zeroed_f64_array() -> Result<B2ndArray, &'static str> {
     let meta = B2ndMeta::with_default_dtype(vec![10, 10], vec![4, 4], vec![2, 2], 8)?;
     let data = vec![0u8; 10 * 10 * 8];
-    B2ndArray::from_cbuffer(meta, &data, CParams::default(), DParams::default())
+    B2ndArray::from_dense_buffer(meta, &data, CParams::default(), DParams::default())
 }
 
 fn frame_generator_case(
@@ -93,12 +93,12 @@ fn frame_generator_case(
         typesize,
         ..CParams::default()
     };
-    let array = B2ndArray::from_cbuffer(meta, &data, cparams, DParams::default())?;
+    let array = B2ndArray::from_dense_buffer(meta, &data, cparams, DParams::default())?;
     let path = temp_dir.path().join(name);
     array.save(&path)?;
     let opened = B2ndArray::open(&path)?;
     assert_eq!(opened.shape(), shape.as_slice());
-    assert_eq!(opened.to_cbuffer()?, data);
+    assert_eq!(opened.to_dense_buffer()?, data);
     println!("frame generator: {name}");
     println!("metadata:\n{}", opened.format_meta());
     Ok(())
@@ -316,10 +316,10 @@ fn print_meta_and_open(path: &std::path::Path) -> Result<(), Box<dyn std::error:
 
 fn serialization_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let array = f64_array()?;
-    let frame = array.to_frame();
-    let restored = B2ndArray::from_frame(&frame)?;
+    let frame = array.to_contiguous_frame();
+    let restored = B2ndArray::from_contiguous_frame(&frame)?;
     assert_eq!(
-        f64_values(&restored.to_cbuffer()?),
+        f64_values(&restored.to_dense_buffer()?),
         (0..100).map(|i| i as f64).collect::<Vec<_>>()
     );
     println!("serialization: {} byte frame roundtripped", frame.len());
@@ -343,8 +343,8 @@ fn plugin_codec_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
         ..CParams::default()
     };
     let meta = B2ndMeta::with_default_dtype(shape, chunkshape, blockshape, 8)?;
-    let array = B2ndArray::from_cbuffer(meta, &data, cparams, DParams::default())?;
-    assert_eq!(array.to_cbuffer()?, data);
+    let array = B2ndArray::from_dense_buffer(meta, &data, cparams, DParams::default())?;
+    assert_eq!(array.to_dense_buffer()?, data);
     println!(
         "plugin codec: NDLZ roundtripped {} i64 values",
         source.len()
@@ -371,8 +371,8 @@ fn plugin_filter_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
         ..CParams::default()
     };
     let meta = B2ndMeta::with_default_dtype(shape, chunkshape, blockshape, 8)?;
-    let array = B2ndArray::from_cbuffer(meta, &data, cparams, DParams::default())?;
-    assert_eq!(array.to_cbuffer()?, data);
+    let array = B2ndArray::from_dense_buffer(meta, &data, cparams, DParams::default())?;
+    assert_eq!(array.to_dense_buffer()?, data);
     println!(
         "plugin filter: NDCELL roundtripped {} i64 values",
         source.len()
@@ -387,17 +387,11 @@ fn plain_buffer_slicing() -> Result<(), Box<dyn std::error::Error>> {
     };
     let meta = B2ndMeta::with_default_dtype(vec![10, 10], vec![4, 4], vec![2, 2], 8)?;
     let data = vec![0u8; 10 * 10 * 8];
-    let array = B2ndArray::from_cbuffer(meta, &data, CParams::default(), dparams.clone())?;
+    let array = B2ndArray::from_dense_buffer(meta, &data, CParams::default(), dparams.clone())?;
     let slice_meta = B2ndMeta::with_default_dtype(vec![10, 10], vec![1, 1], vec![1, 1], 8)?;
-    let slice = array.get_slice_array_with_meta(
-        &[2, 5],
-        &[3, 6],
-        slice_meta,
-        CParams::default(),
-        dparams,
-    )?;
+    let slice = array.slice_with_meta(&[2, 5], &[3, 6], slice_meta, CParams::default(), dparams)?;
     let slice_view = slice.squeeze_view()?;
-    let buffer = slice_view.to_cbuffer()?;
+    let buffer = slice_view.to_dense_buffer()?;
     assert_eq!(f64_values(&buffer), vec![0.0]);
     println!(
         "plain-buffer slicing: squeezed shape={:?}",
@@ -444,7 +438,7 @@ fn append_and_set_slice() -> Result<(), Box<dyn std::error::Error>> {
     let mut set_slice_stack = set_slice_stack.expect("b2nd_empty_ctx_c returned success");
     for image_index in 0..N_IMAGES {
         fill_random_image(&mut random_state, &mut image);
-        set_slice_stack.set_slice_cbuffer(
+        set_slice_stack.set_slice_from_dense_buffer(
             &[image_index, 0, 0],
             &[image_index + 1, HEIGHT, WIDTH],
             &buffershape,
@@ -477,7 +471,7 @@ fn append_and_set_slice() -> Result<(), Box<dyn std::error::Error>> {
     let mut append_stack = append_stack.expect("b2nd_empty_ctx_c returned success");
     for _ in 0..N_IMAGES {
         fill_random_image(&mut random_state, &mut image);
-        append_stack.append_cbuffer(0, &image)?;
+        append_stack.append_dense_buffer(0, &image)?;
     }
     append_stack
         .schunk
@@ -485,7 +479,9 @@ fn append_and_set_slice() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(append_stack.shape(), &[N_IMAGES, HEIGHT, WIDTH]);
     assert!(append_path.exists());
 
-    println!("stack images: set_slice filled a fixed stack; append_cbuffer grew an empty stack");
+    println!(
+        "stack images: set_slice filled a fixed stack; append_dense_buffer grew an empty stack"
+    );
     Ok(())
 }
 
@@ -500,7 +496,7 @@ fn empty_shape_slicing() -> Result<(), Box<dyn std::error::Error>> {
     };
     // The C example supplies this metadata via a destination context with a
     // urlpath; the Rust helper mirrors the resulting empty slice directly.
-    let empty = array.get_slice_array_with_meta(
+    let empty = array.slice_with_meta(
         &[2, 5],
         &[2, 6],
         slice_meta,
@@ -510,7 +506,7 @@ fn empty_shape_slicing() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(empty.shape(), &[0, 1]);
     assert_eq!(empty.chunkshape(), &[0, 1]);
     assert_eq!(empty.blockshape(), &[0, 1]);
-    assert!(empty.to_cbuffer()?.is_empty());
+    assert!(empty.to_dense_buffer()?.is_empty());
     println!("empty-shape slicing: shape={:?}", empty.shape());
     Ok(())
 }
@@ -525,8 +521,8 @@ fn orthogonal_indexing() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>();
     let nitems = product_i64(&buffershape)?;
     let buffer = vec![0u8; nitems * 8];
-    array.set_orthogonal_selection_cbuffer(selection, &buffershape, &buffer)?;
-    let values = f64_values(&array.get_orthogonal_selection_cbuffer(selection, &buffershape)?);
+    array.set_orthogonal_selection_from_dense_buffer(selection, &buffershape, &buffer)?;
+    let values = f64_values(&array.orthogonal_selection_to_dense_buffer(selection, &buffershape)?);
     assert_eq!(values, vec![0.0; nitems]);
     println!("Results: ");
     for (index, value) in values.iter().enumerate() {

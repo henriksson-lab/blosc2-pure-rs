@@ -64,7 +64,7 @@ fn cparams_nofilter(compcode: u8, typesize: i32, nthreads: i16) -> CParams {
 fn run_compress(label: &str, data: &[u8], params: &CParams, iterations: usize) {
     let mut total = 0usize;
     for _ in 0..iterations {
-        let compressed = compress::compress(black_box(data), black_box(params)).unwrap();
+        let compressed = compress::compress_chunk(black_box(data), black_box(params)).unwrap();
         total = total.wrapping_add(compressed.len());
         black_box(&compressed);
     }
@@ -72,17 +72,20 @@ fn run_compress(label: &str, data: &[u8], params: &CParams, iterations: usize) {
 }
 
 fn run_decompress(label: &str, data: &[u8], params: &CParams, iterations: usize) {
-    let compressed = compress::compress(data, params).unwrap();
+    let compressed = compress::compress_chunk(data, params).unwrap();
     let mut decompressed = vec![0u8; data.len()];
-    let written =
-        compress::decompress_into_with_threads(&compressed, &mut decompressed, params.nthreads)
-            .unwrap();
+    let written = compress::decompress_chunk_into_with_threads(
+        &compressed,
+        &mut decompressed,
+        params.nthreads,
+    )
+    .unwrap();
     assert_eq!(written, data.len());
     assert_eq!(decompressed, data);
 
     let mut total = 0usize;
     for _ in 0..iterations {
-        let written = compress::decompress_into_with_threads(
+        let written = compress::decompress_chunk_into_with_threads(
             black_box(&compressed),
             black_box(&mut decompressed),
             params.nthreads,

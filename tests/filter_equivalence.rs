@@ -408,7 +408,7 @@ fn c_b2nd_filter_to_cbuffer(
         assert_eq!(
             ffi::b2nd_from_cbuffer(ctx, &mut array, data.as_ptr().cast(), data.len() as i64),
             0,
-            "C b2nd filter from_cbuffer failed"
+            "C b2nd filter from_dense_buffer failed"
         );
         assert!(!array.is_null(), "C b2nd filter array is null");
 
@@ -416,7 +416,7 @@ fn c_b2nd_filter_to_cbuffer(
         assert_eq!(
             ffi::b2nd_to_cbuffer(array, out.as_mut_ptr().cast(), out.len() as i64),
             0,
-            "C b2nd filter to_cbuffer failed"
+            "C b2nd filter to_dense_buffer failed"
         );
 
         assert_eq!(ffi::b2nd_free(array), 0);
@@ -525,7 +525,7 @@ fn rust_bytedelta_b2nd_compress_chunks(fixture: &BytedeltaFixture, filter: u8) -
     filters[BLOSC2_MAX_FILTERS - 1] = filter;
     filters_meta[BLOSC2_MAX_FILTERS - 1] = 0;
 
-    let array = B2ndArray::from_cbuffer(
+    let array = B2ndArray::from_dense_buffer(
         bytedelta_b2nd_meta(fixture),
         &fixture.data,
         CParams {
@@ -546,7 +546,7 @@ fn rust_bytedelta_b2nd_compress_chunks(fixture: &BytedeltaFixture, filter: u8) -
     });
 
     (0..array.schunk.nchunks())
-        .map(|nchunk| array.schunk.compressed_chunk_owned(nchunk).unwrap())
+        .map(|nchunk| array.schunk.compressed_chunk_bytes_owned(nchunk).unwrap())
         .collect()
 }
 
@@ -636,7 +636,7 @@ fn c_bytedelta_b2nd_compress_chunks(fixture: &BytedeltaFixture, write_filter: u8
                 fixture.data.len() as i64,
             ),
             0,
-            "{} C bytedelta B2ND from_cbuffer failed with filter {write_filter}",
+            "{} C bytedelta B2ND from_dense_buffer failed with filter {write_filter}",
             fixture.name
         );
         assert!(
@@ -720,7 +720,7 @@ fn c_bytedelta_b2nd_decompressed_chunks(fixture: &BytedeltaFixture) -> Vec<Vec<u
                 fixture.data.len() as i64,
             ),
             0,
-            "{} C bytedelta source B2ND from_cbuffer failed",
+            "{} C bytedelta source B2ND from_dense_buffer failed",
             fixture.name
         );
         assert!(
@@ -1219,7 +1219,7 @@ fn test_bytedelta_meta_zero_uses_b2nd_schunk_typesize_like_c_fixture() {
     filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_FILTER_BYTEDELTA;
     filters_meta[BLOSC2_MAX_FILTERS - 1] = 0;
 
-    let array = B2ndArray::from_cbuffer(
+    let array = B2ndArray::from_dense_buffer(
         meta,
         &data,
         CParams {
@@ -1235,7 +1235,7 @@ fn test_bytedelta_meta_zero_uses_b2nd_schunk_typesize_like_c_fixture() {
     )
     .unwrap();
 
-    assert_eq!(array.to_cbuffer().unwrap(), data);
+    assert_eq!(array.to_dense_buffer().unwrap(), data);
 }
 
 #[test]
@@ -1586,7 +1586,7 @@ fn test_ndcell_b2nd_roundtrips_with_registered_global_filter() {
     filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_FILTER_NDCELL;
     filters_meta[BLOSC2_MAX_FILTERS - 1] = 2;
 
-    let array = B2ndArray::from_cbuffer(
+    let array = B2ndArray::from_dense_buffer(
         meta,
         &data,
         CParams {
@@ -1602,7 +1602,7 @@ fn test_ndcell_b2nd_roundtrips_with_registered_global_filter() {
     )
     .unwrap();
 
-    assert_eq!(array.to_cbuffer().unwrap(), c_out);
+    assert_eq!(array.to_dense_buffer().unwrap(), c_out);
 }
 
 #[test]
@@ -1625,7 +1625,7 @@ fn test_ndmean_b2nd_outputs_cell_means() {
     filters[BLOSC2_MAX_FILTERS - 1] = BLOSC_FILTER_NDMEAN;
     filters_meta[BLOSC2_MAX_FILTERS - 1] = 4;
 
-    let array = B2ndArray::from_cbuffer(
+    let array = B2ndArray::from_dense_buffer(
         meta,
         &data,
         CParams {
@@ -1641,7 +1641,7 @@ fn test_ndmean_b2nd_outputs_cell_means() {
     )
     .unwrap();
 
-    assert_eq!(array.to_cbuffer().unwrap(), c_out);
+    assert_eq!(array.to_dense_buffer().unwrap(), c_out);
 }
 
 #[test]

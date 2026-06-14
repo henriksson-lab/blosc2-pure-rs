@@ -65,14 +65,14 @@ mod enabled {
 
     fn bench_rust(data: &[u8], filter: u8, iters: usize) -> (usize, f64, f64) {
         let cparams = rust_cparams(filter);
-        let compressed = compress::compress(data, &cparams).unwrap();
-        let restored = compress::decompress(&compressed).unwrap();
+        let compressed = compress::compress_chunk(data, &cparams).unwrap();
+        let restored = compress::decompress_chunk(&compressed).unwrap();
         assert_eq!(restored, data);
 
         let mut c_times = Vec::with_capacity(iters);
         for _ in 0..iters {
             let start = Instant::now();
-            let out = compress::compress(data, &cparams).unwrap();
+            let out = compress::compress_chunk(data, &cparams).unwrap();
             c_times.push(start.elapsed().as_secs_f64());
             std::hint::black_box(out);
         }
@@ -80,7 +80,7 @@ mod enabled {
         let mut d_times = Vec::with_capacity(iters);
         for _ in 0..iters {
             let start = Instant::now();
-            let out = compress::decompress(&compressed).unwrap();
+            let out = compress::decompress_chunk(&compressed).unwrap();
             d_times.push(start.elapsed().as_secs_f64());
             std::hint::black_box(out);
         }
@@ -186,8 +186,8 @@ mod enabled {
     }
 
     fn assert_cross_decode_compatibility(data: &[u8], filter: u8) {
-        let rust_chunk = compress::compress(data, &rust_cparams(filter)).unwrap();
-        let rust_decoded = compress::decompress(&rust_chunk).unwrap();
+        let rust_chunk = compress::compress_chunk(data, &rust_cparams(filter)).unwrap();
+        let rust_decoded = compress::decompress_chunk(&rust_chunk).unwrap();
         assert_eq!(rust_decoded, data);
 
         let _b = common::Blosc2::new();
@@ -209,7 +209,7 @@ mod enabled {
         assert!(csize > 0, "c compression failed: {csize}");
         c_chunk.truncate(csize as usize);
 
-        let c_decoded_by_rust = compress::decompress(&c_chunk).unwrap();
+        let c_decoded_by_rust = compress::decompress_chunk(&c_chunk).unwrap();
         assert_eq!(
             c_decoded_by_rust, data,
             "Rust decode of C blosclz chunk failed for filter={filter}"

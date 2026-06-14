@@ -215,7 +215,7 @@ fn append_streamed_compressed_chunk<W: Write + io::Seek>(
     let mut cparams = schunk.cparams.clone();
     cparams.nchunk = nchunk;
     cparams.schunk = schunk as *const Schunk as usize;
-    let compressed = compress::compress(chunk, &cparams)
+    let compressed = compress::compress_chunk(chunk, &cparams)
         .map_err(|_| io::Error::other("Error in appending data to destination file"))?;
     stream
         .append_compressed_chunk(&compressed)
@@ -283,9 +283,9 @@ fn decompress_file(input: &Path, output: &Path, nthreads: Option<i16>) -> io::Re
 
 fn open_frame_lazy_like_c_example(input: &Path) -> Result<LazySchunk, String> {
     if let Some(input) = input.to_str() {
-        return Schunk::open_lazy(input);
+        return Schunk::open_lazy_frame(input);
     }
-    Schunk::open_lazy_offset(input, 0)
+    Schunk::open_lazy_frame_at(input, 0)
 }
 
 #[cfg(test)]
@@ -293,7 +293,7 @@ fn open_frame_like_c_example(input: &Path) -> Result<Schunk, String> {
     if let Some(input) = input.to_str() {
         return Schunk::open(input);
     }
-    Schunk::open_offset(input, 0)
+    Schunk::open_frame_at(input, 0)
 }
 
 #[cfg(test)]
@@ -324,15 +324,16 @@ fn write_lazy_decompressed_chunks_c_style<W: Write>(
     let mut data = vec![0u8; schunk.chunksize];
     for i in 0..schunk.nchunks() {
         let chunk = schunk
-            .compressed_chunk(i)
+            .compressed_chunk_bytes(i)
             .map_err(|_| io::Error::other("Decompression error.  Error code: -1"))?;
-        let (chunk_nbytes, _, _) = compress::cbuffer_sizes(&chunk)
+        let (chunk_nbytes, _, _) = compress::chunk_sizes(&chunk)
             .map_err(|_| io::Error::other("Decompression error.  Error code: -1"))?;
         if chunk_nbytes > data.len() {
             return Err(io::Error::other("Decompression error.  Error code: -6"));
         }
-        let dsize = compress::decompress_into_with_dparams(&chunk, &mut data, &schunk.dparams)
-            .map_err(|_| io::Error::other("Decompression error.  Error code: -1"))?;
+        let dsize =
+            compress::decompress_chunk_into_with_dparams(&chunk, &mut data, &schunk.dparams)
+                .map_err(|_| io::Error::other("Decompression error.  Error code: -1"))?;
         let _ = writer.write(&data[..dsize]);
     }
     Ok(())
@@ -712,7 +713,7 @@ mod tests {
 
         assert_eq!(err.kind(), io::ErrorKind::Other);
         assert_eq!(err.to_string(), "Input file cannot be open.");
-        let schunk = Schunk::open_offset(&output, 0).unwrap();
+        let schunk = Schunk::open_frame_at(&output, 0).unwrap();
         assert_eq!(schunk.nchunks(), 0);
         assert_eq!(schunk.nbytes, 0);
         assert_eq!(schunk.cbytes, 0);
@@ -736,7 +737,7 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
-        assert_eq!(Schunk::open_offset(&output, 0).unwrap().nbytes, 7);
+        assert_eq!(Schunk::open_frame_at(&output, 0).unwrap().nbytes, 7);
     }
 
     #[test]
@@ -750,7 +751,7 @@ mod tests {
         compress_file(&input, &output, default_test_options(CLI_DEFAULT_CHUNKSIZE)).unwrap();
 
         assert!(output.is_file());
-        assert_eq!(Schunk::open_offset(&output, 0).unwrap().nbytes, 7);
+        assert_eq!(Schunk::open_frame_at(&output, 0).unwrap().nbytes, 7);
     }
 
     #[test]
@@ -834,7 +835,7 @@ mod tests {
 
         compress_file(&input, &output, default_test_options(CLI_DEFAULT_CHUNKSIZE)).unwrap();
 
-        let schunk = Schunk::open_offset(&output, 0).unwrap();
+        let schunk = Schunk::open_frame_at(&output, 0).unwrap();
         assert_eq!(schunk.nchunks(), 1);
         assert_eq!(schunk.nbytes, 0);
         assert!(schunk.cbytes > 0);
@@ -854,7 +855,7 @@ mod tests {
 
         compress_file(&input, &output, default_test_options(8)).unwrap();
 
-        let schunk = Schunk::open_offset(&output, 0).unwrap();
+        let schunk = Schunk::open_frame_at(&output, 0).unwrap();
         assert_eq!(schunk.nbytes, data.len() as i64);
 
         decompress_file(&output, &restored, Some(1)).unwrap();
@@ -901,17 +902,17 @@ mod tests {
         let mut schunk = Schunk::new(CParams::default(), DParams::default());
 
         write_frame_to_path(&schunk, &output).unwrap();
-        assert_eq!(Schunk::open_offset(&output, 0).unwrap().nchunks(), 0);
+        assert_eq!(Schunk::open_frame_at(&output, 0).unwrap().nchunks(), 0);
 
         schunk.append_buffer(b"first").unwrap();
         write_frame_to_path(&schunk, &output).unwrap();
-        let persisted = Schunk::open_offset(&output, 0).unwrap();
+        let persisted = Schunk::open_frame_at(&output, 0).unwrap();
         assert_eq!(persisted.nchunks(), 1);
         assert_eq!(persisted.decompress_chunk(0).unwrap(), b"first");
 
         schunk.append_buffer(b"second").unwrap();
         write_frame_to_path(&schunk, &output).unwrap();
-        let persisted = Schunk::open_offset(&output, 0).unwrap();
+        let persisted = Schunk::open_frame_at(&output, 0).unwrap();
         assert_eq!(persisted.nchunks(), 2);
         assert_eq!(persisted.decompress_all().unwrap(), b"firstsecond");
     }

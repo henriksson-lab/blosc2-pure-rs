@@ -374,7 +374,7 @@ fn default_compress_parameters_match_c_example_frame() {
         "Compression time: ",
     );
 
-    let schunk = Schunk::open_offset(&compressed, 0).unwrap();
+    let schunk = Schunk::open_frame_at(&compressed, 0).unwrap();
     assert_eq!(schunk.cparams.compcode, BLOSC_BLOSCLZ);
     assert_eq!(schunk.cparams.clevel, 9);
     assert_eq!(schunk.cparams.typesize, 1);
@@ -406,7 +406,7 @@ fn compress_use_dict_flag_is_stored_in_frame_params() {
         OsStr::new("--use-dict"),
     ]));
 
-    let schunk = Schunk::open_offset(&compressed, 0).unwrap();
+    let schunk = Schunk::open_frame_at(&compressed, 0).unwrap();
     assert_eq!(schunk.cparams.compcode, BLOSC_ZSTD);
     assert!(schunk.cparams.use_dict);
 }
@@ -701,7 +701,7 @@ fn empty_input_creates_empty_frame_like_terminal_c_fread() {
         "Compression time: ",
     );
 
-    let schunk = Schunk::open_offset(&compressed, 0).unwrap();
+    let schunk = Schunk::open_frame_at(&compressed, 0).unwrap();
     assert_eq!(schunk.nchunks(), 1);
     assert_eq!(schunk.nbytes, 0);
 
@@ -733,7 +733,7 @@ fn default_chunk_buffer_handles_exact_and_partial_terminal_chunks() {
             compressed.as_os_str(),
         ]));
 
-        let schunk = Schunk::open_offset(&compressed, 0).unwrap();
+        let schunk = Schunk::open_frame_at(&compressed, 0).unwrap();
         assert_eq!(schunk.chunksize, 1_000_000);
         assert_eq!(schunk.nchunks(), expected_chunks);
 
@@ -791,7 +791,7 @@ fn compress_missing_input_replaces_existing_output_with_empty_frame() {
         "Input file cannot be open.",
     );
 
-    let schunk = Schunk::open_offset(&output, 0).unwrap();
+    let schunk = Schunk::open_frame_at(&output, 0).unwrap();
     assert_eq!(schunk.nchunks(), 0);
     assert_eq!(schunk.nbytes, 0);
     assert_eq!(schunk.cbytes, 0);
@@ -816,7 +816,7 @@ fn compress_removes_empty_output_directory_before_creating_frame() {
     );
 
     assert!(output.is_file());
-    assert_eq!(Schunk::open_offset(&output, 0).unwrap().nbytes, 7);
+    assert_eq!(Schunk::open_frame_at(&output, 0).unwrap().nbytes, 7);
 }
 
 #[test]
@@ -869,7 +869,7 @@ fn compress_removes_output_symlink_before_creating_frame() {
         .unwrap()
         .file_type()
         .is_symlink());
-    assert_eq!(Schunk::open_offset(&output, 0).unwrap().nbytes, 7);
+    assert_eq!(Schunk::open_frame_at(&output, 0).unwrap().nbytes, 7);
 }
 
 #[test]
@@ -976,10 +976,11 @@ fn decompression_failure_keeps_completed_chunks_in_output_stream() {
     schunk.append_buffer(&first_chunk).unwrap();
     schunk.append_buffer(&second_chunk).unwrap();
     assert_eq!(schunk.chunksize, first_chunk.len());
-    let header_size = i32::from_be_bytes(schunk.to_frame()[11..15].try_into().unwrap()) as usize;
+    let header_size =
+        i32::from_be_bytes(schunk.to_contiguous_frame()[11..15].try_into().unwrap()) as usize;
     let second_chunk_start = header_size + schunk.chunks[0].len();
     let second_chunk_end = second_chunk_start + schunk.chunks[1].len();
-    let mut frame = schunk.to_frame();
+    let mut frame = schunk.to_contiguous_frame();
     frame[second_chunk_end - 1] ^= 0xff;
     fs::write(&compressed, frame).unwrap();
     fs::write(&restored, b"old destination").unwrap();

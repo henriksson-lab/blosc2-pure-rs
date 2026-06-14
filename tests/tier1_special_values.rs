@@ -1255,7 +1255,7 @@ fn test_schunk_fill_special_leftover_chunks_match_c() {
                 ..Default::default()
             });
             for nchunk in 0..expected_nchunks {
-                let chunk = schunk.compressed_chunk(nchunk as i64).unwrap();
+                let chunk = schunk.compressed_chunk_bytes(nchunk as i64).unwrap();
                 let expected_nbytes = if nchunk == expected_nchunks - 1 && leftover_items != 0 {
                     leftover_items * std::mem::size_of::<f32>()
                 } else {
@@ -1363,7 +1363,7 @@ fn test_schunk_repeatval_chunks_getitem_match_c_zero_runlen() {
     });
     let _b = init();
     for nchunk in 0..=FULL_CHUNKS {
-        let stored = schunk.compressed_chunk(nchunk as i64).unwrap();
+        let stored = schunk.compressed_chunk_bytes(nchunk as i64).unwrap();
         let expected_items = if nchunk == FULL_CHUNKS {
             LEFTOVER_ITEMS
         } else {
@@ -1513,8 +1513,8 @@ fn test_schunk_frame_roundtrip_with_zeros() {
     schunk.append_buffer(&zeros).unwrap();
     schunk.append_buffer(&zeros).unwrap();
 
-    let frame = schunk.to_frame();
-    let schunk2 = Schunk::from_frame(&frame).unwrap();
+    let frame = schunk.to_contiguous_frame();
+    let schunk2 = Schunk::from_contiguous_frame(&frame).unwrap();
 
     assert_eq!(schunk2.nchunks(), 2);
     assert_eq!(schunk2.decompress_chunk(0).unwrap(), zeros);

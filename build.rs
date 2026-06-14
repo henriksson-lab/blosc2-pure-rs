@@ -1,6 +1,176 @@
 fn main() {
+    build_zdict();
     #[cfg(feature = "_ffi")]
     build_ffi();
+}
+
+fn build_zdict() {
+    use std::env;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    println!("cargo:rerun-if-env-changed=BLOSC2_C_SOURCE_DIR");
+    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let c_blosc2_dir = env::var_os("BLOSC2_C_SOURCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| manifest_dir.join("c-blosc2"));
+    let c_blosc2_dir = if c_blosc2_dir.is_absolute() {
+        c_blosc2_dir
+    } else {
+        manifest_dir.join(c_blosc2_dir)
+    };
+    let zstd_dir = c_blosc2_dir.join("internal-complibs/zstd-1.5.7");
+    if !zstd_dir.exists() {
+        panic!(
+            "byte-identical zstd dictionary training requires vendored zstd at {}",
+            zstd_dir.display()
+        );
+    }
+    emit_zdict_rerun_if_changed(&zstd_dir);
+
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let obj_dir = out_dir.join("zdict-objects");
+    std::fs::create_dir_all(&obj_dir)
+        .unwrap_or_else(|err| panic!("failed to create {}: {err}", obj_dir.display()));
+
+    let cc = env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let target = env::var("TARGET").unwrap_or_default();
+    let mut objects = Vec::new();
+    for source in zdict_sources() {
+        let source_path = zstd_dir.join(source);
+        let object = obj_dir.join(
+            source
+                .replace(['/', '\\'], "_")
+                .strip_suffix(".c")
+                .unwrap_or(source)
+                .to_owned()
+                + ".o",
+        );
+        let mut cmd = Command::new(&cc);
+        cmd.arg("-c")
+            .arg(&source_path)
+            .arg("-o")
+            .arg(&object)
+            .arg("-O2")
+            .arg("-fPIC")
+            .arg("-DZSTD_DISABLE_ASM")
+            .arg("-DZSTD_MULTITHREAD")
+            .arg("-DZSTD_LEGACY_SUPPORT=0")
+            .arg(format!("-I{}", zstd_dir.join("common").display()))
+            .arg(format!("-I{}", zstd_dir.join("compress").display()))
+            .arg(format!("-I{}", zstd_dir.join("decompress").display()))
+            .arg(format!("-I{}", zstd_dir.join("dictBuilder").display()))
+            .arg(format!("-I{}", zstd_dir.display()));
+        if !target.contains("windows") {
+            cmd.arg("-std=c99");
+        }
+        let status = cmd.status().unwrap_or_else(|err| {
+            panic!(
+                "failed to invoke C compiler {} for {}: {err}",
+                Path::new(&cc).display(),
+                source_path.display()
+            )
+        });
+        if !status.success() {
+            panic!(
+                "C compiler failed for {} with status {status}",
+                source_path.display()
+            );
+        }
+        objects.push(object);
+    }
+
+    let lib_path = out_dir.join("libblosc2_zdict.a");
+    let ar = env::var_os("AR").unwrap_or_else(|| "ar".into());
+    let mut ar_cmd = Command::new(&ar);
+    ar_cmd.arg("crs").arg(&lib_path);
+    for object in &objects {
+        ar_cmd.arg(object);
+    }
+    let status = ar_cmd.status().unwrap_or_else(|err| {
+        panic!(
+            "failed to invoke archiver {} for {}: {err}",
+            Path::new(&ar).display(),
+            lib_path.display()
+        )
+    });
+    if !status.success() {
+        panic!(
+            "archiver failed for {} with status {status}",
+            lib_path.display()
+        );
+    }
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=blosc2_zdict");
+    if !target.contains("windows") {
+        println!("cargo:rustc-link-lib=pthread");
+    }
+}
+
+fn zdict_sources() -> &'static [&'static str] {
+    &[
+        "common/debug.c",
+        "common/entropy_common.c",
+        "common/error_private.c",
+        "common/fse_decompress.c",
+        "common/pool.c",
+        "common/threading.c",
+        "common/xxhash.c",
+        "common/zstd_common.c",
+        "compress/fse_compress.c",
+        "compress/hist.c",
+        "compress/huf_compress.c",
+        "compress/zstd_compress.c",
+        "compress/zstd_compress_literals.c",
+        "compress/zstd_compress_sequences.c",
+        "compress/zstd_compress_superblock.c",
+        "compress/zstd_double_fast.c",
+        "compress/zstd_fast.c",
+        "compress/zstd_lazy.c",
+        "compress/zstd_ldm.c",
+        "compress/zstd_opt.c",
+        "compress/zstd_preSplit.c",
+        "compress/zstdmt_compress.c",
+        "decompress/huf_decompress.c",
+        "decompress/zstd_ddict.c",
+        "decompress/zstd_decompress.c",
+        "decompress/zstd_decompress_block.c",
+        "dictBuilder/cover.c",
+        "dictBuilder/divsufsort.c",
+        "dictBuilder/fastcover.c",
+        "dictBuilder/zdict.c",
+    ]
+}
+
+fn emit_zdict_rerun_if_changed(zstd_dir: &std::path::Path) {
+    for path in [
+        "zdict.h",
+        "zstd.h",
+        "zstd_errors.h",
+        "common",
+        "compress",
+        "decompress",
+        "dictBuilder",
+    ] {
+        emit_zdict_path_rerun_if_changed(&zstd_dir.join(path));
+    }
+}
+
+fn emit_zdict_path_rerun_if_changed(path: &std::path::Path) {
+    if path.is_dir() {
+        let entries = std::fs::read_dir(path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|err| panic!("failed to read zstd path entry: {err}"));
+            emit_zdict_path_rerun_if_changed(&entry.path());
+        }
+    } else if matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("c" | "h" | "inc" | "S")
+    ) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
 }
 
 #[cfg(feature = "_ffi")]

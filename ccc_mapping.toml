@@ -45,19 +45,19 @@ other = "blosc2_vldecompress_block_ctx"
 other_path = "c-blosc2/blosc/blosc2.c"
 
 [[entries]]
-rust = "vlchunk_get_nblocks"
+rust = "vl_chunk_block_count"
 rust_path = "src/compress.rs"
 other = "blosc2_vlchunk_get_nblocks"
 other_path = "c-blosc2/blosc/blosc2.c"
 
 [[entries]]
-rust = "getitem"
+rust = "get_items"
 rust_path = "src/compress.rs"
 other = "blosc2_getitem"
 other_path = "c-blosc2/blosc/blosc2.c"
 
 [[entries]]
-rust = "getitem_with_dparams"
+rust = "get_items_with_dparams"
 rust_path = "src/compress.rs"
 other = "_blosc_getitem"
 other_path = "c-blosc2/blosc/blosc2.c"
@@ -126,19 +126,19 @@ other = "b2nd_save"
 other_path = "c-blosc2/blosc/b2nd.c"
 
 [[entries]]
-rust = "compress_with_output_limit"
+rust = "compress_chunk_with_output_limit"
 rust_path = "src/compress.rs"
 other = "blosc2_compress_ctx"
 other_path = "c-blosc2/blosc/blosc2.c"
 
 [[entries]]
-rust = "vlcompress_with_output_limit"
+rust = "compress_vl_blocks_with_output_limit"
 rust_path = "src/compress.rs"
 other = "blosc2_vlcompress_ctx"
 other_path = "c-blosc2/blosc/blosc2.c"
 
 [[entries]]
-rust = "decompress_into_with_header"
+rust = "decompress_chunk_into_with_header"
 rust_path = "src/compress.rs"
 other = "blosc_run_decompression_with_context"
 other_path = "c-blosc2/blosc/blosc2.c"
@@ -156,19 +156,19 @@ other = "blosc_d"
 other_path = "c-blosc2/blosc/blosc2.c"
 
 [[entries]]
-rust = "pipeline_forward_with_context"
+rust = "apply_filter_pipeline_for_compression_with_context"
 rust_path = "src/filters.rs"
 other = "pipeline_forward"
 other_path = "c-blosc2/blosc/blosc2.c"
 
 [[entries]]
-rust = "pipeline_backward_with_context"
+rust = "apply_filter_pipeline_for_decompression_with_context"
 rust_path = "src/filters.rs"
 other = "pipeline_backward"
 other_path = "c-blosc2/blosc/blosc2.c"
 
 [[entries]]
-rust = "update_compressed_chunk"
+rust = "replace_compressed_chunk"
 rust_path = "src/schunk.rs"
 rust_class = "Schunk"
 other = "blosc2_schunk_update_chunk"
@@ -217,21 +217,21 @@ other = "b2nd_get_slice_nchunks"
 other_path = "c-blosc2/blosc/b2nd.c"
 
 [[entries]]
-rust = "to_frame"
+rust = "to_contiguous_frame"
 rust_path = "src/schunk.rs"
 rust_class = "Schunk"
 other = "frame_from_schunk"
 other_path = "c-blosc2/blosc/frame.c"
 
 [[entries]]
-rust = "copy_array_with_meta"
+rust = "copy_with_meta"
 rust_path = "src/b2nd.rs"
 rust_class = "B2ndArray"
 other = "b2nd_copy"
 other_path = "c-blosc2/blosc/b2nd.c"
 
 [[entries]]
-rust = "resize_at"
+rust = "resize_with_start"
 rust_path = "src/b2nd.rs"
 rust_class = "B2ndArray"
 other = "b2nd_resize"
@@ -320,7 +320,7 @@ other = "blosc2_chunk_repeatval"
 other_path = "c-blosc2/blosc/blosc2.c"
 
 ## Schunk public API and frame internals.  The C frame conversion helper maps
-## to Schunk::from_frame; the public C buffer wrapper maps to the Rust public
+## to Schunk::from_contiguous_frame; the public C buffer wrapper maps to the Rust public
 ## wrapper of the same name.
 
 [[entries]]
@@ -344,28 +344,28 @@ other = "blosc2_schunk_open"
 other_path = "c-blosc2/blosc/schunk.c"
 
 [[entries]]
-rust = "open_offset"
+rust = "open_frame_at"
 rust_path = "src/schunk.rs"
 rust_class = "Schunk"
 other = "blosc2_schunk_open_offset"
 other_path = "c-blosc2/blosc/schunk.c"
 
 [[entries]]
-rust = "to_frame"
+rust = "to_contiguous_frame"
 rust_path = "src/schunk.rs"
 rust_class = "Schunk"
 other = "blosc2_schunk_to_buffer"
 other_path = "c-blosc2/blosc/schunk.c"
 
 [[entries]]
-rust = "to_file_len"
+rust = "write_contiguous_frame_file_len"
 rust_path = "src/schunk.rs"
 rust_class = "Schunk"
 other = "blosc2_schunk_to_file"
 other_path = "c-blosc2/blosc/schunk.c"
 
 [[entries]]
-rust = "append_file"
+rust = "append_contiguous_frame_file"
 rust_path = "src/schunk.rs"
 rust_class = "Schunk"
 other = "blosc2_schunk_append_file"
@@ -378,14 +378,14 @@ other = "blosc2_schunk_from_buffer"
 other_path = "c-blosc2/blosc/schunk.c"
 
 [[entries]]
-rust = "from_frame"
+rust = "from_contiguous_frame"
 rust_path = "src/schunk.rs"
 rust_class = "Schunk"
 other = "frame_to_schunk"
 other_path = "c-blosc2/blosc/frame.c"
 
 [[entries]]
-rust = "compressed_chunk"
+rust = "compressed_chunk_bytes"
 rust_path = "src/schunk.rs"
 rust_class = "Schunk"
 other = "blosc2_schunk_get_chunk"
@@ -497,7 +497,7 @@ other = "blosc2_meta_delete"
 other_path = "c-blosc2/blosc/schunk.c"
 
 [[entries]]
-rust = "metalayer_exists"
+rust = "has_metalayer"
 rust_path = "src/schunk.rs"
 rust_class = "Schunk"
 other = "blosc2_meta_exists"
@@ -539,7 +539,7 @@ other = "blosc2_vlmeta_delete"
 other_path = "c-blosc2/blosc/schunk.c"
 
 [[entries]]
-rust = "vlmetalayer_exists"
+rust = "has_vlmetalayer"
 rust_path = "src/schunk.rs"
 rust_class = "Schunk"
 other = "blosc2_vlmeta_exists"

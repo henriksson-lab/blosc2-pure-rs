@@ -151,7 +151,7 @@ const API_MATRIX: &[ApiRow] = &[
     ),
     partial!(
         "blosc2_schunk_open_offset",
-        "Rust open_offset eagerly loads into an owned Schunk; C keeps a no-copy file-backed frame, whose closest Rust equivalent is blosc2_schunk_open_lazy_offset(_c)."
+        "Rust open_frame_at eagerly loads into an owned Schunk; C keeps a no-copy file-backed frame, whose closest Rust equivalent is blosc2_schunk_open_lazy_offset(_c)."
     ),
     covered!("blosc2_schunk_to_buffer"),
     covered!("blosc2_schunk_to_file"),

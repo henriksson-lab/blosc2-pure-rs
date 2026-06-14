@@ -128,10 +128,10 @@ fn schunk_cparams() -> CParams {
     }
 }
 
-fn compressed_chunk(data: &[u8]) -> Vec<u8> {
+fn compressed_chunk_bytes(data: &[u8]) -> Vec<u8> {
     let mut source = Schunk::new(schunk_cparams(), DParams::default());
     source.append_buffer(data).unwrap();
-    source.compressed_chunk(0).unwrap().to_vec()
+    source.compressed_chunk_bytes(0).unwrap().to_vec()
 }
 
 fn frame_chunksize(frame: &[u8]) -> i32 {
@@ -982,8 +982,8 @@ fn test_malformed_chunk_headers_rejected_with_c_error_codes() {
 #[test]
 fn test_schunk_update_chunksize_transitions_match_c() {
     let _b = init();
-    let replacement = compressed_chunk(b"zz");
-    let oversized = compressed_chunk(b"zzzzz");
+    let replacement = compressed_chunk_bytes(b"zz");
+    let oversized = compressed_chunk_bytes(b"zzzzz");
 
     let mut middle_update = Schunk::new(schunk_cparams(), DParams::default());
     middle_update.append_buffer(b"aaaa").unwrap();
@@ -1005,7 +1005,7 @@ fn test_schunk_update_chunksize_transitions_match_c() {
     assert_eq!(middle_update.chunksize, c_middle_chunksize as usize);
     assert_eq!(middle_update.nbytes, c_middle_nbytes);
     assert_eq!(
-        frame_chunksize(&middle_update.to_frame()),
+        frame_chunksize(&middle_update.to_contiguous_frame()),
         frame_chunksize(&c_middle_frame)
     );
     assert_eq!(middle_update.decompress_all().unwrap(), b"aaaazzcccc");
@@ -1029,7 +1029,7 @@ fn test_schunk_update_chunksize_transitions_match_c() {
     assert_eq!(last_oversized_update.chunksize, c_last_chunksize as usize);
     assert_eq!(last_oversized_update.nbytes, c_last_nbytes);
     assert_eq!(
-        frame_chunksize(&last_oversized_update.to_frame()),
+        frame_chunksize(&last_oversized_update.to_contiguous_frame()),
         frame_chunksize(&c_last_frame)
     );
     assert_eq!(
@@ -1041,7 +1041,7 @@ fn test_schunk_update_chunksize_transitions_match_c() {
 #[test]
 fn test_schunk_insert_chunksize_transitions_match_c() {
     let _b = init();
-    let short_chunk = compressed_chunk(b"zz");
+    let short_chunk = compressed_chunk_bytes(b"zz");
 
     let mut middle_insert = Schunk::new(schunk_cparams(), DParams::default());
     middle_insert.append_buffer(b"aaaa").unwrap();
@@ -1062,7 +1062,7 @@ fn test_schunk_insert_chunksize_transitions_match_c() {
     assert_eq!(middle_insert.chunksize, c_middle_chunksize as usize);
     assert_eq!(middle_insert.nbytes, c_middle_nbytes);
     assert_eq!(
-        frame_chunksize(&middle_insert.to_frame()),
+        frame_chunksize(&middle_insert.to_contiguous_frame()),
         frame_chunksize(&c_middle_frame)
     );
     assert_eq!(middle_insert.decompress_all().unwrap(), b"aaaazzbbbb");
@@ -1085,7 +1085,7 @@ fn test_schunk_insert_chunksize_transitions_match_c() {
     assert_eq!(tail_insert.chunksize, c_tail_chunksize as usize);
     assert_eq!(tail_insert.nbytes, c_tail_nbytes);
     assert_eq!(
-        frame_chunksize(&tail_insert.to_frame()),
+        frame_chunksize(&tail_insert.to_contiguous_frame()),
         frame_chunksize(&c_tail_frame)
     );
     assert_eq!(tail_insert.decompress_all().unwrap(), b"aaaabbbbzz");
@@ -1107,12 +1107,12 @@ fn test_schunk_delete_preserves_chunksize_and_frame_header_like_c() {
     assert_eq!(schunk.chunksize, c_chunksize as usize);
     assert_eq!(schunk.nbytes, c_nbytes);
     assert_eq!(
-        frame_chunksize(&schunk.to_frame()),
+        frame_chunksize(&schunk.to_contiguous_frame()),
         frame_chunksize(&c_frame)
     );
     assert_eq!(schunk.decompress_all().unwrap(), b"bb");
 
-    let restored = Schunk::from_frame(&schunk.to_frame()).unwrap();
+    let restored = Schunk::from_contiguous_frame(&schunk.to_contiguous_frame()).unwrap();
     assert_eq!(restored.chunksize, c_chunksize as usize);
     assert_eq!(restored.decompress_all().unwrap(), b"bb");
 }
@@ -1130,8 +1130,8 @@ fn test_b2nd_zero_extent_slice_and_nchunk_edges_match_c() {
     let meta = B2ndMeta::new(vec![4, 6], vec![2, 3], vec![1, 3], "|u1", 0).unwrap();
     let data: Vec<u8> = (0..24).collect();
     let mut array =
-        B2ndArray::from_cbuffer(meta, &data, cparams.clone(), DParams::default()).unwrap();
-    let before = array.to_cbuffer().unwrap();
+        B2ndArray::from_dense_buffer(meta, &data, cparams.clone(), DParams::default()).unwrap();
+    let before = array.to_dense_buffer().unwrap();
 
     let start = [0, 100];
     let stop = [0, 101];
@@ -1157,7 +1157,7 @@ fn test_b2nd_zero_extent_slice_and_nchunk_edges_match_c() {
         b2nd_set_slice_cbuffer_c(&[], 0, &buffershape, &start, &stop, &mut array),
         BLOSC2_ERROR_SUCCESS
     );
-    assert_eq!(array.to_cbuffer().unwrap(), before);
+    assert_eq!(array.to_dense_buffer().unwrap(), before);
 
     assert_eq!(
         b2nd_get_slice_nchunks(&array, &[1, 2], &[1, 2]),
@@ -1171,7 +1171,8 @@ fn test_b2nd_zero_extent_slice_and_nchunk_edges_match_c() {
     assert_eq!(b2nd_get_slice_nchunks(&array, &[4, 6], &[4, 6]), (0, None));
 
     let empty_meta = B2ndMeta::new(vec![0, 5], vec![0, 5], vec![0, 1], "|u1", 0).unwrap();
-    let mut empty = B2ndArray::from_cbuffer(empty_meta, &[], cparams, DParams::default()).unwrap();
+    let mut empty =
+        B2ndArray::from_dense_buffer(empty_meta, &[], cparams, DParams::default()).unwrap();
     let mut empty_dest = vec![0xff; 4];
     assert_eq!(
         b2nd_get_slice_cbuffer_c(&empty, &start, &stop, &mut empty_dest, &buffershape, 4),

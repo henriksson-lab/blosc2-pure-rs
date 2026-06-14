@@ -10,9 +10,9 @@ use blosc2_pure_rs::compress::{
     blosc2_vlcompress_ctx as rust_vlcompress_ctx,
     blosc2_vldecompress_block_ctx as rust_vldecompress_block_ctx,
     blosc2_vldecompress_block_ctx_c as rust_vldecompress_block_ctx_c,
-    blosc2_vldecompress_ctx_c as rust_vldecompress_ctx_c, cbuffer_metainfo, cbuffer_sizes,
-    cbuffer_validate, compress, decompress, decompress_into_with_dparams, vlchunk_get_nblocks,
-    vlcompress, vldecompress, vldecompress_block, CParams, DParams, PostfilterParams,
+    blosc2_vldecompress_ctx_c as rust_vldecompress_ctx_c, chunk_metainfo, chunk_sizes, compress,
+    decompress, decompress_into_with_dparams, validate_chunk, vlchunk_get_nblocks, vlcompress,
+    vldecompress, vldecompress_block, CParams, DParams, PostfilterParams,
 };
 use blosc2_pure_rs::constants::*;
 use blosc2_pure_rs::header::ChunkHeader;
@@ -94,7 +94,7 @@ impl CArray {
         }
     }
 
-    fn to_cbuffer(&self, len: usize) -> Vec<u8> {
+    fn to_dense_buffer(&self, len: usize) -> Vec<u8> {
         let mut out = vec![0; len];
         unsafe {
             let rc = ffi::b2nd_to_cbuffer(self.array, out.as_mut_ptr().cast(), out.len() as i64);
@@ -140,7 +140,7 @@ fn b2nd_u8_cparams() -> CParams {
 }
 
 fn b2nd_u8_array(shape: &[i64], chunkshape: &[i32], blockshape: &[i32], data: &[u8]) -> B2ndArray {
-    B2ndArray::from_cbuffer(
+    B2ndArray::from_dense_buffer(
         b2nd_u8_meta(shape, chunkshape, blockshape),
         data,
         b2nd_u8_cparams(),
@@ -1113,14 +1113,13 @@ fn test_legacy_blosc1_bitshuffle_fixture_matches_c_decompress() {
     assert_eq!(header.compcode(), BLOSC_LZ4);
     assert_eq!(header.flags & BLOSC_DOBITSHUFFLE, BLOSC_DOBITSHUFFLE);
     assert_eq!(header.filters[BLOSC2_MAX_FILTERS - 1], BLOSC_BITSHUFFLE);
-    assert_eq!(cbuffer_sizes(&chunk).unwrap(), (641_092, 22_760, 524_288));
+    assert_eq!(chunk_sizes(&chunk).unwrap(), (641_092, 22_760, 524_288));
 
-    let (typesize, compcode, filters) =
-        cbuffer_metainfo(&chunk[..BLOSC_MIN_HEADER_LENGTH]).unwrap();
+    let (typesize, compcode, filters) = chunk_metainfo(&chunk[..BLOSC_MIN_HEADER_LENGTH]).unwrap();
     assert_eq!(typesize, 8);
     assert_eq!(compcode, BLOSC_LZ4);
     assert_eq!(filters[BLOSC2_MAX_FILTERS - 1], BLOSC_BITSHUFFLE);
-    assert!(cbuffer_validate(&chunk).is_ok());
+    assert!(validate_chunk(&chunk).is_ok());
 
     let rust_decompressed = decompress(&chunk).unwrap_or_else(|e| {
         panic!(
@@ -1371,9 +1370,9 @@ fn test_c_trained_zstd_dictionary_lazy_frame_chunk_decodes_in_pure_rust() {
         assert_eq!(ffi::blosc2_schunk_free(c_schunk), 0);
     }
 
-    let lazy = Schunk::open_lazy(&path).unwrap();
+    let lazy = Schunk::open_lazy_frame(&path).unwrap();
     assert_eq!(lazy.nchunks(), 1);
-    let chunk = lazy.compressed_chunk(0).unwrap();
+    let chunk = lazy.compressed_chunk_bytes(0).unwrap();
     let header = ChunkHeader::read(&chunk).unwrap();
     assert!(
         header.use_dict(),
@@ -1567,7 +1566,7 @@ fn assert_vl_chunk_header(chunk: &[u8], expected_nblocks: usize) {
     assert_ne!(header.blosc2_flags2 & BLOSC2_VL_BLOCKS, 0);
     assert_eq!(header.blocksize, expected_nblocks as i32);
     assert_eq!(
-        cbuffer_sizes(chunk).unwrap().2,
+        chunk_sizes(chunk).unwrap().2,
         expected_nblocks,
         "VL-block chunks store nblocks in the blocksize header field"
     );
@@ -2317,8 +2316,8 @@ fn test_b2nd_rust_frame_c_reads() {
         filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
         ..Default::default()
     };
-    let array = B2ndArray::from_cbuffer(meta, &data, cparams, Default::default()).unwrap();
-    let mut frame = array.to_frame();
+    let array = B2ndArray::from_dense_buffer(meta, &data, cparams, Default::default()).unwrap();
+    let mut frame = array.to_contiguous_frame();
 
     unsafe {
         let mut c_array: *mut ffi::b2nd_array_t = std::ptr::null_mut();
@@ -2350,21 +2349,21 @@ fn test_b2nd_rust_special_constructors_c_reads() {
 
     let empty = B2ndArray::empty(meta.clone(), cparams.clone(), Default::default()).unwrap();
     assert_eq!(
-        ChunkHeader::read(empty.schunk.compressed_chunk(0).unwrap())
+        ChunkHeader::read(empty.schunk.compressed_chunk_bytes(0).unwrap())
             .unwrap()
             .special_type(),
         BLOSC2_SPECIAL_ZERO
     );
     let full = B2ndArray::full(meta, &[9], cparams, Default::default()).unwrap();
     assert_eq!(
-        ChunkHeader::read(full.schunk.compressed_chunk(0).unwrap())
+        ChunkHeader::read(full.schunk.compressed_chunk_bytes(0).unwrap())
             .unwrap()
             .special_type(),
         BLOSC2_SPECIAL_VALUE
     );
 
     for (array, expected) in [(empty, vec![0u8; 15]), (full, vec![9u8; 15])] {
-        let mut frame = array.to_frame();
+        let mut frame = array.to_contiguous_frame();
         unsafe {
             let mut c_array: *mut ffi::b2nd_array_t = std::ptr::null_mut();
             let rc =
@@ -2437,12 +2436,12 @@ fn test_b2nd_c_frame_rust_reads() {
         assert!(!cframe.is_null());
         assert!(cframe_len > 0);
         let frame = std::slice::from_raw_parts(cframe, cframe_len as usize);
-        let rust_array = B2ndArray::from_frame(frame).unwrap();
+        let rust_array = B2ndArray::from_contiguous_frame(frame).unwrap();
         assert_eq!(rust_array.meta.shape, shape);
         assert_eq!(rust_array.meta.chunkshape, chunkshape);
         assert_eq!(rust_array.meta.blockshape, blockshape);
         assert_eq!(rust_array.meta.dtype, "<u2");
-        assert_eq!(rust_array.to_cbuffer().unwrap(), data);
+        assert_eq!(rust_array.to_dense_buffer().unwrap(), data);
 
         if needs_free {
             free(cframe.cast());
@@ -2503,9 +2502,9 @@ fn test_ndlz_b2nd_rust_frame_c_reads() {
             nthreads: 1,
             ..Default::default()
         };
-        let array = B2ndArray::from_cbuffer(meta, &data, cparams, Default::default()).unwrap();
-        assert_eq!(array.to_cbuffer().unwrap(), data);
-        let mut frame = array.to_frame();
+        let array = B2ndArray::from_dense_buffer(meta, &data, cparams, Default::default()).unwrap();
+        assert_eq!(array.to_dense_buffer().unwrap(), data);
+        let mut frame = array.to_contiguous_frame();
 
         unsafe {
             let mut c_array: *mut ffi::b2nd_array_t = std::ptr::null_mut();
@@ -2606,12 +2605,12 @@ fn test_ndlz_b2nd_c_frame_rust_reads() {
             assert!(!cframe.is_null());
             assert!(cframe_len > 0);
             let frame = std::slice::from_raw_parts(cframe, cframe_len as usize);
-            let rust_array = B2ndArray::from_frame(frame).unwrap();
+            let rust_array = B2ndArray::from_contiguous_frame(frame).unwrap();
             assert_eq!(rust_array.meta.shape, shape);
             assert_eq!(rust_array.meta.chunkshape, chunkshape);
             assert_eq!(rust_array.meta.blockshape, blockshape);
             assert_eq!(rust_array.meta.dtype, dtype);
-            assert_eq!(rust_array.to_cbuffer().unwrap(), data);
+            assert_eq!(rust_array.to_dense_buffer().unwrap(), data);
 
             if needs_free {
                 free(cframe.cast());
@@ -2633,8 +2632,8 @@ fn test_b2nd_c_rust_mutation_and_selection_parity() {
     let c_array = CArray::from_u8_cbuffer(&[4, 5], &chunkshape, &blockshape, &data);
     let mut rust_array = b2nd_u8_array(&[4, 5], &chunkshape, &blockshape, &data);
     assert_eq!(
-        c_array.to_cbuffer(data.len()),
-        rust_array.to_cbuffer().unwrap()
+        c_array.to_dense_buffer(data.len()),
+        rust_array.to_dense_buffer().unwrap()
     );
 
     let appended: Vec<u8> = (100..110).collect();
@@ -2652,8 +2651,8 @@ fn test_b2nd_c_rust_mutation_and_selection_parity() {
     rust_array.append(0, &[2, 5], &appended).unwrap();
     let mut expected = [data.as_slice(), appended.as_slice()].concat();
     shape[0] += 2;
-    assert_eq!(c_array.to_cbuffer(expected.len()), expected);
-    assert_eq!(rust_array.to_cbuffer().unwrap(), expected);
+    assert_eq!(c_array.to_dense_buffer(expected.len()), expected);
+    assert_eq!(rust_array.to_dense_buffer().unwrap(), expected);
 
     let insert_shape = [18i64, 6];
     let insert_chunkshape = [6i32, 6];
@@ -2686,8 +2685,11 @@ fn test_b2nd_c_rust_mutation_and_selection_parity() {
     }
     rust_insert.insert(1, 0, &[18, 12], &inserted).unwrap();
     let expected_insert = b2nd_insert_expected(&insert_data, &[18, 6], 1, 0, 12, &inserted);
-    assert_eq!(c_insert.to_cbuffer(expected_insert.len()), expected_insert);
-    assert_eq!(rust_insert.to_cbuffer().unwrap(), expected_insert);
+    assert_eq!(
+        c_insert.to_dense_buffer(expected_insert.len()),
+        expected_insert
+    );
+    assert_eq!(rust_insert.to_dense_buffer().unwrap(), expected_insert);
 
     let delete_shape = [18i64, 12];
     let delete_chunkshape = [6i32, 6];
@@ -2710,8 +2712,11 @@ fn test_b2nd_c_rust_mutation_and_selection_parity() {
     }
     rust_delete.delete(1, 0, 6).unwrap();
     let expected_delete = b2nd_delete_expected(&delete_data, &[18, 12], 1, 0, 6);
-    assert_eq!(c_delete.to_cbuffer(expected_delete.len()), expected_delete);
-    assert_eq!(rust_delete.to_cbuffer().unwrap(), expected_delete);
+    assert_eq!(
+        c_delete.to_dense_buffer(expected_delete.len()),
+        expected_delete
+    );
+    assert_eq!(rust_delete.to_dense_buffer().unwrap(), expected_delete);
 
     let resize_shape = [5i64];
     let resize_data: Vec<u8> = (0..5).collect();
@@ -2724,18 +2729,20 @@ fn test_b2nd_c_rust_mutation_and_selection_parity() {
             0
         );
     }
-    rust_resize.resize_at(new_shape.to_vec(), None).unwrap();
+    rust_resize
+        .resize_with_start(new_shape.to_vec(), None)
+        .unwrap();
     expected = resize_data;
     expected.resize(10, 0);
-    assert_eq!(c_resize.to_cbuffer(expected.len()), expected);
-    assert_eq!(rust_resize.to_cbuffer().unwrap(), expected);
+    assert_eq!(c_resize.to_dense_buffer(expected.len()), expected);
+    assert_eq!(rust_resize.to_dense_buffer().unwrap(), expected);
 
     shape = vec![5, 6];
     expected = (0..30).collect();
     let c_select = CArray::from_u8_cbuffer(&[5, 6], &[3, 4], &[2, 2], &expected);
     let rust_select = b2nd_u8_array(&[5, 6], &[3, 4], &[2, 2], &expected);
-    assert_eq!(c_select.to_cbuffer(expected.len()), expected);
-    assert_eq!(rust_select.to_cbuffer().unwrap(), expected);
+    assert_eq!(c_select.to_dense_buffer(expected.len()), expected);
+    assert_eq!(rust_select.to_dense_buffer().unwrap(), expected);
 
     let slice_start = [1i64, 1];
     let slice_stop = [4i64, 5];
@@ -2754,7 +2761,7 @@ fn test_b2nd_c_rust_mutation_and_selection_parity() {
         );
     }
     let rust_slice_buffer = rust_select
-        .get_slice_cbuffer(&slice_start, &slice_stop, &[3, 4])
+        .slice_to_dense_buffer(&slice_start, &slice_stop, &[3, 4])
         .unwrap();
     let mut expected_slice = Vec::new();
     for row in 1..4 {
@@ -2785,7 +2792,7 @@ fn test_b2nd_c_rust_mutation_and_selection_parity() {
         );
     }
     let rust_selected = rust_select
-        .get_orthogonal_selection(&[selection_axis0.to_vec(), selection_axis1.to_vec()])
+        .select_orthogonal(&[selection_axis0.to_vec(), selection_axis1.to_vec()])
         .unwrap();
     let mut expected_selected = Vec::new();
     for row in selection_axis0 {
@@ -2817,7 +2824,11 @@ fn test_b2nd_c_rust_mutation_and_selection_parity() {
         assert_eq!(ffi::b2nd_free(c_squeezed), 0);
     }
     assert_eq!(
-        rust_singleton.squeeze_view().unwrap().to_cbuffer().unwrap(),
+        rust_singleton
+            .squeeze_view()
+            .unwrap()
+            .to_dense_buffer()
+            .unwrap(),
         singleton_data
     );
 
@@ -2860,13 +2871,13 @@ fn test_b2nd_c_rust_mutation_and_selection_parity() {
             ctx: std::ptr::null_mut(),
             array: c_concat,
         };
-        c_concat_array.to_cbuffer(20)
+        c_concat_array.to_dense_buffer(20)
     };
     assert_eq!(
         c_concat_buffer,
         [left_data.as_slice(), right_data.as_slice()].concat()
     );
-    assert_eq!(rust_concat.to_cbuffer().unwrap(), c_concat_buffer);
+    assert_eq!(rust_concat.to_dense_buffer().unwrap(), c_concat_buffer);
 }
 
 #[test]
@@ -2935,7 +2946,7 @@ fn test_rust_frame_c_reads() {
         schunk.append_buffer(chunk).unwrap();
     }
 
-    let mut frame = schunk.to_frame();
+    let mut frame = schunk.to_contiguous_frame();
     let c_schunk =
         unsafe { ffi::blosc2_schunk_from_buffer(frame.as_mut_ptr(), frame.len() as i64, true) };
     assert!(!c_schunk.is_null(), "C failed to open Rust-produced frame");
@@ -2984,7 +2995,7 @@ fn test_rust_vlblocks_frame_c_reads() {
     let block_refs: Vec<&[u8]> = blocks.iter().map(Vec::as_slice).collect();
     let expected_concat: Vec<u8> = blocks.iter().flatten().copied().collect();
     schunk.append_vlblocks(&block_refs).unwrap();
-    let mut frame = schunk.to_frame();
+    let mut frame = schunk.to_contiguous_frame();
     assert_ne!(
         frame[25] & FRAME_VL_BLOCKS,
         0,
@@ -3086,16 +3097,18 @@ fn test_c_vlblocks_frame_rust_reads() {
             0,
             "C VL-block schunk frame should set FRAME_VL_BLOCKS"
         );
-        let rust_schunk = Schunk::from_frame(&frame).unwrap();
+        let rust_schunk = Schunk::from_contiguous_frame(&frame).unwrap();
         assert_eq!(rust_schunk.nchunks(), 1);
         assert_eq!(rust_schunk.decompress_vlblock(0, 1).unwrap(), blocks[1]);
         assert_eq!(
             rust_schunk.decompress_chunk(0).unwrap(),
             blocks.iter().flatten().copied().collect::<Vec<_>>()
         );
-        assert!(ChunkHeader::read(rust_schunk.compressed_chunk(0).unwrap())
-            .unwrap()
-            .vl_blocks());
+        assert!(
+            ChunkHeader::read(rust_schunk.compressed_chunk_bytes(0).unwrap())
+                .unwrap()
+                .vl_blocks()
+        );
     }
 }
 
@@ -3108,7 +3121,7 @@ fn test_rust_vlmetalayer_frame_c_reads() {
     let content = b"variable-length metalayer content that C must decompress";
     schunk.add_vlmetalayer("vlmeta", content).unwrap();
 
-    let mut frame = schunk.to_frame();
+    let mut frame = schunk.to_contiguous_frame();
     let c_schunk =
         unsafe { ffi::blosc2_schunk_from_buffer(frame.as_mut_ptr(), frame.len() as i64, true) };
     assert!(
@@ -3204,7 +3217,7 @@ fn test_c_frame_metalayers_rust_reads() {
         }
         assert_eq!(ffi::blosc2_schunk_free(c_schunk), 0);
 
-        let rust = Schunk::from_frame(&frame).unwrap();
+        let rust = Schunk::from_contiguous_frame(&frame).unwrap();
         assert_eq!(rust.nchunks(), chunks.len() as i64);
         for (idx, expected) in chunks.iter().enumerate() {
             assert_eq!(rust.decompress_chunk(idx as i64).unwrap(), *expected);
@@ -3242,7 +3255,7 @@ fn test_rust_sframe_c_reads() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rust-sframe.b2frame");
-    schunk.to_sframe_dir(&path).unwrap();
+    schunk.write_sparse_frame_dir(&path).unwrap();
     let c_path = CString::new(path.to_str().unwrap()).unwrap();
     let c_schunk = unsafe { ffi::blosc2_schunk_open(c_path.as_ptr()) };
     assert!(!c_schunk.is_null(), "C failed to open Rust-produced sframe");
@@ -3318,7 +3331,7 @@ fn test_c_sframe_rust_reads() {
         assert_eq!(ffi::blosc2_schunk_free(c_schunk), 0);
     }
 
-    let rust = Schunk::open_sframe(&path).unwrap();
+    let rust = Schunk::open_sparse_frame(&path).unwrap();
     assert_eq!(rust.nchunks(), chunks.len() as i64);
     for (idx, expected) in chunks.iter().enumerate() {
         assert_eq!(
@@ -3326,6 +3339,6 @@ fn test_c_sframe_rust_reads() {
             expected.as_slice()
         );
     }
-    let lazy = Schunk::open_lazy_sframe(&path).unwrap();
+    let lazy = Schunk::open_lazy_sparse_frame(&path).unwrap();
     assert_eq!(lazy.decompress_chunk(1).unwrap(), chunks[1]);
 }

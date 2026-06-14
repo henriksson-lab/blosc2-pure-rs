@@ -13,7 +13,7 @@ use crate::b2nd::B2ndMeta;
 use crate::constants::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{c_char, c_uint, c_void, CStr};
 use std::sync::{OnceLock, RwLock};
 #[cfg(feature = "plugin-zfp")]
 use zfp_rs::{
@@ -34,6 +34,79 @@ pub type Blosc2PrefilterCb = Option<unsafe extern "C" fn(params: *mut c_void) ->
 
 /// Opaque C-ABI postfilter callback slot in `blosc2_dparams`.
 pub type Blosc2PostfilterCb = Option<unsafe extern "C" fn(params: *mut c_void) -> i32>;
+
+unsafe extern "C" {
+    #[link_name = "ZSTD_createCCtx"]
+    fn c_zstd_create_cctx() -> *mut c_void;
+    #[link_name = "ZSTD_freeCCtx"]
+    fn c_zstd_free_cctx(cctx: *mut c_void) -> usize;
+    #[link_name = "ZSTD_compressCCtx"]
+    fn c_zstd_compress_cctx(
+        cctx: *mut c_void,
+        dst: *mut c_void,
+        dst_capacity: usize,
+        src: *const c_void,
+        src_size: usize,
+        compression_level: i32,
+    ) -> usize;
+    #[link_name = "ZSTD_createCDict"]
+    fn c_zstd_create_cdict(
+        dict_buffer: *const c_void,
+        dict_size: usize,
+        compression_level: i32,
+    ) -> *mut c_void;
+    #[link_name = "ZSTD_freeCDict"]
+    fn c_zstd_free_cdict(cdict: *mut c_void) -> usize;
+    #[link_name = "ZSTD_compress_usingCDict"]
+    fn c_zstd_compress_using_cdict(
+        cctx: *mut c_void,
+        dst: *mut c_void,
+        dst_capacity: usize,
+        src: *const c_void,
+        src_size: usize,
+        cdict: *const c_void,
+    ) -> usize;
+    #[link_name = "ZSTD_isError"]
+    fn c_zstd_is_error(code: usize) -> c_uint;
+}
+
+struct CZstdCCtx {
+    ptr: *mut c_void,
+}
+
+impl CZstdCCtx {
+    fn new() -> Option<Self> {
+        let ptr = unsafe { c_zstd_create_cctx() };
+        (!ptr.is_null()).then_some(Self { ptr })
+    }
+}
+
+impl Drop for CZstdCCtx {
+    fn drop(&mut self) {
+        unsafe {
+            c_zstd_free_cctx(self.ptr);
+        }
+    }
+}
+
+struct CZstdCDict {
+    ptr: *mut c_void,
+}
+
+impl CZstdCDict {
+    fn new(dict: &[u8], clevel: i32) -> Option<Self> {
+        let ptr = unsafe { c_zstd_create_cdict(dict.as_ptr().cast(), dict.len(), clevel) };
+        (!ptr.is_null()).then_some(Self { ptr })
+    }
+}
+
+impl Drop for CZstdCDict {
+    fn drop(&mut self) {
+        unsafe {
+            c_zstd_free_cdict(self.ptr);
+        }
+    }
+}
 
 /// Signature for a user-defined compression function registered via
 /// [`register_codec`].
@@ -510,8 +583,8 @@ static USER_CODECS: OnceLock<RwLock<HashMap<u8, UserCodec>>> = OnceLock::new();
 static USER_CODEC_ORDER: OnceLock<RwLock<Vec<u8>>> = OnceLock::new();
 
 thread_local! {
-    static ZSTD_CCTX: RefCell<Option<Box<ZSTD_CCtx>>> = const { RefCell::new(None) };
-    static ZSTD_DICT_CCTX: RefCell<Option<Box<ZSTD_CCtx>>> = const { RefCell::new(None) };
+    static C_ZSTD_CCTX: RefCell<Option<CZstdCCtx>> = const { RefCell::new(None) };
+    static C_ZSTD_DICT_CCTX: RefCell<Option<CZstdCCtx>> = const { RefCell::new(None) };
     static ZSTD_DICT_DCTX: RefCell<Box<ZSTD_DCtx>> = RefCell::new(ZSTD_createDCtx());
     static ZSTD_DCTX: RefCell<(Box<ZSTD_DCtx>, ZSTD_decoder_entropy_rep, XXH64_state_t)> =
         RefCell::new((
@@ -1164,11 +1237,13 @@ pub fn compress_block_with_context(
         BLOSC_ZLIB => zlib_compress(src, dest, clevel),
         BLOSC_ZSTD => zstd_compress(src, dest, clevel),
         #[cfg(feature = "plugin-ndlz")]
-        BLOSC_CODEC_NDLZ => ndlz_compress(meta, src, dest, context.as_ref()),
+        BLOSC_CODEC_NDLZ => compress_ndlz_plugin_block(meta, src, dest, context.as_ref()),
         #[cfg(feature = "plugin-zfp")]
         BLOSC_CODEC_ZFP_FIXED_ACCURACY
         | BLOSC_CODEC_ZFP_FIXED_PRECISION
-        | BLOSC_CODEC_ZFP_FIXED_RATE => zfp_compress(compcode, meta, src, dest, context.as_ref()),
+        | BLOSC_CODEC_ZFP_FIXED_RATE => {
+            compress_zfp_plugin_block(compcode, meta, src, dest, context.as_ref())
+        }
         _ => match user_codecs()
             .read()
             .ok()
@@ -1260,11 +1335,13 @@ pub fn decompress_block_with_context(
         BLOSC_ZLIB => zlib_decompress(src, dest),
         BLOSC_ZSTD => zstd_decompress(src, dest),
         #[cfg(feature = "plugin-ndlz")]
-        BLOSC_CODEC_NDLZ => ndlz_decompress(meta, src, dest),
+        BLOSC_CODEC_NDLZ => decompress_ndlz_plugin_block(meta, src, dest),
         #[cfg(feature = "plugin-zfp")]
         BLOSC_CODEC_ZFP_FIXED_ACCURACY
         | BLOSC_CODEC_ZFP_FIXED_PRECISION
-        | BLOSC_CODEC_ZFP_FIXED_RATE => zfp_decompress(compcode, meta, src, dest, context.as_ref()),
+        | BLOSC_CODEC_ZFP_FIXED_RATE => {
+            decompress_zfp_plugin_block(compcode, meta, src, dest, context.as_ref())
+        }
         _ => match user_codecs()
             .read()
             .ok()
@@ -1557,17 +1634,26 @@ fn blosc_clevel_to_zstd(clevel: u8) -> i32 {
 /// Zstd compression of a single block, using a thread-local context to
 /// avoid repeated allocations across calls.
 fn zstd_compress(src: &[u8], dest: &mut [u8], clevel: u8) -> i32 {
-    let n = ZSTD_CCTX.with(|slot| {
+    let n = C_ZSTD_CCTX.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
-            *slot = ZSTD_createCCtx();
+            *slot = CZstdCCtx::new();
         }
-        let Some(cctx) = slot.as_deref_mut() else {
-            return ERROR(ErrorCode::MemoryAllocation);
+        let Some(cctx) = slot.as_ref() else {
+            return 0;
         };
-        ZSTD_compressCCtx(cctx, dest, src, blosc_clevel_to_zstd(clevel))
+        unsafe {
+            c_zstd_compress_cctx(
+                cctx.ptr,
+                dest.as_mut_ptr().cast(),
+                dest.len(),
+                src.as_ptr().cast(),
+                src.len(),
+                blosc_clevel_to_zstd(clevel),
+            )
+        }
     });
-    if ERR_isError(n) {
+    if c_zstd_code_is_error(n) || n > i32::MAX as usize {
         0
     } else {
         n as i32
@@ -1576,21 +1662,37 @@ fn zstd_compress(src: &[u8], dest: &mut [u8], clevel: u8) -> i32 {
 
 /// Zstd compression of a single block, seeded with a preset dictionary.
 fn zstd_compress_with_dict(src: &[u8], dest: &mut [u8], _clevel: u8, dict: &[u8]) -> i32 {
-    let n = ZSTD_DICT_CCTX.with(|slot| {
+    let Some(cdict) = CZstdCDict::new(dict, 1) else {
+        return 0;
+    };
+    let n = C_ZSTD_DICT_CCTX.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
-            *slot = ZSTD_createCCtx();
+            *slot = CZstdCCtx::new();
         }
-        let Some(cctx) = slot.as_deref_mut() else {
-            return ERROR(ErrorCode::MemoryAllocation);
+        let Some(cctx) = slot.as_ref() else {
+            return 0;
         };
-        ZSTD_compress_usingDict(cctx, dest, src, dict, 1)
+        unsafe {
+            c_zstd_compress_using_cdict(
+                cctx.ptr,
+                dest.as_mut_ptr().cast(),
+                dest.len(),
+                src.as_ptr().cast(),
+                src.len(),
+                cdict.ptr,
+            )
+        }
     });
-    if ERR_isError(n) {
+    if c_zstd_code_is_error(n) || n > i32::MAX as usize {
         0
     } else {
         n as i32
     }
+}
+
+fn c_zstd_code_is_error(code: usize) -> bool {
+    unsafe { c_zstd_is_error(code) != 0 }
 }
 
 /// Decompress a single zstd-encoded block via a thread-local decoder context.
@@ -1816,7 +1918,7 @@ fn xxh32_seed1(input: &[u8]) -> u32 {
     hash ^ (hash >> 16)
 }
 
-fn ndlz_compress(
+fn compress_ndlz_plugin_block(
     meta: u8,
     src: &[u8],
     dest: &mut [u8],
@@ -1834,7 +1936,7 @@ fn ndlz_compress(
     if b2nd_meta.shape.len() != 2 || b2nd_meta.blockshape.len() != 2 {
         return -1;
     }
-    ndlz_compress_block_2d(
+    compress_ndlz_2d_block(
         meta,
         [b2nd_meta.blockshape[0], b2nd_meta.blockshape[1]],
         src,
@@ -1842,15 +1944,15 @@ fn ndlz_compress(
     )
 }
 
-fn ndlz_decompress(meta: u8, src: &[u8], dest: &mut [u8]) -> i32 {
+fn decompress_ndlz_plugin_block(meta: u8, src: &[u8], dest: &mut [u8]) -> i32 {
     match meta {
-        4 | 8 => ndlz_decompress_cell(meta as usize, src, dest),
+        4 | 8 => decompress_ndlz_cell_stream(meta as usize, src, dest),
         _ => -1,
     }
 }
 
 #[cfg(feature = "plugin-zfp")]
-fn zfp_compress(
+fn compress_zfp_plugin_block(
     compcode: u8,
     meta: u8,
     src: &[u8],
@@ -1863,10 +1965,10 @@ fn zfp_compress(
     let Some(cparams) = context.cparams else {
         return 0;
     };
-    let Ok(desc) = zfp_descriptor(context.b2nd_metalayer, cparams.typesize, src.len()) else {
+    let Ok(desc) = describe_zfp_block(context.b2nd_metalayer, cparams.typesize, src.len()) else {
         return BLOSC2_ERROR_FAILURE;
     };
-    let config = zfp_config(compcode, meta, desc.scalar_type, desc.dimensionality);
+    let config = zfp_config_for_mode(compcode, meta, desc.scalar_type, desc.dimensionality);
     let capacity = config
         .maximum_size(desc.scalar_type, &desc.dims[..desc.ndim])
         .max(dest.len());
@@ -1887,7 +1989,7 @@ fn zfp_compress(
 }
 
 #[cfg(feature = "plugin-zfp")]
-fn zfp_decompress(
+fn decompress_zfp_plugin_block(
     compcode: u8,
     meta: u8,
     src: &[u8],
@@ -1900,10 +2002,10 @@ fn zfp_decompress(
     let Some(dparams) = context.dparams else {
         return 0;
     };
-    let Ok(desc) = zfp_descriptor(context.b2nd_metalayer, dparams.typesize, dest.len()) else {
+    let Ok(desc) = describe_zfp_block(context.b2nd_metalayer, dparams.typesize, dest.len()) else {
         return BLOSC2_ERROR_FAILURE;
     };
-    let config = zfp_config(compcode, meta, desc.scalar_type, desc.dimensionality);
+    let config = zfp_config_for_mode(compcode, meta, desc.scalar_type, desc.dimensionality);
     let mut field = unsafe {
         ZfpFieldMut::from_raw(
             dest.as_mut_ptr(),
@@ -1930,7 +2032,7 @@ struct ZfpBlockDescriptor {
 }
 
 #[cfg(feature = "plugin-zfp")]
-fn zfp_descriptor(
+fn describe_zfp_block(
     b2nd_metalayer: Option<&[u8]>,
     typesize: i32,
     data_len: usize,
@@ -1976,7 +2078,7 @@ fn zfp_descriptor(
 }
 
 #[cfg(feature = "plugin-zfp")]
-fn zfp_config(
+fn zfp_config_for_mode(
     compcode: u8,
     meta: u8,
     scalar_type: ZfpScalarType,
@@ -2030,7 +2132,7 @@ fn ndlz_table_match(
 ///
 /// This emits literal cells, same-value cells, full-cell back references, and
 /// row pair/triple back references to previously emitted literal rows.
-pub fn ndlz_compress_block_2d(meta: u8, blockshape: [i32; 2], src: &[u8], dest: &mut [u8]) -> i32 {
+pub fn compress_ndlz_2d_block(meta: u8, blockshape: [i32; 2], src: &[u8], dest: &mut [u8]) -> i32 {
     let cell_shape = match meta {
         4 | 8 => meta as usize,
         _ => return -1,
@@ -2399,7 +2501,7 @@ fn ndlz_copy_rows_from_stream(
     Some(())
 }
 
-fn ndlz_decompress_cell(cell_shape: usize, src: &[u8], dest: &mut [u8]) -> i32 {
+fn decompress_ndlz_cell_stream(cell_shape: usize, src: &[u8], dest: &mut [u8]) -> i32 {
     if src.len() < 8 {
         return 0;
     }
@@ -3239,6 +3341,11 @@ mod tests {
     #[test]
     fn known_global_codec_registration_is_descriptor_idempotent_without_dispatch() {
         let mut compressed = vec![0; 32];
+        #[cfg(feature = "plugin-zfp")]
+        let unsupported_without_static_plugin = 0;
+        #[cfg(not(feature = "plugin-zfp"))]
+        let unsupported_without_static_plugin = BLOSC2_ERROR_CODEC_SUPPORT;
+
         assert_eq!(
             compress_block(
                 BLOSC_CODEC_ZFP_FIXED_ACCURACY,
@@ -3246,7 +3353,7 @@ mod tests {
                 b"payload",
                 &mut compressed
             ),
-            BLOSC2_ERROR_CODEC_SUPPORT
+            unsupported_without_static_plugin
         );
         assert_eq!(
             registered_codec_name(BLOSC_CODEC_ZFP_FIXED_ACCURACY),
@@ -3306,16 +3413,20 @@ mod tests {
                 b"payload",
                 &mut compressed
             ),
-            BLOSC2_ERROR_CODEC_SUPPORT
+            unsupported_without_static_plugin
         );
         let mut decompressed = vec![0; 7];
+        #[cfg(feature = "plugin-zfp")]
+        let unsupported_decompress_without_static_plugin = 0;
+        #[cfg(not(feature = "plugin-zfp"))]
+        let unsupported_decompress_without_static_plugin = BLOSC2_ERROR_CODEC_SUPPORT;
         assert_eq!(
             decompress_block(
                 BLOSC_CODEC_ZFP_FIXED_ACCURACY,
                 b"payload",
                 &mut decompressed
             ),
-            BLOSC2_ERROR_CODEC_SUPPORT
+            unsupported_decompress_without_static_plugin
         );
     }
 
@@ -3450,8 +3561,8 @@ mod tests {
             user_data: 0xbeef,
         };
         let mut decoded = vec![0; src.len()];
-        let mut compressed_chunk = vec![0u8; 128];
-        compressed_chunk.extend_from_slice(&encoded[..cbytes as usize]);
+        let mut compressed_chunk_bytes = vec![0u8; 128];
+        compressed_chunk_bytes.extend_from_slice(&encoded[..cbytes as usize]);
         let compressed_block = encoded[..cbytes as usize].to_vec();
         assert_eq!(
             decompress_block_with_context(
@@ -3468,7 +3579,7 @@ mod tests {
                     dparams: Some(&dparams),
                     chunk: CodecChunkContext {
                         nchunk: 34,
-                        chunk_source: compressed_chunk.as_ptr() as usize,
+                        chunk_source: compressed_chunk_bytes.as_ptr() as usize,
                         ..chunk
                     },
                     b2nd_metalayer: None,
@@ -3495,7 +3606,7 @@ mod tests {
         assert_eq!(C_ABI_DECOMPRESS_SCHUNK.load(Ordering::SeqCst), 0x1234);
         assert_eq!(
             C_ABI_DECOMPRESS_CHUNK.load(Ordering::SeqCst),
-            compressed_chunk.as_ptr() as usize
+            compressed_chunk_bytes.as_ptr() as usize
         );
         assert!(!C_ABI_DECOMPRESS_POSTFILTER_SET.load(Ordering::SeqCst));
         assert_eq!(C_ABI_DECOMPRESS_POSTPARAMS.load(Ordering::SeqCst), 0);
@@ -3969,7 +4080,7 @@ mod tests {
     #[cfg(feature = "plugin-zfp")]
     #[test]
     fn zfp_fixed_precision_meta_clamps_to_c_max_precision() {
-        let config = zfp_config(
+        let config = zfp_config_for_mode(
             BLOSC_CODEC_ZFP_FIXED_PRECISION,
             u8::MAX,
             ZfpScalarType::Float,
@@ -4126,7 +4237,7 @@ mod tests {
             (8, [8, 8], (20..84).collect::<Vec<_>>()),
         ] {
             let mut encoded = vec![0; input.len() + 32];
-            let cbytes = ndlz_compress_block_2d(meta, blockshape, &input, &mut encoded);
+            let cbytes = compress_ndlz_2d_block(meta, blockshape, &input, &mut encoded);
             assert_eq!(cbytes, 0);
         }
     }
@@ -4136,39 +4247,39 @@ mod tests {
         let small_input = vec![1; 12];
         let mut encoded = vec![0; 64];
         assert_eq!(
-            ndlz_compress_block_2d(4, [3, 4], &small_input, &mut encoded),
+            compress_ndlz_2d_block(4, [3, 4], &small_input, &mut encoded),
             0
         );
         let mut no_header_space = vec![0; 8];
         assert_eq!(
-            ndlz_compress_block_2d(4, [3, 4], &small_input, &mut no_header_space),
+            compress_ndlz_2d_block(4, [3, 4], &small_input, &mut no_header_space),
             -1
         );
 
         let input: Vec<u8> = (1..=16).collect();
         assert_eq!(
-            ndlz_compress_block_2d(4, [4, 4], &input, &mut no_header_space),
+            compress_ndlz_2d_block(4, [4, 4], &input, &mut no_header_space),
             -1
         );
         let mut too_small_output = vec![0; 16];
         assert_eq!(
-            ndlz_compress_block_2d(4, [4, 4], &input, &mut too_small_output),
+            compress_ndlz_2d_block(4, [4, 4], &input, &mut too_small_output),
             0
         );
-        assert_eq!(ndlz_compress_block_2d(4, [4, 4], &input, &mut encoded), 0);
+        assert_eq!(compress_ndlz_2d_block(4, [4, 4], &input, &mut encoded), 0);
         let padded_input: Vec<u8> = (1..=20).collect();
         assert_eq!(
-            ndlz_compress_block_2d(4, [4, 5], &padded_input, &mut encoded),
+            compress_ndlz_2d_block(4, [4, 5], &padded_input, &mut encoded),
             0
         );
 
         let mut encoded = vec![0; 64];
-        assert_eq!(ndlz_compress_block_2d(5, [4, 4], &input, &mut encoded), -1);
+        assert_eq!(compress_ndlz_2d_block(5, [4, 4], &input, &mut encoded), -1);
         assert_eq!(
-            ndlz_compress_block_2d(4, [4, 4], &input[..15], &mut encoded),
+            compress_ndlz_2d_block(4, [4, 4], &input[..15], &mut encoded),
             -1
         );
-        assert_eq!(ndlz_compress_block_2d(4, [-1, 4], &input, &mut encoded), -1);
+        assert_eq!(compress_ndlz_2d_block(4, [-1, 4], &input, &mut encoded), -1);
     }
 
     #[test]
@@ -4177,14 +4288,14 @@ mod tests {
         input[16..].copy_from_slice(&[1, 2, 3, 4]);
         let mut encoded = vec![0; 27];
 
-        assert_eq!(ndlz_compress_block_2d(4, [4, 5], &input, &mut encoded), 0);
+        assert_eq!(compress_ndlz_2d_block(4, [4, 5], &input, &mut encoded), 0);
     }
 
     #[test]
     fn ndlz_encoder_uses_repeat_cell_token_for_full_constant_cells() {
         let input = vec![9; 16];
         let mut encoded = vec![0; 64];
-        let cbytes = ndlz_compress_block_2d(4, [4, 4], &input, &mut encoded);
+        let cbytes = compress_ndlz_2d_block(4, [4, 4], &input, &mut encoded);
         assert_eq!(cbytes, 11);
         assert_eq!(&encoded[..11], &[2, 4, 0, 0, 0, 4, 0, 0, 0, 0x40, 9]);
 
@@ -4211,7 +4322,7 @@ mod tests {
         }
 
         let mut encoded = vec![0; 96];
-        let cbytes = ndlz_compress_block_2d(4, [4, 8], &input, &mut encoded);
+        let cbytes = compress_ndlz_2d_block(4, [4, 8], &input, &mut encoded);
         assert_eq!(cbytes, 29);
         assert_eq!(encoded[9], 0);
         assert_eq!(encoded[26], 0xc0);
@@ -4240,7 +4351,7 @@ mod tests {
         }
 
         let mut encoded = vec![0; 192];
-        let cbytes = ndlz_compress_block_2d(8, [8, 16], &input, &mut encoded);
+        let cbytes = compress_ndlz_2d_block(8, [8, 16], &input, &mut encoded);
         assert_eq!(cbytes, 77);
         assert_eq!(encoded[9], 0);
         assert_eq!(encoded[74], 0xc0);
@@ -4278,7 +4389,7 @@ mod tests {
         }
 
         let mut encoded = vec![0; 96];
-        let cbytes = ndlz_compress_block_2d(4, [4, 16], &triple_input, &mut encoded);
+        let cbytes = compress_ndlz_2d_block(4, [4, 16], &triple_input, &mut encoded);
         assert_eq!(cbytes, 37);
         assert_eq!(encoded[26], (7 << 5) | (2 << 3));
         assert_eq!(u16::from_le_bytes([encoded[27], encoded[28]]), 12);
@@ -4309,7 +4420,7 @@ mod tests {
             pair_input.extend_from_slice(&[8, 8, 8, 8]);
         }
 
-        let cbytes = ndlz_compress_block_2d(4, [4, 16], &pair_input, &mut encoded);
+        let cbytes = compress_ndlz_2d_block(4, [4, 16], &pair_input, &mut encoded);
         assert_eq!(cbytes, 41);
         assert_eq!(encoded[26], (1 << 7) | (2 << 3));
         assert_eq!(u16::from_le_bytes([encoded[27], encoded[28]]), 16);
@@ -4347,7 +4458,7 @@ mod tests {
         }
 
         let mut encoded = vec![0; 96];
-        let cbytes = ndlz_compress_block_2d(4, [4, 12], &input, &mut encoded);
+        let cbytes = compress_ndlz_2d_block(4, [4, 12], &input, &mut encoded);
         assert_eq!(cbytes, 48);
         assert_eq!(encoded[43], 40);
         assert_eq!(u16::from_le_bytes([encoded[44], encoded[45]]), 33);
@@ -4378,7 +4489,7 @@ mod tests {
         }
 
         let mut encoded = vec![0; 192];
-        let cbytes = ndlz_compress_block_2d(8, [8, 16], &triple_input, &mut encoded);
+        let cbytes = compress_ndlz_2d_block(8, [8, 16], &triple_input, &mut encoded);
         assert_eq!(cbytes, 117);
         assert_eq!(encoded[74], (21 << 3) | 2);
         assert_eq!(u16::from_le_bytes([encoded[75], encoded[76]]), 64);
@@ -4406,7 +4517,7 @@ mod tests {
             pair_input.extend_from_slice(&second_row);
         }
 
-        let cbytes = ndlz_compress_block_2d(8, [8, 16], &pair_input, &mut encoded);
+        let cbytes = compress_ndlz_2d_block(8, [8, 16], &pair_input, &mut encoded);
         assert_eq!(cbytes, 125);
         assert_eq!(encoded[74], (17 << 3) | 3);
         assert_eq!(u16::from_le_bytes([encoded[75], encoded[76]]), 64);

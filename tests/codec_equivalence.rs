@@ -289,7 +289,7 @@ fn zfp_b2nd_meta() -> B2ndMeta {
 }
 
 fn rust_b2nd_zfp_array(compcode: u8, meta: u8, data: &[u8]) -> B2ndArray {
-    B2ndArray::from_cbuffer(
+    B2ndArray::from_dense_buffer(
         zfp_b2nd_meta(),
         data,
         CParams {
@@ -400,7 +400,7 @@ fn assert_dictionary_chunk(chunk: &[u8], context: &str) {
 }
 
 fn embedded_dict_bytes(chunk: &[u8]) -> Vec<u8> {
-    let (nbytes, _cbytes, blocksize) = compress::cbuffer_sizes(chunk).unwrap();
+    let (nbytes, _cbytes, blocksize) = compress::chunk_sizes(chunk).unwrap();
     let nblocks = nbytes.div_ceil(blocksize);
     let dict_size_pos = BLOSC_EXTENDED_HEADER_LENGTH + nblocks * 4;
     let dict_size = i32::from_le_bytes(chunk[dict_size_pos..dict_size_pos + 4].try_into().unwrap());
@@ -489,7 +489,7 @@ fn test_ndlz_c_plugin_repeat_and_reject_status_fixtures() {
     };
     assert!(compress::blosc2_create_cctx(cparams.clone()).is_ok());
     assert_eq!(
-        compress::compress(&(0..128u8).collect::<Vec<_>>(), &cparams).unwrap_err(),
+        compress::compress_chunk(&(0..128u8).collect::<Vec<_>>(), &cparams).unwrap_err(),
         "Codec compression failed"
     );
 }
@@ -512,7 +512,7 @@ fn test_ndlz_rust_encoder_emits_c_wire_full_cell_match_fixtures() {
         }
 
         let mut encoded = vec![0; input.len() + 64];
-        let cbytes = codecs::ndlz_compress_block_2d(meta, [rows, cols], &input, &mut encoded);
+        let cbytes = codecs::compress_ndlz_2d_block(meta, [rows, cols], &input, &mut encoded);
         assert_eq!(cbytes, expected_cbytes);
         let match_token_pos = 9 + 1 + cell_shape * cell_shape;
         assert_eq!(encoded[match_token_pos], 0xc0);
@@ -572,12 +572,12 @@ fn test_ndlz_c_plugin_sentinel_error_fixtures() {
     let input = vec![1u8; 16];
     let mut encoded = vec![0u8; 64];
     assert_eq!(
-        codecs::ndlz_compress_block_2d(5, [4, 4], &input, &mut encoded),
+        codecs::compress_ndlz_2d_block(5, [4, 4], &input, &mut encoded),
         -1,
         "unsupported NDLZ encoder metadata must mirror C's reject sentinel"
     );
     assert_eq!(
-        codecs::ndlz_compress_block_2d(4, [3, 4], &input[..12], &mut encoded),
+        codecs::compress_ndlz_2d_block(4, [3, 4], &input[..12], &mut encoded),
         0,
         "non-cell-aligned NDLZ blocks must mirror C's fallback sentinel"
     );
@@ -606,7 +606,7 @@ fn test_zfp_plugin_modes_require_b2nd_context_metadata() {
             .flat_map(|i| ((i as f32) * 0.5 + 1.0).to_ne_bytes())
             .collect();
         assert_eq!(
-            compress::compress(&input, &cparams).unwrap_err(),
+            compress::compress_chunk(&input, &cparams).unwrap_err(),
             "Codec compression failed",
             "ZFP compcode={compcode} compression must require b2nd metadata"
         );
@@ -624,7 +624,7 @@ fn test_zfp_b2nd_static_codec_matches_c_plugin_fixture() {
         (BLOSC_CODEC_ZFP_FIXED_RATE, 45),
     ] {
         let rust_array = rust_b2nd_zfp_array(compcode, compcode_meta, &data);
-        let rust_dense = rust_array.to_cbuffer().unwrap();
+        let rust_dense = rust_array.to_dense_buffer().unwrap();
         let rust_chunks = rust_array.schunk.chunks.clone();
         let (c_dense, c_chunks) = c_b2nd_zfp_dense_and_chunks(compcode, compcode_meta, &data);
 
@@ -661,7 +661,7 @@ fn test_dictionary_codecs_c_compress_rust_and_c_decompress_parity() {
         let c_chunk = c_compress_chunk(&data, compcode, true);
         assert_dictionary_chunk(&c_chunk, &format!("C codec={compcode}"));
 
-        let rust_decoded = compress::decompress(&c_chunk)
+        let rust_decoded = compress::decompress_chunk(&c_chunk)
             .unwrap_or_else(|e| panic!("Rust failed to decode C dict codec={compcode}: {e}"));
         let c_decoded =
             c_decompress_chunk(&c_chunk, data.len(), &format!("C dict codec={compcode}"));
@@ -693,11 +693,11 @@ fn test_dictionary_codecs_rust_compress_c_and_rust_decompress_parity() {
             use_dict: true,
             ..Default::default()
         };
-        let rust_chunk = compress::compress(&data, &cparams)
+        let rust_chunk = compress::compress_chunk(&data, &cparams)
             .unwrap_or_else(|e| panic!("Rust dict compress failed for codec={compcode}: {e}"));
         assert_dictionary_chunk(&rust_chunk, &format!("Rust codec={compcode}"));
 
-        let rust_decoded = compress::decompress(&rust_chunk)
+        let rust_decoded = compress::decompress_chunk(&rust_chunk)
             .unwrap_or_else(|e| panic!("Rust failed to decode Rust dict codec={compcode}: {e}"));
         let c_decoded = c_decompress_chunk(
             &rust_chunk,
@@ -714,7 +714,7 @@ fn test_dictionary_codecs_rust_compress_c_and_rust_decompress_parity() {
 }
 
 #[test]
-fn test_zstd_dictionary_training_gap_is_explicit() {
+fn test_zstd_dictionary_training_is_byte_identical_single_threaded() {
     let _b = init_blosc2();
     let data = dictionary_fixture_data();
     let c_chunk = c_compress_chunk(&data, BLOSC_ZSTD, true);
@@ -728,11 +728,11 @@ fn test_zstd_dictionary_training_gap_is_explicit() {
         use_dict: true,
         ..Default::default()
     };
-    let rust_chunk = compress::compress(&data, &cparams).unwrap();
+    let rust_chunk = compress::compress_chunk(&data, &cparams).unwrap();
 
     assert_dictionary_chunk(&c_chunk, "C Zstd dict");
     assert_dictionary_chunk(&rust_chunk, "Rust Zstd dict");
-    assert_eq!(compress::decompress(&c_chunk).unwrap(), data);
+    assert_eq!(compress::decompress_chunk(&c_chunk).unwrap(), data);
     assert_eq!(
         c_decompress_chunk(&rust_chunk, data.len(), "Rust Zstd dict"),
         data
@@ -740,12 +740,16 @@ fn test_zstd_dictionary_training_gap_is_explicit() {
 
     let c_dict = embedded_dict_bytes(&c_chunk);
     let rust_dict = embedded_dict_bytes(&rust_chunk);
-    assert_ne!(
+    assert_eq!(
         rust_dict, c_dict,
-        "Rust still uses an independent pure-Rust dictionary trainer; this should become equal once ZDICT fastCover training is ported byte-for-byte"
+        "Rust must train the embedded Zstd dictionary with byte-identical ZDICT output"
     );
     assert_eq!(&c_dict[..4], &ZSTD_MAGIC_DICTIONARY.to_le_bytes());
     assert_eq!(&rust_dict[..4], &ZSTD_MAGIC_DICTIONARY.to_le_bytes());
+    assert_eq!(
+        rust_chunk, c_chunk,
+        "single-threaded Rust Zstd dictionary chunks must be byte-identical to C"
+    );
 }
 
 #[test]
@@ -765,14 +769,14 @@ fn test_zstd_low_diversity_dictionary_use_matches_c() {
         use_dict: true,
         ..Default::default()
     };
-    let rust_chunk = compress::compress(&data, &cparams).unwrap();
+    let rust_chunk = compress::compress_chunk(&data, &cparams).unwrap();
 
     assert_eq!(
         c_chunk[BLOSC2_CHUNK_BLOSC2_FLAGS] & BLOSC2_USEDICT,
         rust_chunk[BLOSC2_CHUNK_BLOSC2_FLAGS] & BLOSC2_USEDICT,
         "low-diversity Zstd dictionary fallback must match C use_dict flag"
     );
-    assert_eq!(compress::decompress(&c_chunk).unwrap(), data);
+    assert_eq!(compress::decompress_chunk(&c_chunk).unwrap(), data);
     assert_eq!(
         c_decompress_chunk(&rust_chunk, data.len(), "Rust low-diversity Zstd"),
         data
@@ -803,7 +807,7 @@ fn test_dictionary_request_on_unsupported_codec_matches_c_reject_status() {
             ..Default::default()
         };
         assert_eq!(
-            compress::compress(&data, &cparams).unwrap_err(),
+            compress::compress_chunk(&data, &cparams).unwrap_err(),
             "Dictionary compression is only supported for Zstd, LZ4, and LZ4HC",
             "Rust must mirror C's dictionary rejection before writing unsupported codec={compcode}"
         );
@@ -1086,11 +1090,11 @@ fn test_user_codec_meta_and_udcodec_header_match_c_registered_codec_wire_rules()
         filters: [0; BLOSC2_MAX_FILTERS],
         ..Default::default()
     };
-    let chunk = compress::compress(&data, &cparams)
+    let chunk = compress::compress_chunk(&data, &cparams)
         .expect("registered user codec chunk compression must succeed");
     assert_udcodec_header(&chunk, code, META, "registered user codec");
     assert_eq!(
-        compress::decompress(&chunk).expect("registered user codec chunk must decode"),
+        compress::decompress_chunk(&chunk).expect("registered user codec chunk must decode"),
         data
     );
 }
@@ -1305,7 +1309,7 @@ fn test_raw_c_abi_codec_registration_forwards_codec_params_like_c() {
         ..Default::default()
     };
     assert_eq!(
-        compress::compress(&data, &dict_cparams).unwrap_err(),
+        compress::compress_chunk(&data, &dict_cparams).unwrap_err(),
         "Dictionary compression is only supported for Zstd, LZ4, and LZ4HC",
         "C rejects use_dict before invoking user-codec callbacks for unsupported codecs"
     );
@@ -1325,8 +1329,8 @@ fn test_raw_c_abi_codec_registration_forwards_codec_params_like_c() {
         ..Default::default()
     };
     raw_codec_reset_snapshots();
-    let chunk =
-        compress::compress(&data, &cparams).expect("raw C ABI codec chunk compression must work");
+    let chunk = compress::compress_chunk(&data, &cparams)
+        .expect("raw C ABI codec chunk compression must work");
     assert_udcodec_header(&chunk, code, META, "raw C ABI registered codec");
     assert_eq!(
         RAW_CODEC_LAST_COMP_CODE.load(Ordering::SeqCst),
@@ -1390,7 +1394,7 @@ fn test_raw_c_abi_codec_registration_forwards_codec_params_like_c() {
     };
     raw_codec_reset_snapshots();
     assert_eq!(
-        compress::decompress_with_dparams(&chunk, &dparams)
+        compress::decompress_chunk_with_dparams(&chunk, &dparams)
             .expect("raw C ABI codec chunk must decode"),
         data
     );
@@ -1445,7 +1449,7 @@ fn test_raw_c_abi_codec_registration_forwards_codec_params_like_c() {
         ..Default::default()
     };
     raw_codec_reset_snapshots();
-    let vlchunk = compress::vlcompress(&vl_refs, &vl_cparams)
+    let vlchunk = compress::compress_vl_blocks(&vl_refs, &vl_cparams)
         .expect("raw C ABI codec VL compression must work");
     assert_eq!(
         RAW_CODEC_LAST_ENCODER_CHUNK_PTR.load(Ordering::SeqCst),
@@ -1480,7 +1484,7 @@ fn test_raw_c_abi_codec_registration_forwards_codec_params_like_c() {
     });
     raw_codec_reset_snapshots();
     assert_eq!(
-        vl_dctx.vldecompress_block(&vlchunk, 1).unwrap(),
+        vl_dctx.decompress_vl_block(&vlchunk, 1).unwrap(),
         vl_blocks[1]
     );
     assert_eq!(
@@ -1502,7 +1506,7 @@ fn test_raw_c_abi_codec_registration_forwards_codec_params_like_c() {
         "raw C ABI VL decoder postparams must not be fabricated from Rust postfilter user_data"
     );
     assert_eq!(RAW_CODEC_LAST_DPARAMS_SCHUNK.load(Ordering::SeqCst), 0x8642);
-    assert_eq!(compress::vldecompress(&vlchunk).unwrap(), vl_blocks);
+    assert_eq!(compress::decompress_vl_blocks(&vlchunk).unwrap(), vl_blocks);
 }
 
 /// Compress with C BloscLZ, decompress with Rust BloscLZ
@@ -1540,8 +1544,8 @@ fn test_blosclz_c_compress_rust_decompress() {
     assert!(csize > 0, "C compression failed");
 
     // Decompress with Rust for the cross-compatibility assertion.
-    let rust_decompressed =
-        compress::decompress(&compressed[..csize as usize]).expect("Rust decompression failed");
+    let rust_decompressed = compress::decompress_chunk(&compressed[..csize as usize])
+        .expect("Rust decompression failed");
     assert_eq!(rust_decompressed, data, "Rust decompression mismatch");
 
     // Decompress with C too, so failures are easier to diagnose.
@@ -1560,7 +1564,7 @@ fn test_blosclz_c_compress_rust_decompress() {
 
 fn assert_c_chunk_rust_and_c_decompress_parity(data: &[u8], compcode: u8, context: &str) {
     let c_chunk = c_compress_chunk(data, compcode, false);
-    let rust_decoded = compress::decompress(&c_chunk)
+    let rust_decoded = compress::decompress_chunk(&c_chunk)
         .unwrap_or_else(|e| panic!("Rust failed to decode C chunk for {context}: {e}"));
     let c_decoded = c_decompress_chunk(&c_chunk, data.len(), context);
 
@@ -1581,9 +1585,9 @@ fn assert_rust_chunk_rust_and_c_decompress_parity(data: &[u8], compcode: u8, con
         filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
         ..Default::default()
     };
-    let rust_chunk = compress::compress(data, &cparams)
+    let rust_chunk = compress::compress_chunk(data, &cparams)
         .unwrap_or_else(|e| panic!("Rust failed to compress chunk for {context}: {e}"));
-    let rust_decoded = compress::decompress(&rust_chunk)
+    let rust_decoded = compress::decompress_chunk(&rust_chunk)
         .unwrap_or_else(|e| panic!("Rust failed to decode Rust chunk for {context}: {e}"));
     let c_decoded = c_decompress_chunk(&rust_chunk, data.len(), context);
 

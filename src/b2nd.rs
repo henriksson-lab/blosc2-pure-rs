@@ -662,17 +662,17 @@ pub fn b2nd_full_ctx_c(
     )
 }
 
-/// C-name alias for [`B2ndArray::from_cbuffer`].
+/// C-name alias for [`B2ndArray::from_dense_buffer`].
 pub fn b2nd_from_cbuffer(
     meta: B2ndMeta,
     data: &[u8],
     cparams: CParams,
     dparams: DParams,
 ) -> Result<B2ndArray, &'static str> {
-    B2ndArray::from_cbuffer(meta, data, cparams, dparams)
+    B2ndArray::from_dense_buffer(meta, data, cparams, dparams)
 }
 
-/// C-style status adapter for [`B2ndArray::from_cbuffer`].
+/// C-style status adapter for [`B2ndArray::from_dense_buffer`].
 pub fn b2nd_from_cbuffer_c(
     meta: B2ndMeta,
     data: &[u8],
@@ -686,7 +686,7 @@ pub fn b2nd_from_cbuffer_c(
     }
 }
 
-/// C-style context adapter for [`B2ndArray::from_cbuffer`].
+/// C-style context adapter for [`B2ndArray::from_dense_buffer`].
 pub fn b2nd_from_cbuffer_ctx_c(
     ctx: &B2ndContext,
     data: &[u8],
@@ -735,7 +735,7 @@ fn b2nd_fill_created_array_from_cbuffer_c(
     let start = vec![0i64; ndim];
     let stop = array.meta.shape.clone();
     let buffershape = array.meta.shape.clone();
-    match array.set_slice_cbuffer(&start, &stop, &buffershape, data) {
+    match array.set_slice_from_dense_buffer(&start, &stop, &buffershape, data) {
         Ok(()) => (BLOSC2_ERROR_SUCCESS, Some(array)),
         Err(err) => (b2nd_selection_error_code(err), Some(array)),
     }
@@ -758,15 +758,16 @@ pub fn b2nd_from_schunk_c(schunk: Schunk) -> (i32, Option<B2ndArray>) {
     }
 }
 
-/// C-name alias for [`B2ndArray::from_frame`].
+/// C-name alias for [`B2ndArray::from_contiguous_frame`].
 pub fn b2nd_from_cframe(frame: &[u8], copy: bool) -> Result<B2ndArray, String> {
     if !copy {
-        return B2ndArray::from_schunk(Schunk::from_frame_borrowed(frame)?).map_err(str::to_string);
+        return B2ndArray::from_schunk(Schunk::from_borrowed_contiguous_frame(frame)?)
+            .map_err(str::to_string);
     }
-    B2ndArray::from_frame(frame)
+    B2ndArray::from_contiguous_frame(frame)
 }
 
-/// C-style status adapter for [`B2ndArray::from_frame`].
+/// C-style status adapter for [`B2ndArray::from_contiguous_frame`].
 pub fn b2nd_from_cframe_c(frame: &[u8], cframe_len: i64, copy: bool) -> (i32, Option<B2ndArray>) {
     let frame = match b2nd_checked_cbuffer_prefix(frame, cframe_len) {
         Ok(frame) => frame,
@@ -778,12 +779,12 @@ pub fn b2nd_from_cframe_c(frame: &[u8], cframe_len: i64, copy: bool) -> (i32, Op
     }
 }
 
-/// C-name alias for [`B2ndArray::to_frame`].
+/// C-name alias for [`B2ndArray::to_contiguous_frame`].
 pub fn b2nd_to_cframe(array: &B2ndArray) -> Vec<u8> {
-    array.to_frame()
+    array.to_contiguous_frame()
 }
 
-/// C-style frame writer for [`B2ndArray::to_frame`].
+/// C-style frame writer for [`B2ndArray::to_contiguous_frame`].
 ///
 /// The returned `needs_free` flag mirrors `blosc2_schunk_to_buffer`, including
 /// `false` for a borrowed in-memory contiguous frame. This Rust adapter still
@@ -830,21 +831,21 @@ pub fn b2nd_open_c(path: impl AsRef<Path>) -> (i32, Option<B2ndArray>) {
     }
 }
 
-/// C-name alias for [`B2ndArray::open_offset`].
+/// C-name alias for [`B2ndArray::open_frame_at`].
 pub fn b2nd_open_offset(path: impl AsRef<Path>, offset: i64) -> Result<B2ndArray, String> {
     if offset < 0 {
         return Err("Invalid frame offset".into());
     }
-    B2ndArray::open_offset(path, offset as u64)
+    B2ndArray::open_frame_at(path, offset as u64)
 }
 
-/// C-style status adapter for [`B2ndArray::open_offset`].
+/// C-style status adapter for [`B2ndArray::open_frame_at`].
 pub fn b2nd_open_offset_c(path: impl AsRef<Path>, offset: i64) -> (i32, Option<B2ndArray>) {
     let offset = match u64::try_from(offset) {
         Ok(offset) => offset,
         Err(_) => return (BLOSC2_ERROR_NULL_POINTER, None),
     };
-    match B2ndArray::open_offset(path, offset) {
+    match B2ndArray::open_frame_at(path, offset) {
         Ok(array) => (BLOSC2_ERROR_SUCCESS, Some(array)),
         Err(err) => (b2nd_open_error_code(&err), None),
     }
@@ -875,12 +876,12 @@ fn b2nd_file_write_error_code(err: &std::io::Error) -> i32 {
     }
 }
 
-/// C-name alias for [`B2ndArray::to_cbuffer`].
+/// C-name alias for [`B2ndArray::to_dense_buffer`].
 pub fn b2nd_to_cbuffer_vec(array: &B2ndArray) -> Result<Vec<u8>, &'static str> {
-    array.to_cbuffer()
+    array.to_dense_buffer()
 }
 
-/// C-style dense buffer writer for [`B2ndArray::to_cbuffer`].
+/// C-style dense buffer writer for [`B2ndArray::to_dense_buffer`].
 pub fn b2nd_to_cbuffer(array: &B2ndArray, dest: &mut [u8]) -> i32 {
     let required = match array.preflight_dense_cbuffer_len() {
         Ok(required) => required,
@@ -892,7 +893,7 @@ pub fn b2nd_to_cbuffer(array: &B2ndArray, dest: &mut [u8]) -> i32 {
     if dest.len() < required {
         return BLOSC2_ERROR_INVALID_PARAM;
     }
-    match array.to_cbuffer() {
+    match array.to_dense_buffer() {
         Ok(buffer) => {
             dest[..buffer.len()].copy_from_slice(&buffer);
             BLOSC2_ERROR_SUCCESS
@@ -917,7 +918,7 @@ pub fn b2nd_to_cbuffer_c(array: &B2ndArray, dest: &mut [u8], buffersize: i64) ->
     if buffersize < required {
         return BLOSC2_ERROR_INVALID_PARAM;
     }
-    match array.to_cbuffer() {
+    match array.to_dense_buffer() {
         Ok(buffer) => {
             dest[..buffersize].fill(0);
             dest[..buffer.len()].copy_from_slice(&buffer);
@@ -1076,32 +1077,32 @@ pub fn b2nd_squeeze_index_c(array: &B2ndArray, axes: &[bool]) -> (i32, Option<B2
     }
 }
 
-/// C-name alias for [`B2ndArray::copy_array_with_meta`].
+/// C-name alias for [`B2ndArray::copy_with_meta`].
 pub fn b2nd_copy(
     array: &B2ndArray,
     meta: B2ndMeta,
     cparams: CParams,
     dparams: DParams,
 ) -> Result<B2ndArray, &'static str> {
-    array.copy_array_with_meta(meta, cparams, dparams)
+    array.copy_with_meta(meta, cparams, dparams)
 }
 
-/// C-style status adapter for [`B2ndArray::copy_array_with_meta`].
+/// C-style status adapter for [`B2ndArray::copy_with_meta`].
 pub fn b2nd_copy_c(
     array: &B2ndArray,
     meta: B2ndMeta,
     cparams: CParams,
     dparams: DParams,
 ) -> (i32, Option<B2ndArray>) {
-    b2nd_array_result_to_c(array.copy_array_with_meta(meta, cparams, dparams))
+    b2nd_array_result_to_c(array.copy_with_meta(meta, cparams, dparams))
 }
 
-/// C-style context adapter for [`B2ndArray::copy_array_with_meta`].
+/// C-style context adapter for [`B2ndArray::copy_with_meta`].
 pub fn b2nd_copy_ctx_c(ctx: &mut B2ndContext, array: &B2ndArray) -> (i32, Option<B2ndArray>) {
     ctx.meta.shape = array.meta.shape.clone();
     b2nd_ctx_array_result_to_c(
         ctx,
-        array.copy_array_with_meta(ctx.meta.clone(), ctx.cparams.clone(), ctx.dparams.clone()),
+        array.copy_with_meta(ctx.meta.clone(), ctx.cparams.clone(), ctx.dparams.clone()),
     )
 }
 
@@ -1208,7 +1209,7 @@ pub fn b2nd_concatenate_ctx_axis_c(
     b2nd_concatenate_ctx_c(ctx, array, other, axis, copy)
 }
 
-/// C-name alias for [`B2ndArray::get_slice_array_with_meta`].
+/// C-name alias for [`B2ndArray::slice_with_meta`].
 pub fn b2nd_get_slice(
     array: &B2ndArray,
     start: &[i64],
@@ -1220,7 +1221,7 @@ pub fn b2nd_get_slice(
     b2nd_get_slice_array_with_meta_c(array, start, stop, meta, cparams, dparams, &[])
 }
 
-/// C-style status adapter for [`B2ndArray::get_slice_array_with_meta`].
+/// C-style status adapter for [`B2ndArray::slice_with_meta`].
 pub fn b2nd_get_slice_c(
     array: &B2ndArray,
     start: &[i64],
@@ -1240,7 +1241,7 @@ pub fn b2nd_get_slice_c(
     ))
 }
 
-/// C-style context adapter for [`B2ndArray::get_slice_array_with_meta`].
+/// C-style context adapter for [`B2ndArray::slice_with_meta`].
 pub fn b2nd_get_slice_ctx_c(
     ctx: &mut B2ndContext,
     array: &B2ndArray,
@@ -1262,7 +1263,7 @@ pub fn b2nd_get_slice_ctx_c(
     let metalayers = ctx.metalayer_refs();
     b2nd_ctx_array_result_to_c(
         ctx,
-        array.get_slice_array_with_meta_and_metalayers(
+        array.slice_with_meta_and_metalayers(
             start,
             stop,
             ctx.meta.clone(),
@@ -1273,17 +1274,17 @@ pub fn b2nd_get_slice_ctx_c(
     )
 }
 
-/// C-name alias for [`B2ndArray::get_slice_cbuffer`].
+/// C-name alias for [`B2ndArray::slice_to_dense_buffer`].
 pub fn b2nd_get_slice_cbuffer_vec(
     array: &B2ndArray,
     start: &[i64],
     stop: &[i64],
     buffershape: &[i64],
 ) -> Result<Vec<u8>, &'static str> {
-    array.get_slice_cbuffer(start, stop, buffershape)
+    array.slice_to_dense_buffer(start, stop, buffershape)
 }
 
-/// C-style slice writer for [`B2ndArray::get_slice_cbuffer`].
+/// C-style slice writer for [`B2ndArray::slice_to_dense_buffer`].
 pub fn b2nd_get_slice_cbuffer(
     array: &B2ndArray,
     start: &[i64],
@@ -1308,7 +1309,7 @@ pub fn b2nd_get_slice_cbuffer(
         dest.fill(0);
         return BLOSC2_ERROR_SUCCESS;
     }
-    match array.get_slice_cbuffer(start, stop, buffershape) {
+    match array.slice_to_dense_buffer(start, stop, buffershape) {
         Ok(buffer) => {
             dest[..buffer.len()].copy_from_slice(&buffer);
             BLOSC2_ERROR_SUCCESS
@@ -1399,7 +1400,7 @@ pub fn b2nd_get_slice_nchunks(
     }
 }
 
-/// C-name alias for [`B2ndArray::set_slice_cbuffer`].
+/// C-name alias for [`B2ndArray::set_slice_from_dense_buffer`].
 pub fn b2nd_set_slice_cbuffer(
     data: &[u8],
     buffershape: &[i64],
@@ -1419,7 +1420,7 @@ pub fn b2nd_set_slice_cbuffer(
     {
         return BLOSC2_ERROR_SUCCESS;
     }
-    match array.set_slice_cbuffer(start, stop, buffershape, data) {
+    match array.set_slice_from_dense_buffer(start, stop, buffershape, data) {
         Ok(()) => BLOSC2_ERROR_SUCCESS,
         Err(_) => BLOSC2_ERROR_INVALID_PARAM,
     }
@@ -1454,21 +1455,21 @@ pub fn b2nd_set_slice_cbuffer_c(
     b2nd_set_slice_cbuffer(data, buffershape, start, stop, array)
 }
 
-/// C-name alias for [`B2ndArray::get_orthogonal_selection`].
+/// C-name alias for [`B2ndArray::select_orthogonal`].
 pub fn b2nd_get_orthogonal_selection(
     array: &B2ndArray,
     selection: &[Vec<i64>],
 ) -> Result<Vec<u8>, &'static str> {
-    array.get_orthogonal_selection(selection)
+    array.select_orthogonal(selection)
 }
 
-/// C-name alias for [`B2ndArray::get_orthogonal_selection_cbuffer`].
+/// C-name alias for [`B2ndArray::orthogonal_selection_to_dense_buffer`].
 pub fn b2nd_get_orthogonal_selection_cbuffer(
     array: &B2ndArray,
     selection: &[Vec<i64>],
     buffershape: &[i64],
 ) -> Result<Vec<u8>, &'static str> {
-    array.get_orthogonal_selection_cbuffer(selection, buffershape)
+    array.orthogonal_selection_to_dense_buffer(selection, buffershape)
 }
 
 /// C-style orthogonal selection writer with an explicit destination size.
@@ -1586,14 +1587,14 @@ pub fn b2nd_set_orthogonal_selection(
     array.set_orthogonal_selection(selection, data)
 }
 
-/// C-name alias for [`B2ndArray::set_orthogonal_selection_cbuffer`].
+/// C-name alias for [`B2ndArray::set_orthogonal_selection_from_dense_buffer`].
 pub fn b2nd_set_orthogonal_selection_cbuffer(
     array: &mut B2ndArray,
     selection: &[Vec<i64>],
     buffershape: &[i64],
     data: &[u8],
 ) -> Result<(), &'static str> {
-    array.set_orthogonal_selection_cbuffer(selection, buffershape, data)
+    array.set_orthogonal_selection_from_dense_buffer(selection, buffershape, data)
 }
 
 /// C-style orthogonal selection setter with an explicit source size.
@@ -1674,34 +1675,34 @@ pub fn b2nd_set_orthogonal_selection_count_c(
     )
 }
 
-/// C-name alias for [`B2ndArray::resize_at`].
+/// C-name alias for [`B2ndArray::resize_with_start`].
 pub fn b2nd_resize(
     array: &mut B2ndArray,
     new_shape: Vec<i64>,
     start: Option<&[i64]>,
 ) -> Result<(), &'static str> {
-    array.resize_at(new_shape, start)
+    array.resize_with_start(new_shape, start)
 }
 
-/// C-style status adapter for [`B2ndArray::resize_at`].
+/// C-style status adapter for [`B2ndArray::resize_with_start`].
 pub fn b2nd_resize_c(array: &mut B2ndArray, new_shape: Vec<i64>, start: Option<&[i64]>) -> i32 {
-    match array.resize_at(new_shape, start) {
+    match array.resize_with_start(new_shape, start) {
         Ok(()) => BLOSC2_ERROR_SUCCESS,
         Err(_) => BLOSC2_ERROR_INVALID_PARAM,
     }
 }
 
-/// C-name alias for [`B2ndArray::insert_cbuffer`].
+/// C-name alias for [`B2ndArray::insert_dense_buffer`].
 pub fn b2nd_insert(
     array: &mut B2ndArray,
     data: &[u8],
     axis: usize,
     start: i64,
 ) -> Result<(), &'static str> {
-    array.insert_cbuffer(axis, start, data)
+    array.insert_dense_buffer(axis, start, data)
 }
 
-/// C-style status adapter for [`B2ndArray::insert_cbuffer`].
+/// C-style status adapter for [`B2ndArray::insert_dense_buffer`].
 pub fn b2nd_insert_c(
     array: &mut B2ndArray,
     data: &[u8],
@@ -1713,13 +1714,13 @@ pub fn b2nd_insert_c(
         Ok(data) => data,
         Err(code) => return code,
     };
-    match array.insert_cbuffer(axis, start, data) {
+    match array.insert_dense_buffer(axis, start, data) {
         Ok(()) => BLOSC2_ERROR_SUCCESS,
         Err(_) => BLOSC2_ERROR_INVALID_PARAM,
     }
 }
 
-/// Signed-axis C-style status adapter for [`B2ndArray::insert_cbuffer`].
+/// Signed-axis C-style status adapter for [`B2ndArray::insert_dense_buffer`].
 pub fn b2nd_insert_axis_c(
     array: &mut B2ndArray,
     data: &[u8],
@@ -1734,24 +1735,24 @@ pub fn b2nd_insert_axis_c(
     b2nd_insert_c(array, data, buffersize, axis, start)
 }
 
-/// C-name alias for [`B2ndArray::append_cbuffer`].
+/// C-name alias for [`B2ndArray::append_dense_buffer`].
 pub fn b2nd_append(array: &mut B2ndArray, data: &[u8], axis: usize) -> Result<(), &'static str> {
-    array.append_cbuffer(axis, data)
+    array.append_dense_buffer(axis, data)
 }
 
-/// C-style status adapter for [`B2ndArray::append_cbuffer`].
+/// C-style status adapter for [`B2ndArray::append_dense_buffer`].
 pub fn b2nd_append_c(array: &mut B2ndArray, data: &[u8], buffersize: i64, axis: usize) -> i32 {
     let data = match b2nd_checked_cbuffer_prefix(data, buffersize) {
         Ok(data) => data,
         Err(code) => return code,
     };
-    match array.append_cbuffer(axis, data) {
+    match array.append_dense_buffer(axis, data) {
         Ok(()) => BLOSC2_ERROR_SUCCESS,
         Err(_) => BLOSC2_ERROR_INVALID_PARAM,
     }
 }
 
-/// Signed-axis C-style status adapter for [`B2ndArray::append_cbuffer`].
+/// Signed-axis C-style status adapter for [`B2ndArray::append_dense_buffer`].
 pub fn b2nd_append_axis_c(array: &mut B2ndArray, data: &[u8], buffersize: i64, axis: i8) -> i32 {
     let axis = match usize::try_from(axis) {
         Ok(axis) => axis,
@@ -1784,9 +1785,9 @@ pub fn b2nd_delete_c(array: &mut B2ndArray, axis: usize, start: i64, len: i64) -
     let mut resize_start = vec![0i64; ndim];
     resize_start[axis] = start;
     let resize = if start == new_shape[axis] {
-        array.resize_at(new_shape, None)
+        array.resize_with_start(new_shape, None)
     } else {
-        array.resize_at(new_shape, Some(&resize_start))
+        array.resize_with_start(new_shape, Some(&resize_start))
     };
     match resize {
         Ok(()) => BLOSC2_ERROR_SUCCESS,
@@ -1908,7 +1909,7 @@ fn b2nd_get_slice_array_with_meta_c(
         Ok(_) => {}
         Err(err) => return Err(err),
     }
-    array.get_slice_array_with_meta_and_metalayers(start, stop, meta, cparams, dparams, metalayers)
+    array.slice_with_meta_and_metalayers(start, stop, meta, cparams, dparams, metalayers)
 }
 
 fn finish_ctx_array_storage(ctx: &B2ndContext, mut array: B2ndArray) -> Result<B2ndArray, String> {
@@ -1931,7 +1932,7 @@ fn finish_ctx_array_storage(ctx: &B2ndContext, mut array: B2ndArray) -> Result<B
     if storage.contiguous {
         array
             .schunk
-            .to_file_path(path.as_ref())
+            .write_contiguous_frame_path(path.as_ref())
             .map_err(|err| format!("Failed to write B2ND frame: {err}"))?;
     } else {
         array
@@ -2622,7 +2623,7 @@ impl B2ndArray {
     /// in C order. Data is split into chunks and blocks, compressed with
     /// `cparams`, and written to a new super-chunk that carries `meta` as the
     /// `b2nd` metalayer.
-    pub fn from_cbuffer(
+    pub fn from_dense_buffer(
         meta: B2ndMeta,
         data: &[u8],
         cparams: CParams,
@@ -2708,8 +2709,8 @@ impl B2ndArray {
     }
 
     /// Build a b2nd array from a serialized contiguous frame.
-    pub fn from_frame(frame: &[u8]) -> Result<Self, String> {
-        Self::from_schunk(Schunk::from_frame(frame)?).map_err(str::to_string)
+    pub fn from_contiguous_frame(frame: &[u8]) -> Result<Self, String> {
+        Self::from_schunk(Schunk::from_contiguous_frame(frame)?).map_err(str::to_string)
     }
 
     /// Open a b2nd array from a contiguous frame file or sparse frame
@@ -2722,7 +2723,7 @@ impl B2ndArray {
             FrameStorage::Contiguous
         };
         let mut array =
-            Self::from_schunk(Schunk::open_offset(path.as_ref(), 0)?).map_err(str::to_string)?;
+            Self::from_schunk(Schunk::open_frame_at(path.as_ref(), 0)?).map_err(str::to_string)?;
         array.attached_frame = Some(B2ndAttachedFrame {
             path: path.into_owned(),
             storage,
@@ -2733,14 +2734,14 @@ impl B2ndArray {
 
     /// Open a b2nd array from a contiguous frame embedded at `offset` bytes in
     /// a file.
-    pub fn open_offset(path: impl AsRef<Path>, offset: u64) -> Result<Self, String> {
+    pub fn open_frame_at(path: impl AsRef<Path>, offset: u64) -> Result<Self, String> {
         let path = normalized_path(path.as_ref());
         let storage = if path.as_ref().is_dir() {
             FrameStorage::Sparse
         } else {
             FrameStorage::Contiguous
         };
-        let mut array = Self::from_schunk(Schunk::open_offset(path.as_ref(), offset)?)
+        let mut array = Self::from_schunk(Schunk::open_frame_at(path.as_ref(), offset)?)
             .map_err(str::to_string)?;
         array.attached_frame = Some(B2ndAttachedFrame {
             path: path.into_owned(),
@@ -2751,8 +2752,8 @@ impl B2ndArray {
     }
 
     /// Serialize the array as a contiguous in-memory frame.
-    pub fn to_frame(&self) -> Vec<u8> {
-        self.schunk.to_frame()
+    pub fn to_contiguous_frame(&self) -> Vec<u8> {
+        self.schunk.to_contiguous_frame()
     }
 
     /// Write the array at `path`, preserving the source storage kind when the
@@ -2766,25 +2767,28 @@ impl B2ndArray {
             ));
         }
         match self.schunk.storage() {
-            FrameStorage::Contiguous => self.schunk.to_file_path(path.as_ref()).map(|_| ()),
+            FrameStorage::Contiguous => self
+                .schunk
+                .write_contiguous_frame_path(path.as_ref())
+                .map(|_| ()),
             FrameStorage::Sparse => self.save_sframe(path),
         }
     }
 
     /// Write the array as a sparse frame directory.
     pub fn save_sframe(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        self.schunk.to_sframe_dir(path)
+        self.schunk.write_sparse_frame_dir(path)
     }
 
     /// Append the array as a contiguous frame to `path`, returning the frame's
     /// starting byte offset.
     pub fn save_append(&self, path: impl AsRef<Path>) -> std::io::Result<u64> {
-        self.schunk.append_file(path)
+        self.schunk.append_contiguous_frame_file(path)
     }
 
     /// Decompress every chunk and assemble a dense row-major C buffer covering
     /// the full array shape.
-    pub fn to_cbuffer(&self) -> Result<Vec<u8>, &'static str> {
+    pub fn to_dense_buffer(&self) -> Result<Vec<u8>, &'static str> {
         let typesize = b2nd_cparams_typesize(&self.schunk.cparams)?;
         let out_len = self.preflight_dense_cbuffer_len()?;
         let mut out = vec![0u8; out_len];
@@ -2923,7 +2927,7 @@ impl B2ndArray {
     /// `start..stop` in each dimension.
     pub fn get_slice(&self, start: &[i64], stop: &[i64]) -> Result<Vec<u8>, &'static str> {
         let slice = validate_slice_bounds(&self.meta, start, stop)?;
-        self.get_slice_cbuffer(start, stop, &slice.extents_as_i64)
+        self.slice_to_dense_buffer(start, stop, &slice.extents_as_i64)
     }
 
     /// Return the linear chunk indexes touched by the half-open item slice
@@ -2974,9 +2978,9 @@ impl B2ndArray {
     ///
     /// The new array keeps this array's chunkshape, blockshape, dtype and
     /// compression/decompression parameters.
-    pub fn get_slice_array(&self, start: &[i64], stop: &[i64]) -> Result<Self, &'static str> {
+    pub fn slice(&self, start: &[i64], stop: &[i64]) -> Result<Self, &'static str> {
         let slice = validate_slice_bounds(&self.meta, start, stop)?;
-        let data = self.get_slice_cbuffer(start, stop, &slice.extents_as_i64)?;
+        let data = self.slice_to_dense_buffer(start, stop, &slice.extents_as_i64)?;
         let meta = B2ndMeta::new(
             slice.extents_as_i64,
             self.meta.chunkshape.clone(),
@@ -2984,7 +2988,7 @@ impl B2ndArray {
             self.meta.dtype.clone(),
             self.meta.dtype_format,
         )?;
-        Self::from_cbuffer(
+        Self::from_dense_buffer(
             meta,
             &data,
             self.schunk.cparams.clone(),
@@ -2998,7 +3002,7 @@ impl B2ndArray {
     /// The returned shape is always `stop - start`; `meta` supplies chunkshape,
     /// blockshape, dtype and dtype_format, mirroring C-Blosc2's destination
     /// context behavior for `b2nd_get_slice`.
-    pub fn get_slice_array_with_meta(
+    pub fn slice_with_meta(
         &self,
         start: &[i64],
         stop: &[i64],
@@ -3006,7 +3010,7 @@ impl B2ndArray {
         cparams: CParams,
         dparams: DParams,
     ) -> Result<Self, &'static str> {
-        self.get_slice_array_with_meta_and_metalayers(start, stop, meta, cparams, dparams, &[])
+        self.slice_with_meta_and_metalayers(start, stop, meta, cparams, dparams, &[])
     }
 
     /// Return the half-open item slice `start..stop` as a new b2nd array using
@@ -3015,7 +3019,7 @@ impl B2ndArray {
     ///
     /// `meta.shape` is overwritten with `stop - start`; `metalayers` are
     /// attached after the managed `b2nd` descriptor.
-    pub fn get_slice_array_with_meta_and_metalayers(
+    pub fn slice_with_meta_and_metalayers(
         &self,
         start: &[i64],
         stop: &[i64],
@@ -3025,7 +3029,7 @@ impl B2ndArray {
         metalayers: &[(&str, &[u8])],
     ) -> Result<Self, &'static str> {
         let slice = validate_slice_bounds(&self.meta, start, stop)?;
-        let data = self.get_slice_cbuffer(start, stop, &slice.extents_as_i64)?;
+        let data = self.slice_to_dense_buffer(start, stop, &slice.extents_as_i64)?;
         meta.shape = slice.extents_as_i64;
         Self::from_cbuffer_with_metalayers(meta, &data, cparams, dparams, metalayers)
     }
@@ -3033,7 +3037,7 @@ impl B2ndArray {
     /// Deep-copy this array, preserving fixed and variable-length user
     /// metalayers.
     pub fn copy_array(&self) -> Result<Self, &'static str> {
-        self.copy_array_with_meta(
+        self.copy_with_meta(
             self.meta.clone(),
             self.schunk.cparams.clone(),
             self.schunk.dparams.clone(),
@@ -3045,7 +3049,7 @@ impl B2ndArray {
     ///
     /// `meta.shape` is overwritten with the source shape, mirroring C-Blosc2's
     /// destination context behavior for `b2nd_copy`.
-    pub fn copy_array_with_meta(
+    pub fn copy_with_meta(
         &self,
         mut meta: B2ndMeta,
         cparams: CParams,
@@ -3063,7 +3067,7 @@ impl B2ndArray {
         let fixed_metalayers = user_fixed_metalayers(&self.schunk);
         let mut copied = Self::from_cbuffer_with_metalayers(
             meta,
-            &self.to_cbuffer()?,
+            &self.to_dense_buffer()?,
             cparams,
             dparams,
             &fixed_metalayers,
@@ -3092,7 +3096,7 @@ impl B2ndArray {
     /// Existing user metalayers on this array are preserved.
     pub fn concatenate_in_place(&mut self, other: &Self, axis: usize) -> Result<(), &'static str> {
         self.concatenated_shape(other, axis)?;
-        let data = other.to_cbuffer()?;
+        let data = other.to_dense_buffer()?;
         let buffershape = other.meta.shape.clone();
         self.append(axis, &buffershape, &data)
     }
@@ -3150,10 +3154,10 @@ impl B2ndArray {
 
         let mut start = vec![0i64; ndim];
         let mut stop = self.meta.shape.clone();
-        result.set_slice(&start, &stop, &self.to_cbuffer()?)?;
+        result.set_slice(&start, &stop, &self.to_dense_buffer()?)?;
         start[axis] = self.meta.shape[axis];
         stop = new_shape;
-        result.set_slice(&start, &stop, &other.to_cbuffer()?)?;
+        result.set_slice(&start, &stop, &other.to_dense_buffer()?)?;
         Ok(result)
     }
 
@@ -3230,7 +3234,7 @@ impl B2ndArray {
 
     /// Return a dense row-major buffer with explicit buffer shape, filling the
     /// leading region with the half-open item slice and leaving padding zeroed.
-    pub fn get_slice_cbuffer(
+    pub fn slice_to_dense_buffer(
         &self,
         start: &[i64],
         stop: &[i64],
@@ -3314,12 +3318,12 @@ impl B2ndArray {
         data: &[u8],
     ) -> Result<(), &'static str> {
         let slice = validate_slice_bounds(&self.meta, start, stop)?;
-        self.set_slice_cbuffer(start, stop, &slice.extents_as_i64, data)
+        self.set_slice_from_dense_buffer(start, stop, &slice.extents_as_i64, data)
     }
 
     /// Overwrite the half-open item slice from the leading region of a dense
     /// row-major source buffer with explicit buffer shape.
-    pub fn set_slice_cbuffer(
+    pub fn set_slice_from_dense_buffer(
         &mut self,
         start: &[i64],
         stop: &[i64],
@@ -3350,17 +3354,14 @@ impl B2ndArray {
     }
 
     /// Return a dense row-major buffer for an orthogonal selection.
-    pub fn get_orthogonal_selection(
-        &self,
-        selection: &[Vec<i64>],
-    ) -> Result<Vec<u8>, &'static str> {
+    pub fn select_orthogonal(&self, selection: &[Vec<i64>]) -> Result<Vec<u8>, &'static str> {
         let (coords, extents, out_shape) = validate_orthogonal_selection(&self.meta, selection)?;
         self.get_orthogonal_selection_cbuffer_with_validated(&coords, &extents, &out_shape)
     }
 
     /// Return a dense row-major buffer for an orthogonal selection with an
     /// explicit output buffer shape.
-    pub fn get_orthogonal_selection_cbuffer(
+    pub fn orthogonal_selection_to_dense_buffer(
         &self,
         selection: &[Vec<i64>],
         buffershape: &[i64],
@@ -3427,8 +3428,10 @@ impl B2ndArray {
             dparams.nchunk = linear_chunk as i64;
             dparams.block_maskout = Some(read.maskout);
             dparams.b2nd_metalayer = b2nd_metalayer_for_schunk(&self.schunk);
-            let compressed_chunk = self.schunk.compressed_chunk_owned(linear_chunk as i64)?;
-            let chunk = compress::decompress_with_dparams(&compressed_chunk, &dparams)?;
+            let compressed_chunk_bytes = self
+                .schunk
+                .compressed_chunk_bytes_owned(linear_chunk as i64)?;
+            let chunk = compress::decompress_chunk_with_dparams(&compressed_chunk_bytes, &dparams)?;
             if chunk.len() < chunk_nbytes
                 || (!self.allow_oversized_chunks && chunk.len() != chunk_nbytes)
             {
@@ -3470,7 +3473,7 @@ impl B2ndArray {
 
     /// Overwrite an orthogonal selection from the leading region of a dense
     /// row-major source buffer with explicit buffer shape.
-    pub fn set_orthogonal_selection_cbuffer(
+    pub fn set_orthogonal_selection_from_dense_buffer(
         &mut self,
         selection: &[Vec<i64>],
         buffershape: &[i64],
@@ -3543,12 +3546,12 @@ impl B2ndArray {
     /// Resize the array, preserving the overlapping prefix region and zero-filling
     /// new cells.
     pub fn resize(&mut self, new_shape: Vec<i64>) -> Result<(), &'static str> {
-        self.resize_at(new_shape, None)
+        self.resize_with_start(new_shape, None)
     }
 
     /// Resize the array at `start`, following C-Blosc2 `b2nd_resize`
     /// semantics. `None` resizes at the array end in each dimension.
-    pub fn resize_at(
+    pub fn resize_with_start(
         &mut self,
         new_shape: Vec<i64>,
         start: Option<&[i64]>,
@@ -3846,24 +3849,24 @@ impl B2ndArray {
         )?;
         self.transactional_mutation(|array| {
             if start == array.meta.shape[axis] {
-                array.resize_at(new_shape, None)?;
+                array.resize_with_start(new_shape, None)?;
             } else {
                 let mut resize_start = vec![0i64; ndim];
                 resize_start[axis] = start;
-                array.resize_at(new_shape, Some(&resize_start))?;
+                array.resize_with_start(new_shape, Some(&resize_start))?;
             }
 
             let mut slice_start = vec![0i64; ndim];
             let mut slice_stop = array.meta.shape.clone();
             slice_start[axis] = start;
             slice_stop[axis] = start + buffershape[axis];
-            array.set_slice_cbuffer(&slice_start, &slice_stop, buffershape, data)
+            array.set_slice_from_dense_buffer(&slice_start, &slice_stop, buffershape, data)
         })
     }
 
     /// Insert a dense row-major buffer along one axis, deriving the inserted
     /// extent from `data.len()` like C-Blosc2 `b2nd_insert`.
-    pub fn insert_cbuffer(
+    pub fn insert_dense_buffer(
         &mut self,
         axis: usize,
         start: i64,
@@ -3891,7 +3894,7 @@ impl B2ndArray {
 
     /// Append a dense row-major buffer to the end of one axis, deriving the
     /// appended extent from `data.len()` like C-Blosc2 `b2nd_append`.
-    pub fn append_cbuffer(&mut self, axis: usize, data: &[u8]) -> Result<(), &'static str> {
+    pub fn append_dense_buffer(&mut self, axis: usize, data: &[u8]) -> Result<(), &'static str> {
         if self.try_append_full_chunk(axis, None, data)? {
             return Ok(());
         }
@@ -3994,11 +3997,11 @@ impl B2ndArray {
             .checked_sub(len)
             .ok_or("Invalid B2ND delete bounds")?;
         if end == self.meta.shape[axis] {
-            self.resize_at(new_shape, None)
+            self.resize_with_start(new_shape, None)
         } else {
             let mut resize_start = vec![0i64; ndim];
             resize_start[axis] = start;
-            self.resize_at(new_shape, Some(&resize_start))
+            self.resize_with_start(new_shape, Some(&resize_start))
         }
     }
 
@@ -5790,15 +5793,15 @@ mod tests {
     }
 
     fn assert_b2nd_frame_and_reopen_roundtrip(array: &B2ndArray, expected: &[u8]) {
-        let frame = array.to_frame();
-        let restored = B2ndArray::from_frame(&frame).unwrap();
-        assert_eq!(restored.to_cbuffer().unwrap(), expected);
+        let frame = array.to_contiguous_frame();
+        let restored = B2ndArray::from_contiguous_frame(&frame).unwrap();
+        assert_eq!(restored.to_dense_buffer().unwrap(), expected);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("plugin-roundtrip.b2frame");
         array.save(&path).unwrap();
         let reopened = B2ndArray::open(&path).unwrap();
-        assert_eq!(reopened.to_cbuffer().unwrap(), expected);
+        assert_eq!(reopened.to_dense_buffer().unwrap(), expected);
     }
 
     fn b2nd_string_shuffle_data(nitems: usize, string_len: usize) -> Vec<u8> {
@@ -5815,7 +5818,7 @@ mod tests {
     fn b2nd_total_compressed_bytes(array: &B2ndArray) -> usize {
         (0..array.schunk.nchunks())
             .map(|nchunk| {
-                ChunkHeader::read(array.schunk.compressed_chunk(nchunk).unwrap())
+                ChunkHeader::read(array.schunk.compressed_chunk_bytes(nchunk).unwrap())
                     .unwrap()
                     .cbytes as usize
             })
@@ -5891,7 +5894,7 @@ mod tests {
             DTYPE_NUMPY_FORMAT,
         )
         .unwrap();
-        let array = B2ndArray::from_cbuffer(
+        let array = B2ndArray::from_dense_buffer(
             meta,
             &[0u8; 12],
             CParams {
@@ -5937,7 +5940,7 @@ mod tests {
         let mut filter_meta_bytes = [0; BLOSC2_MAX_FILTERS];
         filter_ids[BLOSC2_MAX_FILTERS - 1] = FILTER_ID;
         filter_meta_bytes[BLOSC2_MAX_FILTERS - 1] = 0xa5;
-        let filter_array = B2ndArray::from_cbuffer(
+        let filter_array = B2ndArray::from_dense_buffer(
             filter_meta,
             &filter_data,
             CParams {
@@ -5956,7 +5959,7 @@ mod tests {
         let codec_meta =
             B2ndMeta::new(vec![24], vec![24], vec![24], "|u1", DTYPE_NUMPY_FORMAT).unwrap();
         let codec_data: Vec<u8> = (0..24u8).collect();
-        let codec_array = B2ndArray::from_cbuffer(
+        let codec_array = B2ndArray::from_dense_buffer(
             codec_meta,
             &codec_data,
             CParams {
@@ -5991,7 +5994,7 @@ mod tests {
         let data: Vec<u8> = (0..=255).cycle().take(4096).collect();
         let mut filters = [BLOSC_NOFILTER; BLOSC2_MAX_FILTERS];
         filters[BLOSC2_MAX_FILTERS - 1] = FILTER_ID;
-        let array = B2ndArray::from_cbuffer(
+        let array = B2ndArray::from_dense_buffer(
             meta,
             &data,
             CParams {
@@ -6010,13 +6013,13 @@ mod tests {
             FILTER_ID
         );
         assert_eq!(
-            ChunkHeader::read(array.schunk.compressed_chunk(0).unwrap())
+            ChunkHeader::read(array.schunk.compressed_chunk_bytes(0).unwrap())
                 .unwrap()
                 .filters[BLOSC2_MAX_FILTERS - 1],
             FILTER_ID
         );
         assert_eq!(CONTEXT_FORWARD_B2ND_BLOCK0.load(Ordering::SeqCst), 8);
-        assert_eq!(array.to_cbuffer().unwrap(), data);
+        assert_eq!(array.to_dense_buffer().unwrap(), data);
         assert_eq!(CONTEXT_BACKWARD_B2ND_BLOCK0.load(Ordering::SeqCst), 8);
     }
 
@@ -6026,7 +6029,7 @@ mod tests {
         let data: Vec<u8> = (0..16u8).collect();
         let mut filter_pipeline = [BLOSC_NOFILTER; BLOSC2_MAX_FILTERS];
         filter_pipeline[BLOSC2_MAX_FILTERS - 1] = BLOSC_FILTER_NDCELL;
-        let array = B2ndArray::from_cbuffer(
+        let array = B2ndArray::from_dense_buffer(
             meta,
             &data,
             CParams {
@@ -6048,7 +6051,7 @@ mod tests {
 
         assert_eq!(
             reopened
-                .get_orthogonal_selection(&[vec![1, 3], vec![0, 2]])
+                .select_orthogonal(&[vec![1, 3], vec![0, 2]])
                 .unwrap(),
             vec![4, 6, 12, 14]
         );
@@ -6069,7 +6072,7 @@ mod tests {
 
         let meta = B2ndMeta::new(vec![4096], vec![4096], vec![64], "|u1", 0).unwrap();
         let data: Vec<u8> = (0..=255).cycle().take(4096).collect();
-        let array = B2ndArray::from_cbuffer(
+        let array = B2ndArray::from_dense_buffer(
             meta,
             &data,
             CParams {
@@ -6085,7 +6088,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(CONTEXT_COMPRESS_B2ND_BLOCK0.load(Ordering::SeqCst), 64);
-        assert_eq!(array.to_cbuffer().unwrap(), data);
+        assert_eq!(array.to_dense_buffer().unwrap(), data);
         assert_eq!(CONTEXT_DECOMPRESS_B2ND_BLOCK0.load(Ordering::SeqCst), 64);
     }
     use crate::schunk::Schunk;
@@ -6311,17 +6314,17 @@ mod tests {
         };
 
         let array =
-            B2ndArray::from_cbuffer(meta.clone(), &data, cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta.clone(), &data, cparams, DParams::default()).unwrap();
         assert_eq!(
             array.schunk.metalayer(B2ND_METALAYER_NAME).unwrap(),
             meta.serialize().unwrap()
         );
-        assert_eq!(array.to_cbuffer().unwrap(), expected);
+        assert_eq!(array.to_dense_buffer().unwrap(), expected);
 
-        let frame = array.to_frame();
-        let restored = B2ndArray::from_frame(&frame).unwrap();
+        let frame = array.to_contiguous_frame();
+        let restored = B2ndArray::from_contiguous_frame(&frame).unwrap();
         assert_eq!(restored.meta, meta);
-        assert_eq!(restored.to_cbuffer().unwrap(), expected);
+        assert_eq!(restored.to_dense_buffer().unwrap(), expected);
     }
 
     #[test]
@@ -6377,22 +6380,27 @@ mod tests {
                 ..Default::default()
             };
             charwise_cparams.filters_meta[BLOSC2_MAX_FILTERS - 1] = charsize as u8;
-            let charwise =
-                B2ndArray::from_cbuffer(meta.clone(), &data, charwise_cparams, DParams::default())
-                    .unwrap();
-            assert_eq!(charwise.to_cbuffer().unwrap(), data);
+            let charwise = B2ndArray::from_dense_buffer(
+                meta.clone(),
+                &data,
+                charwise_cparams,
+                DParams::default(),
+            )
+            .unwrap();
+            assert_eq!(charwise.to_dense_buffer().unwrap(), data);
             assert_eq!(
                 charwise.schunk.cparams.filters_meta[BLOSC2_MAX_FILTERS - 1],
                 charsize as u8
             );
-            let restored = B2ndArray::from_frame(&charwise.to_frame()).unwrap();
-            assert_eq!(restored.to_cbuffer().unwrap(), data);
+            let restored =
+                B2ndArray::from_contiguous_frame(&charwise.to_contiguous_frame()).unwrap();
+            assert_eq!(restored.to_dense_buffer().unwrap(), data);
             assert_eq!(
                 restored.schunk.cparams.filters_meta[BLOSC2_MAX_FILTERS - 1],
                 charsize as u8
             );
 
-            let stringwise = B2ndArray::from_cbuffer(
+            let stringwise = B2ndArray::from_dense_buffer(
                 meta,
                 &data,
                 CParams {
@@ -6407,7 +6415,7 @@ mod tests {
                 DParams::default(),
             )
             .unwrap();
-            assert_eq!(stringwise.to_cbuffer().unwrap(), data);
+            assert_eq!(stringwise.to_dense_buffer().unwrap(), data);
             assert!(
                 b2nd_total_compressed_bytes(&charwise) <= b2nd_total_compressed_bytes(&stringwise)
             );
@@ -6427,24 +6435,24 @@ mod tests {
             ..Default::default()
         };
         let array =
-            B2ndArray::from_cbuffer(meta.clone(), &data, cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta.clone(), &data, cparams, DParams::default()).unwrap();
 
         let prefix = b"application-prefix";
         let mut file_data = prefix.to_vec();
-        file_data.extend_from_slice(&array.to_frame());
+        file_data.extend_from_slice(&array.to_contiguous_frame());
         file_data.extend_from_slice(b"trailer");
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("embedded-b2nd.b2frame");
         std::fs::write(&path, file_data).unwrap();
 
-        let restored = B2ndArray::open_offset(&path, prefix.len() as u64).unwrap();
+        let restored = B2ndArray::open_frame_at(&path, prefix.len() as u64).unwrap();
         let file_url = format!("file:///{}", path.display());
-        let restored_from_url = B2ndArray::open_offset(&file_url, prefix.len() as u64).unwrap();
+        let restored_from_url = B2ndArray::open_frame_at(&file_url, prefix.len() as u64).unwrap();
         assert_eq!(restored.meta, meta);
-        assert_eq!(restored.to_cbuffer().unwrap(), data);
+        assert_eq!(restored.to_dense_buffer().unwrap(), data);
         assert_eq!(restored_from_url.meta, meta);
-        assert_eq!(restored_from_url.to_cbuffer().unwrap(), data);
+        assert_eq!(restored_from_url.to_dense_buffer().unwrap(), data);
     }
 
     #[test]
@@ -6460,7 +6468,7 @@ mod tests {
             filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
             ..Default::default()
         };
-        let first = B2ndArray::from_cbuffer(
+        let first = B2ndArray::from_dense_buffer(
             meta.clone(),
             &first_data,
             cparams.clone(),
@@ -6468,36 +6476,36 @@ mod tests {
         )
         .unwrap();
         let second =
-            B2ndArray::from_cbuffer(meta.clone(), &second_data, cparams, DParams::default())
+            B2ndArray::from_dense_buffer(meta.clone(), &second_data, cparams, DParams::default())
                 .unwrap();
 
         let prefix = b"application-prefix";
         let first_offset = prefix.len() as u64;
         let mut file_data = prefix.to_vec();
-        file_data.extend_from_slice(&first.to_frame());
-        file_data.extend_from_slice(&second.to_frame());
+        file_data.extend_from_slice(&first.to_contiguous_frame());
+        file_data.extend_from_slice(&second.to_contiguous_frame());
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("embedded-b2nd-mutation.b2frame");
         std::fs::write(&path, file_data).unwrap();
 
-        let mut opened = B2ndArray::open_offset(&path, first_offset).unwrap();
+        let mut opened = B2ndArray::open_frame_at(&path, first_offset).unwrap();
         opened
             .set_slice(&[0, 0], &[1, 1], &99u16.to_le_bytes())
             .unwrap();
 
         let persisted = std::fs::read(&path).unwrap();
         assert_eq!(&persisted[..prefix.len()], prefix);
-        let restored = B2ndArray::open_offset(&path, first_offset).unwrap();
+        let restored = B2ndArray::open_frame_at(&path, first_offset).unwrap();
         let mut expected = first_data.clone();
         expected[..2].copy_from_slice(&99u16.to_le_bytes());
-        assert_eq!(restored.to_cbuffer().unwrap(), expected);
+        assert_eq!(restored.to_dense_buffer().unwrap(), expected);
 
-        let second_offset = first_offset + restored.to_frame().len() as u64;
+        let second_offset = first_offset + restored.to_contiguous_frame().len() as u64;
         assert_eq!(
-            B2ndArray::open_offset(&path, second_offset)
+            B2ndArray::open_frame_at(&path, second_offset)
                 .unwrap()
-                .to_cbuffer()
+                .to_dense_buffer()
                 .unwrap(),
             second_data
         );
@@ -6516,7 +6524,7 @@ mod tests {
             ..Default::default()
         };
         let array =
-            B2ndArray::from_cbuffer(meta.clone(), &data, cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta.clone(), &data, cparams, DParams::default()).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("embedded-sparse-b2nd.b2frame");
@@ -6532,7 +6540,7 @@ mod tests {
         std::fs::write(&index_path, embedded_index).unwrap();
 
         let offset = prefix.len() as u64;
-        let mut opened = B2ndArray::open_offset(&path, offset).unwrap();
+        let mut opened = B2ndArray::open_frame_at(&path, offset).unwrap();
         opened
             .set_slice(&[0, 0], &[1, 1], &99u16.to_le_bytes())
             .unwrap();
@@ -6540,11 +6548,11 @@ mod tests {
         let persisted_index = std::fs::read(&index_path).unwrap();
         assert_eq!(&persisted_index[..prefix.len()], prefix);
         assert!(persisted_index.ends_with(suffix));
-        let restored = B2ndArray::open_offset(&path, offset).unwrap();
+        let restored = B2ndArray::open_frame_at(&path, offset).unwrap();
         let mut expected = data.clone();
         expected[..2].copy_from_slice(&99u16.to_le_bytes());
         assert_eq!(restored.meta, meta);
-        assert_eq!(restored.to_cbuffer().unwrap(), expected);
+        assert_eq!(restored.to_dense_buffer().unwrap(), expected);
     }
 
     #[test]
@@ -6560,7 +6568,7 @@ mod tests {
             filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
             ..Default::default()
         };
-        let first = B2ndArray::from_cbuffer(
+        let first = B2ndArray::from_dense_buffer(
             meta.clone(),
             &first_data,
             cparams.clone(),
@@ -6568,7 +6576,7 @@ mod tests {
         )
         .unwrap();
         let second =
-            B2ndArray::from_cbuffer(meta.clone(), &second_data, cparams, DParams::default())
+            B2ndArray::from_dense_buffer(meta.clone(), &second_data, cparams, DParams::default())
                 .unwrap();
 
         let dir = tempfile::tempdir().unwrap();
@@ -6579,16 +6587,16 @@ mod tests {
         assert_eq!(first_offset, 0);
         assert!(second_offset > first_offset);
         assert_eq!(
-            B2ndArray::open_offset(&path, first_offset)
+            B2ndArray::open_frame_at(&path, first_offset)
                 .unwrap()
-                .to_cbuffer()
+                .to_dense_buffer()
                 .unwrap(),
             first_data
         );
         assert_eq!(
-            B2ndArray::open_offset(&path, second_offset)
+            B2ndArray::open_frame_at(&path, second_offset)
                 .unwrap()
-                .to_cbuffer()
+                .to_dense_buffer()
                 .unwrap(),
             second_data
         );
@@ -6607,7 +6615,7 @@ mod tests {
             ..Default::default()
         };
         let array =
-            B2ndArray::from_cbuffer(meta.clone(), &data, cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta.clone(), &data, cparams, DParams::default()).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("array-sframe.b2frame");
@@ -6615,7 +6623,7 @@ mod tests {
         assert!(path.join("chunks.b2frame").is_file());
         let restored = B2ndArray::open(&path).unwrap();
         assert_eq!(restored.meta, meta);
-        assert_eq!(restored.to_cbuffer().unwrap(), data);
+        assert_eq!(restored.to_dense_buffer().unwrap(), data);
     }
 
     #[test]
@@ -6631,7 +6639,7 @@ mod tests {
             ..Default::default()
         };
         let array =
-            B2ndArray::from_cbuffer(meta.clone(), &data, cparams.clone(), DParams::default())
+            B2ndArray::from_dense_buffer(meta.clone(), &data, cparams.clone(), DParams::default())
                 .unwrap();
 
         let dir = tempfile::tempdir().unwrap();
@@ -6645,7 +6653,7 @@ mod tests {
         assert_eq!(
             B2ndArray::open(&contiguous_path)
                 .unwrap()
-                .to_cbuffer()
+                .to_dense_buffer()
                 .unwrap(),
             data
         );
@@ -6655,11 +6663,15 @@ mod tests {
             .unwrap();
         assert!(url_path.is_dir());
         assert_eq!(
-            B2ndArray::open(&url_path).unwrap().to_cbuffer().unwrap(),
+            B2ndArray::open(&url_path)
+                .unwrap()
+                .to_dense_buffer()
+                .unwrap(),
             data
         );
 
-        let from_contiguous_frame = B2ndArray::from_frame(&array.to_frame()).unwrap();
+        let from_contiguous_frame =
+            B2ndArray::from_contiguous_frame(&array.to_contiguous_frame()).unwrap();
         let preserved_contiguous_path = dir.path().join("preserved-contiguous.b2frame");
         from_contiguous_frame
             .save(&preserved_contiguous_path)
@@ -6668,7 +6680,7 @@ mod tests {
         assert_eq!(
             B2ndArray::open(&preserved_contiguous_path)
                 .unwrap()
-                .to_cbuffer()
+                .to_dense_buffer()
                 .unwrap(),
             data
         );
@@ -6676,9 +6688,9 @@ mod tests {
         let sparse_path = dir.path().join("array-sparse.b2frame");
         array.save_sframe(&sparse_path).unwrap();
         assert_eq!(
-            B2ndArray::open_offset(&sparse_path, 0)
+            B2ndArray::open_frame_at(&sparse_path, 0)
                 .unwrap()
-                .to_cbuffer()
+                .to_dense_buffer()
                 .unwrap(),
             data
         );
@@ -6688,7 +6700,7 @@ mod tests {
         assert!(preserved_path.join("chunks.b2frame").is_file());
         let restored = B2ndArray::open(&preserved_path).unwrap();
         assert_eq!(restored.meta, meta);
-        assert_eq!(restored.to_cbuffer().unwrap(), data);
+        assert_eq!(restored.to_dense_buffer().unwrap(), data);
     }
 
     #[cfg(unix)]
@@ -6703,7 +6715,8 @@ mod tests {
             typesize: 1,
             ..Default::default()
         };
-        let mut array = B2ndArray::from_cbuffer(meta, &data, cparams, DParams::default()).unwrap();
+        let mut array =
+            B2ndArray::from_dense_buffer(meta, &data, cparams, DParams::default()).unwrap();
         array.schunk.set_storage(FrameStorage::Contiguous);
 
         let dir = tempfile::tempdir().unwrap();
@@ -6713,7 +6726,7 @@ mod tests {
         array.save(&path).unwrap();
 
         let reopened = B2ndArray::open(&path).unwrap();
-        assert_eq!(reopened.to_cbuffer().unwrap(), data);
+        assert_eq!(reopened.to_dense_buffer().unwrap(), data);
         assert!(path.is_file());
         assert!(!dir.path().join("array-\u{fffd}.b2frame").exists());
     }
@@ -6726,7 +6739,8 @@ mod tests {
             typesize: 1,
             ..Default::default()
         };
-        let mut array = B2ndArray::from_cbuffer(meta, &data, cparams, DParams::default()).unwrap();
+        let mut array =
+            B2ndArray::from_dense_buffer(meta, &data, cparams, DParams::default()).unwrap();
         let smaller_meta = B2ndMeta::with_default_dtype(vec![2], vec![2], vec![2], 1).unwrap();
         let encoded = smaller_meta.serialize().unwrap();
         array
@@ -6734,15 +6748,15 @@ mod tests {
             .update_metalayer(B2ND_METALAYER_NAME, &encoded)
             .unwrap();
 
-        let frame = array.schunk.to_frame();
-        let reopened = B2ndArray::from_frame(&frame).unwrap();
+        let frame = array.schunk.to_contiguous_frame();
+        let reopened = B2ndArray::from_contiguous_frame(&frame).unwrap();
         assert_eq!(
-            reopened.to_cbuffer().unwrap_err(),
+            reopened.to_dense_buffer().unwrap_err(),
             "B2ND chunk size does not match metadata"
         );
         assert_eq!(
             reopened
-                .get_orthogonal_selection_cbuffer(&[vec![0, 1]], &[2])
+                .orthogonal_selection_to_dense_buffer(&[vec![0, 1]], &[2])
                 .unwrap_err(),
             "B2ND chunk size does not match metadata"
         );
@@ -6778,11 +6792,11 @@ mod tests {
         let array = array.unwrap();
         assert_eq!(array.schunk.storage(), FrameStorage::Contiguous);
         assert_eq!(array.schunk.metalayer("owner"), Some(&b"ctx-storage"[..]));
-        assert_eq!(array.to_cbuffer().unwrap(), data);
+        assert_eq!(array.to_dense_buffer().unwrap(), data);
         assert_eq!(
             B2ndArray::open(&contiguous_path)
                 .unwrap()
-                .to_cbuffer()
+                .to_dense_buffer()
                 .unwrap(),
             data
         );
@@ -6805,9 +6819,12 @@ mod tests {
         assert!(sparse_path.join("chunks.b2frame").is_file());
         let sparse = sparse.unwrap();
         assert_eq!(sparse.schunk.storage(), FrameStorage::Sparse);
-        assert_eq!(sparse.to_cbuffer().unwrap(), data);
+        assert_eq!(sparse.to_dense_buffer().unwrap(), data);
         assert_eq!(
-            B2ndArray::open(&sparse_path).unwrap().to_cbuffer().unwrap(),
+            B2ndArray::open(&sparse_path)
+                .unwrap()
+                .to_dense_buffer()
+                .unwrap(),
             data
         );
     }
@@ -6893,7 +6910,10 @@ mod tests {
         assert_eq!(zeros.schunk.storage(), FrameStorage::Contiguous);
         assert_eq!(zeros.schunk.metalayer("source"), Some(&b"parts"[..]));
         assert_eq!(
-            B2ndArray::open(&zeros_path).unwrap().to_cbuffer().unwrap(),
+            B2ndArray::open(&zeros_path)
+                .unwrap()
+                .to_dense_buffer()
+                .unwrap(),
             vec![0; 16]
         );
 
@@ -6913,9 +6933,12 @@ mod tests {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
-        assert_eq!(full.unwrap().to_cbuffer().unwrap(), expected);
+        assert_eq!(full.unwrap().to_dense_buffer().unwrap(), expected);
         assert_eq!(
-            B2ndArray::open(&full_path).unwrap().to_cbuffer().unwrap(),
+            B2ndArray::open(&full_path)
+                .unwrap()
+                .to_dense_buffer()
+                .unwrap(),
             expected
         );
     }
@@ -6932,10 +6955,14 @@ mod tests {
         };
 
         let scalar_meta = B2ndMeta::new(Vec::new(), Vec::new(), Vec::new(), "<u2", 0).unwrap();
-        let scalar =
-            B2ndArray::from_cbuffer(scalar_meta.clone(), &[7, 0, 9], cparams, DParams::default())
-                .unwrap();
-        assert_eq!(scalar.to_cbuffer().unwrap(), vec![7, 0]);
+        let scalar = B2ndArray::from_dense_buffer(
+            scalar_meta.clone(),
+            &[7, 0, 9],
+            cparams,
+            DParams::default(),
+        )
+        .unwrap();
+        assert_eq!(scalar.to_dense_buffer().unwrap(), vec![7, 0]);
         assert_eq!(scalar.get_slice_nchunks(&[], &[]).unwrap(), vec![0]);
 
         let mut legacy = scalar.schunk.clone();
@@ -6972,7 +6999,7 @@ mod tests {
         );
 
         let empty_meta = B2ndMeta::new(vec![0, 3], vec![2, 2], vec![1, 1], "", 0).unwrap();
-        let empty = B2ndArray::from_cbuffer(
+        let empty = B2ndArray::from_dense_buffer(
             empty_meta.clone(),
             &[],
             CParams {
@@ -6984,12 +7011,19 @@ mod tests {
         .unwrap();
         assert_eq!(empty.schunk.nchunks(), 0);
         assert_eq!(empty.schunk.chunksize, 4);
-        assert_eq!(empty.to_cbuffer().unwrap(), Vec::<u8>::new());
+        assert_eq!(empty.to_dense_buffer().unwrap(), Vec::<u8>::new());
         assert_eq!(
-            B2ndArray::from_frame(&empty.to_frame()).unwrap().meta,
+            B2ndArray::from_contiguous_frame(&empty.to_contiguous_frame())
+                .unwrap()
+                .meta,
             empty_meta
         );
-        assert_eq!(Schunk::from_frame(&empty.to_frame()).unwrap().chunksize, 4);
+        assert_eq!(
+            Schunk::from_contiguous_frame(&empty.to_contiguous_frame())
+                .unwrap()
+                .chunksize,
+            4
+        );
     }
 
     #[test]
@@ -7022,7 +7056,7 @@ mod tests {
                 DParams::default()
             )
             .unwrap()
-            .to_cbuffer()
+            .to_dense_buffer()
             .unwrap(),
             vec![1, 2, 3, 4, 5, 6]
         );
@@ -7036,14 +7070,14 @@ mod tests {
         assert_eq!(
             b2nd_zeros(meta.clone(), cparams.clone(), DParams::default())
                 .unwrap()
-                .to_cbuffer()
+                .to_dense_buffer()
                 .unwrap(),
             vec![0; 6]
         );
         assert_eq!(
             b2nd_empty(meta.clone(), cparams.clone(), DParams::default())
                 .unwrap()
-                .to_cbuffer()
+                .to_dense_buffer()
                 .unwrap(),
             vec![0; 6]
         );
@@ -7070,11 +7104,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(full.schunk.metalayer("kind"), Some(&b"repeat"[..]));
-        assert_eq!(full.to_cbuffer().unwrap(), vec![9; 6]);
+        assert_eq!(full.to_dense_buffer().unwrap(), vec![9; 6]);
         assert_eq!(
             b2nd_full(meta.clone(), &[7], cparams.clone(), DParams::default())
                 .unwrap()
-                .to_cbuffer()
+                .to_dense_buffer()
                 .unwrap(),
             vec![7; 6]
         );
@@ -7087,7 +7121,7 @@ mod tests {
         assert_eq!(
             b2nd_nans(f32_meta, f32_cparams, DParams::default())
                 .unwrap()
-                .to_cbuffer()
+                .to_dense_buffer()
                 .unwrap()
                 .len(),
             8
@@ -7121,17 +7155,17 @@ mod tests {
         let same_meta_copy = array.copy_array().unwrap();
         assert_eq!(same_meta_copy.meta, array.meta);
         assert_eq!(
-            same_meta_copy.to_cbuffer().unwrap(),
-            array.to_cbuffer().unwrap()
+            same_meta_copy.to_dense_buffer().unwrap(),
+            array.to_dense_buffer().unwrap()
         );
         assert_eq!(
             same_meta_copy.schunk.vlmetalayer("variable"),
             Some(&b"payload"[..])
         );
 
-        let raw_data = array.to_cbuffer().unwrap();
+        let raw_data = array.to_dense_buffer().unwrap();
         let first_chunk_data = array.schunk.decompress_chunk(0).unwrap();
-        let replacement = compress::compress(
+        let replacement = compress::compress_chunk(
             &first_chunk_data,
             &CParams {
                 compcode: BLOSC_ZSTD,
@@ -7145,16 +7179,16 @@ mod tests {
         .unwrap();
         array
             .schunk
-            .update_compressed_chunk(0, &replacement)
+            .replace_compressed_chunk(0, &replacement)
             .unwrap();
         let raw_copy = array.copy_array().unwrap();
         assert_eq!(
-            raw_copy.schunk.compressed_chunk(0).unwrap(),
+            raw_copy.schunk.compressed_chunk_bytes(0).unwrap(),
             replacement.as_slice()
         );
-        assert_eq!(raw_copy.to_cbuffer().unwrap(), raw_data);
+        assert_eq!(raw_copy.to_dense_buffer().unwrap(), raw_data);
         let same_layout_threaded = array
-            .copy_array_with_meta(
+            .copy_with_meta(
                 array.meta.clone(),
                 CParams {
                     nthreads: 4,
@@ -7164,14 +7198,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            same_layout_threaded.schunk.compressed_chunk(0).unwrap(),
+            same_layout_threaded
+                .schunk
+                .compressed_chunk_bytes(0)
+                .unwrap(),
             replacement.as_slice()
         );
         assert_eq!(same_layout_threaded.schunk.cparams.nthreads, 4);
-        assert_eq!(same_layout_threaded.to_cbuffer().unwrap(), raw_data);
+        assert_eq!(same_layout_threaded.to_dense_buffer().unwrap(), raw_data);
 
         let dtype_only_changed = array
-            .copy_array_with_meta(
+            .copy_with_meta(
                 B2ndMeta::new(vec![0, 0], vec![2, 2], vec![1, 2], "|S1", 0).unwrap(),
                 cparams.clone(),
                 DParams::default(),
@@ -7179,30 +7216,30 @@ mod tests {
             .unwrap();
         assert_eq!(dtype_only_changed.meta.dtype, "|S1");
         assert_eq!(
-            dtype_only_changed.schunk.compressed_chunk(0).unwrap(),
+            dtype_only_changed.schunk.compressed_chunk_bytes(0).unwrap(),
             replacement.as_slice()
         );
-        assert_eq!(dtype_only_changed.to_cbuffer().unwrap(), raw_data);
+        assert_eq!(dtype_only_changed.to_dense_buffer().unwrap(), raw_data);
 
         let dst_meta = B2ndMeta::new(vec![99, 99], vec![1, 3], vec![1, 1], "|u1", 0).unwrap();
         let copied = array
-            .copy_array_with_meta(dst_meta, cparams.clone(), DParams::default())
+            .copy_with_meta(dst_meta, cparams.clone(), DParams::default())
             .unwrap();
 
         assert_eq!(copied.shape(), &[2, 3]);
         assert_eq!(copied.chunkshape(), &[1, 3]);
         assert_eq!(copied.blockshape(), &[1, 1]);
-        assert_eq!(copied.to_cbuffer().unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(copied.to_dense_buffer().unwrap(), vec![1, 2, 3, 4, 5, 6]);
         assert_eq!(copied.schunk.metalayer("fixed"), Some(&b"metadata"[..]));
         assert_eq!(copied.schunk.vlmetalayer("variable"), Some(&b"payload"[..]));
 
         let mut changed = copied.clone();
         changed.set_slice(&[0, 0], &[1, 1], &[99]).unwrap();
-        assert_eq!(changed.to_cbuffer().unwrap(), vec![99, 2, 3, 4, 5, 6]);
-        assert_eq!(array.to_cbuffer().unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(changed.to_dense_buffer().unwrap(), vec![99, 2, 3, 4, 5, 6]);
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![1, 2, 3, 4, 5, 6]);
 
         let postfilter_meta = B2ndMeta::new(vec![4], vec![4], vec![2], "|u1", 0).unwrap();
-        let postfilter_source = B2ndArray::from_cbuffer(
+        let postfilter_source = B2ndArray::from_dense_buffer(
             postfilter_meta.clone(),
             &[1, 2, 3, 4],
             cparams.clone(),
@@ -7213,10 +7250,16 @@ mod tests {
         )
         .unwrap();
         let materialized_copy = postfilter_source
-            .copy_array_with_meta(postfilter_meta, cparams, DParams::default())
+            .copy_with_meta(postfilter_meta, cparams, DParams::default())
             .unwrap();
-        assert_eq!(postfilter_source.to_cbuffer().unwrap(), vec![2, 3, 4, 5]);
-        assert_eq!(materialized_copy.to_cbuffer().unwrap(), vec![2, 3, 4, 5]);
+        assert_eq!(
+            postfilter_source.to_dense_buffer().unwrap(),
+            vec![2, 3, 4, 5]
+        );
+        assert_eq!(
+            materialized_copy.to_dense_buffer().unwrap(),
+            vec![2, 3, 4, 5]
+        );
     }
 
     #[test]
@@ -7243,12 +7286,15 @@ mod tests {
             .add_vlmetalayer("vlorigin", b"first-vl")
             .unwrap();
         let second =
-            B2ndArray::from_cbuffer(meta, &[5, 6, 7, 8], cparams.clone(), DParams::default())
+            B2ndArray::from_dense_buffer(meta, &[5, 6, 7, 8], cparams.clone(), DParams::default())
                 .unwrap();
 
         let axis0 = first.concatenate(&second, 0).unwrap();
         assert_eq!(axis0.shape(), &[4, 2]);
-        assert_eq!(axis0.to_cbuffer().unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            axis0.to_dense_buffer().unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
         assert_eq!(axis0.schunk.metalayer("origin"), Some(&b"first"[..]));
         assert_eq!(axis0.schunk.vlmetalayer("vlorigin"), Some(&b"first-vl"[..]));
 
@@ -7258,14 +7304,21 @@ mod tests {
             .unwrap();
         assert_eq!(axis1.shape(), &[2, 4]);
         assert_eq!(axis1.blockshape(), &[1, 1]);
-        assert_eq!(axis1.to_cbuffer().unwrap(), vec![1, 2, 5, 6, 3, 4, 7, 8]);
+        assert_eq!(
+            axis1.to_dense_buffer().unwrap(),
+            vec![1, 2, 5, 6, 3, 4, 7, 8]
+        );
 
         let mut in_place = first.clone();
         in_place.concatenate_in_place(&second, 1).unwrap();
         assert_eq!(in_place.shape(), &[2, 4]);
         assert_eq!(
-            in_place.to_cbuffer().unwrap(),
-            first.concatenate(&second, 1).unwrap().to_cbuffer().unwrap()
+            in_place.to_dense_buffer().unwrap(),
+            first
+                .concatenate(&second, 1)
+                .unwrap()
+                .to_dense_buffer()
+                .unwrap()
         );
         assert_eq!(in_place.schunk.metalayer("origin"), Some(&b"first"[..]));
         assert_eq!(
@@ -7273,7 +7326,7 @@ mod tests {
             Some(&b"first-vl"[..])
         );
 
-        let mismatched_shape = B2ndArray::from_cbuffer(
+        let mismatched_shape = B2ndArray::from_dense_buffer(
             B2ndMeta::new(vec![3, 2], vec![2, 2], vec![1, 2], "|u1", 0).unwrap(),
             &[0; 6],
             cparams.clone(),
@@ -7293,15 +7346,15 @@ mod tests {
         );
         assert_eq!(failed_in_place.shape(), first.shape());
         assert_eq!(
-            failed_in_place.to_cbuffer().unwrap(),
-            first.to_cbuffer().unwrap()
+            failed_in_place.to_dense_buffer().unwrap(),
+            first.to_dense_buffer().unwrap()
         );
         assert_eq!(
             first.concatenate(&mismatched_shape, 2).err(),
             Some("B2ND concatenate rank mismatch")
         );
 
-        let mismatched_rank = B2ndArray::from_cbuffer(
+        let mismatched_rank = B2ndArray::from_dense_buffer(
             B2ndMeta::new(vec![4], vec![2], vec![1], "|u1", 0).unwrap(),
             &[0; 4],
             cparams.clone(),
@@ -7313,7 +7366,7 @@ mod tests {
             Some("B2ND concatenate rank mismatch")
         );
 
-        let mismatched_type = B2ndArray::from_cbuffer(
+        let mismatched_type = B2ndArray::from_dense_buffer(
             B2ndMeta::new(vec![2, 2], vec![2, 2], vec![1, 2], "<u2", 0).unwrap(),
             &[0; 8],
             CParams {
@@ -7328,7 +7381,7 @@ mod tests {
             Some("B2ND concatenate typesize mismatch")
         );
 
-        let scalar = B2ndArray::from_cbuffer(
+        let scalar = B2ndArray::from_dense_buffer(
             B2ndMeta::new(Vec::new(), Vec::new(), Vec::new(), "|u1", 0).unwrap(),
             &[1],
             cparams,
@@ -7352,7 +7405,7 @@ mod tests {
             ..Default::default()
         };
         let meta = B2ndMeta::new(vec![4], vec![2], vec![1], "|u1", 0).unwrap();
-        let first = B2ndArray::from_cbuffer(
+        let first = B2ndArray::from_dense_buffer(
             meta.clone(),
             &[1, 2, 3, 4],
             cparams.clone(),
@@ -7360,22 +7413,31 @@ mod tests {
         )
         .unwrap();
         let mut second =
-            B2ndArray::from_cbuffer(meta, &[5, 6, 7, 8], cparams.clone(), DParams::default())
+            B2ndArray::from_dense_buffer(meta, &[5, 6, 7, 8], cparams.clone(), DParams::default())
                 .unwrap();
-        let first_tail = first.schunk.compressed_chunk(1).unwrap().to_vec();
+        let first_tail = first.schunk.compressed_chunk_bytes(1).unwrap().to_vec();
         let replacement = replace_raw_chunk(&mut second, 0, &[5, 6]);
 
         let combined = first.concatenate(&second, 0).unwrap();
-        assert_eq!(combined.to_cbuffer().unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
-        assert_eq!(combined.schunk.compressed_chunk(1).unwrap(), first_tail);
-        assert_eq!(combined.schunk.compressed_chunk(2).unwrap(), replacement);
         assert_eq!(
-            combined.schunk.compressed_chunk(3).unwrap(),
-            second.schunk.compressed_chunk(1).unwrap()
+            combined.to_dense_buffer().unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(
+            combined.schunk.compressed_chunk_bytes(1).unwrap(),
+            first_tail
+        );
+        assert_eq!(
+            combined.schunk.compressed_chunk_bytes(2).unwrap(),
+            replacement
+        );
+        assert_eq!(
+            combined.schunk.compressed_chunk_bytes(3).unwrap(),
+            second.schunk.compressed_chunk_bytes(1).unwrap()
         );
 
         let meta_2d = B2ndMeta::new(vec![2, 2], vec![2, 2], vec![2, 2], "|u1", 0).unwrap();
-        let left = B2ndArray::from_cbuffer(
+        let left = B2ndArray::from_dense_buffer(
             meta_2d.clone(),
             &[1, 2, 3, 4],
             cparams.clone(),
@@ -7383,12 +7445,13 @@ mod tests {
         )
         .unwrap();
         let mut right =
-            B2ndArray::from_cbuffer(meta_2d, &[5, 6, 7, 8], cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta_2d, &[5, 6, 7, 8], cparams, DParams::default())
+                .unwrap();
         let raw_right = replace_raw_chunk(&mut right, 0, &[5, 6, 7, 8]);
         let out = left.concatenate(&right, 0).unwrap();
         assert_eq!(out.shape(), &[4, 2]);
-        assert_eq!(out.to_cbuffer().unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
-        assert_eq!(out.schunk.compressed_chunk(1).unwrap(), raw_right);
+        assert_eq!(out.to_dense_buffer().unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(out.schunk.compressed_chunk_bytes(1).unwrap(), raw_right);
     }
 
     #[test]
@@ -7406,24 +7469,28 @@ mod tests {
         let zeros = B2ndArray::zeros(meta.clone(), cparams.clone(), DParams::default()).unwrap();
         assert_eq!(zeros.schunk.nchunks(), 4);
         assert_eq!(zeros.schunk.chunksize, 8);
-        assert_eq!(zeros.to_cbuffer().unwrap(), vec![0; 15]);
-        let zero_header = ChunkHeader::read(zeros.schunk.compressed_chunk(0).unwrap()).unwrap();
+        assert_eq!(zeros.to_dense_buffer().unwrap(), vec![0; 15]);
+        let zero_header =
+            ChunkHeader::read(zeros.schunk.compressed_chunk_bytes(0).unwrap()).unwrap();
         assert_eq!(zero_header.special_type(), BLOSC2_SPECIAL_ZERO);
 
         let uninit = B2ndArray::empty(meta.clone(), cparams.clone(), DParams::default()).unwrap();
-        let empty_header = ChunkHeader::read(uninit.schunk.compressed_chunk(0).unwrap()).unwrap();
+        let empty_header =
+            ChunkHeader::read(uninit.schunk.compressed_chunk_bytes(0).unwrap()).unwrap();
         assert_eq!(empty_header.special_type(), BLOSC2_SPECIAL_ZERO);
-        assert_eq!(uninit.to_cbuffer().unwrap(), vec![0; 15]);
+        assert_eq!(uninit.to_dense_buffer().unwrap(), vec![0; 15]);
 
         let uninit = B2ndArray::uninit(meta.clone(), cparams.clone(), DParams::default()).unwrap();
-        let uninit_header = ChunkHeader::read(uninit.schunk.compressed_chunk(0).unwrap()).unwrap();
+        let uninit_header =
+            ChunkHeader::read(uninit.schunk.compressed_chunk_bytes(0).unwrap()).unwrap();
         assert_eq!(uninit_header.special_type(), BLOSC2_SPECIAL_UNINIT);
-        assert_eq!(uninit.to_cbuffer().unwrap().len(), 15);
+        assert_eq!(uninit.to_dense_buffer().unwrap().len(), 15);
 
         let full =
             B2ndArray::full(meta.clone(), &[7], cparams.clone(), DParams::default()).unwrap();
-        assert_eq!(full.to_cbuffer().unwrap(), vec![7; 15]);
-        let full_header = ChunkHeader::read(full.schunk.compressed_chunk(0).unwrap()).unwrap();
+        assert_eq!(full.to_dense_buffer().unwrap(), vec![7; 15]);
+        let full_header =
+            ChunkHeader::read(full.schunk.compressed_chunk_bytes(0).unwrap()).unwrap();
         assert_eq!(full_header.special_type(), BLOSC2_SPECIAL_VALUE);
         assert!(B2ndArray::full(meta, &[7, 8], cparams, DParams::default()).is_err());
     }
@@ -7440,9 +7507,9 @@ mod tests {
             ..Default::default()
         };
         let nans = B2ndArray::nans(meta.clone(), cparams.clone(), DParams::default()).unwrap();
-        let header = ChunkHeader::read(nans.schunk.compressed_chunk(0).unwrap()).unwrap();
+        let header = ChunkHeader::read(nans.schunk.compressed_chunk_bytes(0).unwrap()).unwrap();
         assert_eq!(header.special_type(), BLOSC2_SPECIAL_NAN);
-        for item in nans.to_cbuffer().unwrap().chunks_exact(4) {
+        for item in nans.to_dense_buffer().unwrap().chunks_exact(4) {
             assert!(f32::from_le_bytes(item.try_into().unwrap()).is_nan());
         }
 
@@ -7483,7 +7550,7 @@ mod tests {
             DParams::default(),
         )
         .unwrap();
-        for item in nans64.to_cbuffer().unwrap().chunks_exact(8) {
+        for item in nans64.to_dense_buffer().unwrap().chunks_exact(8) {
             assert!(f64::from_le_bytes(item.try_into().unwrap()).is_nan());
         }
 
@@ -7496,7 +7563,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            compress::decompress(&direct_bad_chunk),
+            compress::decompress_chunk(&direct_bad_chunk),
             Err("NaN special only valid for 4 or 8 byte types")
         );
     }
@@ -7521,27 +7588,27 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &data, cparams.clone(), DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta, &data, cparams.clone(), DParams::default()).unwrap();
         array.schunk.add_vlmetalayer("vkeep", b"variable").unwrap();
 
         let squeezed = array.squeeze_view().unwrap();
         assert_eq!(squeezed.shape(), &[3, 2]);
         assert_eq!(squeezed.chunkshape(), &[3, 2]);
         assert_eq!(squeezed.blockshape(), &[1, 1]);
-        assert_eq!(squeezed.to_cbuffer().unwrap(), data);
+        assert_eq!(squeezed.to_dense_buffer().unwrap(), data);
         assert_eq!(squeezed.schunk.vlmetalayer("vkeep"), Some(&b"variable"[..]));
 
         let expanded = squeezed
             .expand_dims_view(&[true, false, true, false])
             .unwrap();
         assert_eq!(expanded.meta, array.meta);
-        assert_eq!(expanded.to_cbuffer().unwrap(), data);
+        assert_eq!(expanded.to_dense_buffer().unwrap(), data);
 
         let squeezed_one = expanded
             .squeeze_index_view(&[true, false, false, false])
             .unwrap();
         assert_eq!(squeezed_one.shape(), &[3, 1, 2]);
-        assert_eq!(squeezed_one.to_cbuffer().unwrap(), data);
+        assert_eq!(squeezed_one.to_dense_buffer().unwrap(), data);
 
         assert!(expanded
             .expand_dims_view(&[true, false, false, false])
@@ -7552,10 +7619,10 @@ mod tests {
 
         let scalar_meta = B2ndMeta::new(Vec::new(), Vec::new(), Vec::new(), "|u1", 0).unwrap();
         let scalar =
-            B2ndArray::from_cbuffer(scalar_meta, &[42], cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(scalar_meta, &[42], cparams, DParams::default()).unwrap();
         let scalar_expanded = scalar.expand_dims_view(&[true, true]).unwrap();
         assert_eq!(scalar_expanded.shape(), &[1, 1]);
-        assert_eq!(scalar_expanded.to_cbuffer().unwrap(), vec![42]);
+        assert_eq!(scalar_expanded.to_dense_buffer().unwrap(), vec![42]);
 
         let axes16 = vec![true; B2ND_MAX_DIM];
         assert_eq!(scalar.expand_dims_view(&axes16).unwrap().shape(), &[1; 16]);
@@ -7578,26 +7645,24 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
         let mut squeezed = array.squeeze_view().unwrap();
         let mut expanded = squeezed.expand_dims_view(&[true, false]).unwrap();
 
         array.set_slice(&[0, 0], &[1, 1], &[99]).unwrap();
-        assert_eq!(array.to_cbuffer().unwrap(), vec![99, 2, 3, 4]);
-        assert_eq!(squeezed.to_cbuffer().unwrap(), vec![99, 2, 3, 4]);
-        assert_eq!(expanded.to_cbuffer().unwrap(), vec![99, 2, 3, 4]);
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![99, 2, 3, 4]);
+        assert_eq!(squeezed.to_dense_buffer().unwrap(), vec![99, 2, 3, 4]);
+        assert_eq!(expanded.to_dense_buffer().unwrap(), vec![99, 2, 3, 4]);
 
         squeezed.set_slice(&[1], &[2], &[88]).unwrap();
         assert_eq!(
-            array
-                .get_orthogonal_selection(&[vec![0], vec![1, 2]])
-                .unwrap(),
+            array.select_orthogonal(&[vec![0], vec![1, 2]]).unwrap(),
             vec![88, 3]
         );
         expanded.set_slice(&[0, 2], &[1, 3], &[77]).unwrap();
-        assert_eq!(array.to_cbuffer().unwrap(), vec![99, 88, 77, 4]);
-        assert_eq!(squeezed.to_cbuffer().unwrap(), vec![99, 88, 77, 4]);
-        assert_eq!(expanded.to_cbuffer().unwrap(), vec![99, 88, 77, 4]);
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![99, 88, 77, 4]);
+        assert_eq!(squeezed.to_dense_buffer().unwrap(), vec![99, 88, 77, 4]);
+        assert_eq!(expanded.to_dense_buffer().unwrap(), vec![99, 88, 77, 4]);
     }
 
     #[test]
@@ -7612,7 +7677,7 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta.clone(), &[1, 2, 3, 4], cparams, DParams::default())
+            B2ndArray::from_dense_buffer(meta.clone(), &[1, 2, 3, 4], cparams, DParams::default())
                 .unwrap();
         let mut squeezed = array.squeeze_view().unwrap();
 
@@ -7632,8 +7697,8 @@ mod tests {
         array.set_slice(&[0, 0], &[1, 1], &[99]).unwrap();
         squeezed.set_slice(&[1], &[2], &[88]).unwrap();
 
-        assert_eq!(array.to_cbuffer().unwrap(), vec![99, 88, 3, 4]);
-        assert_eq!(squeezed.to_cbuffer().unwrap(), vec![99, 88, 3, 4]);
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![99, 88, 3, 4]);
+        assert_eq!(squeezed.to_dense_buffer().unwrap(), vec![99, 88, 3, 4]);
         assert_eq!(array.shape(), &[1, 4]);
         assert_eq!(squeezed.shape(), &[4]);
     }
@@ -7649,7 +7714,7 @@ mod tests {
             filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
             ..Default::default()
         };
-        let mut array = B2ndArray::from_cbuffer(
+        let mut array = B2ndArray::from_dense_buffer(
             meta.clone(),
             &[1, 2, 3, 4],
             cparams.clone(),
@@ -7657,19 +7722,20 @@ mod tests {
         )
         .unwrap();
         let mut squeezed = array.squeeze_view().unwrap();
-        let replacement = B2ndArray::from_cbuffer(meta, &[9, 8, 7, 6], cparams, DParams::default())
-            .unwrap()
-            .schunk
-            .chunks[0]
-            .clone();
+        let replacement =
+            B2ndArray::from_dense_buffer(meta, &[9, 8, 7, 6], cparams, DParams::default())
+                .unwrap()
+                .schunk
+                .chunks[0]
+                .clone();
 
         array.schunk.chunks[0] = replacement;
-        assert_eq!(array.to_cbuffer().unwrap(), vec![9, 8, 3, 4]);
-        assert_eq!(squeezed.to_cbuffer().unwrap(), vec![9, 8, 3, 4]);
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![9, 8, 3, 4]);
+        assert_eq!(squeezed.to_dense_buffer().unwrap(), vec![9, 8, 3, 4]);
 
         squeezed.set_slice(&[2], &[3], &[44]).unwrap();
-        assert_eq!(array.to_cbuffer().unwrap(), vec![9, 8, 44, 4]);
-        assert_eq!(squeezed.to_cbuffer().unwrap(), vec![9, 8, 44, 4]);
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![9, 8, 44, 4]);
+        assert_eq!(squeezed.to_dense_buffer().unwrap(), vec![9, 8, 44, 4]);
     }
 
     #[test]
@@ -7684,21 +7750,21 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
         let mut squeezed = array.squeeze_view().unwrap();
         let mut expanded = squeezed.expand_dims_view(&[true, false]).unwrap();
 
         array.set_slice(&[0, 1], &[1, 2], &[22]).unwrap();
-        assert_eq!(squeezed.to_cbuffer().unwrap(), vec![1, 22, 3, 4]);
-        assert_eq!(expanded.to_cbuffer().unwrap(), vec![1, 22, 3, 4]);
+        assert_eq!(squeezed.to_dense_buffer().unwrap(), vec![1, 22, 3, 4]);
+        assert_eq!(expanded.to_dense_buffer().unwrap(), vec![1, 22, 3, 4]);
 
         squeezed.set_slice(&[2], &[3], &[33]).unwrap();
-        assert_eq!(array.to_cbuffer().unwrap(), vec![1, 22, 33, 4]);
-        assert_eq!(expanded.to_cbuffer().unwrap(), vec![1, 22, 33, 4]);
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![1, 22, 33, 4]);
+        assert_eq!(expanded.to_dense_buffer().unwrap(), vec![1, 22, 33, 4]);
 
         expanded.set_slice(&[0, 3], &[1, 4], &[44]).unwrap();
-        assert_eq!(array.to_cbuffer().unwrap(), vec![1, 22, 33, 44]);
-        assert_eq!(squeezed.to_cbuffer().unwrap(), vec![1, 22, 33, 44]);
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![1, 22, 33, 44]);
+        assert_eq!(squeezed.to_dense_buffer().unwrap(), vec![1, 22, 33, 44]);
     }
 
     #[test]
@@ -7714,7 +7780,8 @@ mod tests {
 
         let meta = B2ndMeta::new(vec![1, 2], vec![1, 2], vec![1, 1], "|u1", 0).unwrap();
         let mut array =
-            B2ndArray::from_cbuffer(meta, &[1, 2], cparams.clone(), DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta, &[1, 2], cparams.clone(), DParams::default())
+                .unwrap();
         array.schunk.add_metalayer("keep", b"fixed").unwrap();
         assert_eq!(
             array.squeeze_view().err(),
@@ -7723,16 +7790,17 @@ mod tests {
 
         let padded_meta = B2ndMeta::new(vec![1, 2], vec![2, 2], vec![1, 1], "|u1", 0).unwrap();
         let padded =
-            B2ndArray::from_cbuffer(padded_meta, &[1, 2], cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(padded_meta, &[1, 2], cparams, DParams::default())
+                .unwrap();
         let squeezed = padded.squeeze_index_view(&[true, false]).unwrap();
         assert_eq!(squeezed.shape(), &[2]);
         assert_eq!(squeezed.chunkshape(), &[2]);
         assert_eq!(squeezed.blockshape(), &[1]);
-        assert_eq!(squeezed.to_cbuffer().unwrap(), vec![1, 2]);
+        assert_eq!(squeezed.to_dense_buffer().unwrap(), vec![1, 2]);
 
         let non_leading_padded =
             B2ndMeta::new(vec![2, 1], vec![2, 2], vec![1, 1], "|u1", 0).unwrap();
-        let array = B2ndArray::from_cbuffer(
+        let array = B2ndArray::from_dense_buffer(
             non_leading_padded,
             &[11, 22],
             CParams {
@@ -7746,11 +7814,11 @@ mod tests {
         assert_eq!(squeezed.shape(), &[2]);
         assert_eq!(squeezed.chunkshape(), &[2]);
         assert_eq!(squeezed.blockshape(), &[1]);
-        assert_eq!(squeezed.to_cbuffer().unwrap(), vec![11, 0]);
+        assert_eq!(squeezed.to_dense_buffer().unwrap(), vec![11, 0]);
         assert_eq!(
             b2nd_squeeze_index(&array, &[false, true])
                 .unwrap()
-                .to_cbuffer()
+                .to_dense_buffer()
                 .unwrap(),
             vec![11, 0]
         );
@@ -7805,14 +7873,14 @@ mod tests {
             ..Default::default()
         };
         let array =
-            B2ndArray::from_cbuffer(meta.clone(), &[], cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta.clone(), &[], cparams, DParams::default()).unwrap();
         assert_eq!(array.schunk.nchunks(), 0);
         assert_eq!(array.schunk.chunksize, 0);
-        assert_eq!(array.to_cbuffer().unwrap(), Vec::<u8>::new());
+        assert_eq!(array.to_dense_buffer().unwrap(), Vec::<u8>::new());
 
-        let restored = B2ndArray::from_frame(&array.to_frame()).unwrap();
+        let restored = B2ndArray::from_contiguous_frame(&array.to_contiguous_frame()).unwrap();
         assert_eq!(restored.meta, meta);
-        assert_eq!(restored.to_cbuffer().unwrap(), Vec::<u8>::new());
+        assert_eq!(restored.to_dense_buffer().unwrap(), Vec::<u8>::new());
     }
 
     #[test]
@@ -7841,8 +7909,13 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                B2ndArray::from_cbuffer(meta.clone(), &[], cparams.clone(), DParams::default())
-                    .err(),
+                B2ndArray::from_dense_buffer(
+                    meta.clone(),
+                    &[],
+                    cparams.clone(),
+                    DParams::default()
+                )
+                .err(),
                 Some("Invalid typesize")
             );
             assert_eq!(
@@ -7886,10 +7959,10 @@ mod tests {
             filters: [0, 0, 0, 0, 0, BLOSC_NOFILTER],
             ..Default::default()
         };
-        let replacement = crate::compress::compress(data, &alt_cparams).unwrap();
+        let replacement = crate::compress::compress_chunk(data, &alt_cparams).unwrap();
         array
             .schunk
-            .update_compressed_chunk(nchunk as i64, &replacement)
+            .replace_compressed_chunk(nchunk as i64, &replacement)
             .unwrap();
         replacement
     }
@@ -7986,7 +8059,7 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta.clone(), &data, cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta.clone(), &data, cparams, DParams::default()).unwrap();
         array
             .schunk
             .add_metalayer(CATERVA_METALAYER_NAME, &meta.serialize().unwrap())
@@ -8043,7 +8116,7 @@ mod tests {
             let col = 2 + idx % 4;
             expected[row * 7 + col] = *value;
         }
-        assert_eq!(array.to_cbuffer().unwrap(), u16_bytes(&expected));
+        assert_eq!(array.to_dense_buffer().unwrap(), u16_bytes(&expected));
 
         array.resize(vec![6, 4]).unwrap();
         assert!(array.schunk.metalayer(CATERVA_METALAYER_NAME).is_some());
@@ -8056,7 +8129,7 @@ mod tests {
                 resized[row * 4 + col] = expected[row * 7 + col];
             }
         }
-        assert_eq!(array.to_cbuffer().unwrap(), u16_bytes(&resized));
+        assert_eq!(array.to_dense_buffer().unwrap(), u16_bytes(&resized));
 
         array.resize(vec![2, 3]).unwrap();
         let mut shrunk = Vec::new();
@@ -8065,51 +8138,53 @@ mod tests {
                 shrunk.push(resized[row * 4 + col]);
             }
         }
-        assert_eq!(array.to_cbuffer().unwrap(), u16_bytes(&shrunk));
-        let before_empty_insert = array.to_cbuffer().unwrap();
+        assert_eq!(array.to_dense_buffer().unwrap(), u16_bytes(&shrunk));
+        let before_empty_insert = array.to_dense_buffer().unwrap();
         array.insert(0, 1, &[0, 3], &[]).unwrap();
         assert_eq!(array.shape(), &[2, 3]);
-        assert_eq!(array.to_cbuffer().unwrap(), before_empty_insert);
+        assert_eq!(array.to_dense_buffer().unwrap(), before_empty_insert);
         array
-            .insert_cbuffer(1, 3, &u16_bytes(&[700, 701, 702, 703]))
+            .insert_dense_buffer(1, 3, &u16_bytes(&[700, 701, 702, 703]))
             .unwrap();
         assert_eq!(array.shape(), &[2, 5]);
         assert_eq!(
-            array.to_cbuffer().unwrap(),
+            array.to_dense_buffer().unwrap(),
             u16_bytes(&[
                 shrunk[0], shrunk[1], shrunk[2], 700, 701, shrunk[3], shrunk[4], shrunk[5], 702,
                 703
             ])
         );
         array
-            .append_cbuffer(0, &u16_bytes(&[800, 801, 802, 803, 804]))
+            .append_dense_buffer(0, &u16_bytes(&[800, 801, 802, 803, 804]))
             .unwrap();
         assert_eq!(array.shape(), &[3, 5]);
-        assert!(array.append_cbuffer(1, &[1]).is_err());
+        assert!(array.append_dense_buffer(1, &[1]).is_err());
         assert!(array.get_slice(&[0, 0], &[0, 1]).unwrap().is_empty());
-        let padded = array.get_slice_cbuffer(&[0, 1], &[2, 3], &[2, 3]).unwrap();
+        let padded = array
+            .slice_to_dense_buffer(&[0, 1], &[2, 3], &[2, 3])
+            .unwrap();
         assert_eq!(
             padded,
             u16_bytes(&[shrunk[1], shrunk[2], 0, shrunk[4], shrunk[5], 0])
         );
 
-        let slice_array = array.get_slice_array(&[0, 1], &[2, 3]).unwrap();
+        let slice_array = array.slice(&[0, 1], &[2, 3]).unwrap();
         assert_eq!(slice_array.shape(), &[2, 2]);
         assert_eq!(slice_array.chunkshape(), &[3, 4]);
         assert_eq!(slice_array.blockshape(), &[3, 2]);
         assert_eq!(
-            slice_array.to_cbuffer().unwrap(),
+            slice_array.to_dense_buffer().unwrap(),
             u16_bytes(&[shrunk[1], shrunk[2], shrunk[4], shrunk[5]])
         );
         assert!(array
-            .get_slice_array(&[0, 0], &[0, 1])
+            .slice(&[0, 0], &[0, 1])
             .unwrap()
-            .to_cbuffer()
+            .to_dense_buffer()
             .unwrap()
             .is_empty());
         let alt_meta = B2ndMeta::new(vec![999, 999], vec![1, 2], vec![1, 1], "<u2", 0).unwrap();
         let alt = array
-            .get_slice_array_with_meta(
+            .slice_with_meta(
                 &[0, 1],
                 &[2, 3],
                 alt_meta,
@@ -8128,12 +8203,12 @@ mod tests {
         assert_eq!(alt.chunkshape(), &[1, 2]);
         assert_eq!(alt.blockshape(), &[1, 1]);
         assert_eq!(
-            alt.to_cbuffer().unwrap(),
+            alt.to_dense_buffer().unwrap(),
             u16_bytes(&[shrunk[1], shrunk[2], shrunk[4], shrunk[5]])
         );
         let alt_meta = B2ndMeta::new(vec![999, 999], vec![1, 2], vec![1, 1], "<u2", 0).unwrap();
         let alt_with_meta = array
-            .get_slice_array_with_meta_and_metalayers(
+            .slice_with_meta_and_metalayers(
                 &[0, 1],
                 &[2, 3],
                 alt_meta,
@@ -8152,13 +8227,13 @@ mod tests {
         assert_eq!(alt_with_meta.shape(), &[2, 2]);
         assert_eq!(alt_with_meta.schunk.metalayer("slice"), Some(&b"meta"[..]));
         assert_eq!(
-            alt_with_meta.to_cbuffer().unwrap(),
+            alt_with_meta.to_dense_buffer().unwrap(),
             u16_bytes(&[shrunk[1], shrunk[2], shrunk[4], shrunk[5]])
         );
 
-        let before_empty_set = array.to_cbuffer().unwrap();
+        let before_empty_set = array.to_dense_buffer().unwrap();
         array.set_slice(&[0, 0], &[0, 1], &[]).unwrap();
-        assert_eq!(array.to_cbuffer().unwrap(), before_empty_set);
+        assert_eq!(array.to_dense_buffer().unwrap(), before_empty_set);
         assert!(array.set_slice(&[0, 0], &[1, 1], &[1]).is_err());
         assert!(array.delete(0, i64::MAX, 1).is_err());
     }
@@ -8183,10 +8258,10 @@ mod tests {
         schunk.append_buffer(&[1, 1, 1]).unwrap();
         let mut array = B2ndArray::from_schunk(schunk).unwrap();
 
-        assert_eq!(array.to_cbuffer().unwrap(), vec![1, 1, 1, 1, 1]);
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![1, 1, 1, 1, 1]);
         array.resize(vec![10]).unwrap();
         assert_eq!(
-            array.to_cbuffer().unwrap(),
+            array.to_dense_buffer().unwrap(),
             vec![1, 1, 1, 1, 1, 1, 0, 0, 0, 0]
         );
     }
@@ -8222,7 +8297,7 @@ mod tests {
         let nans_u1 = nans_u1.unwrap();
         assert_eq!(nans_u1.meta, meta);
         assert_eq!(
-            ChunkHeader::read(nans_u1.schunk.compressed_chunk(0).unwrap())
+            ChunkHeader::read(nans_u1.schunk.compressed_chunk_bytes(0).unwrap())
                 .unwrap()
                 .special_type(),
             BLOSC2_SPECIAL_NAN
@@ -8261,7 +8336,7 @@ mod tests {
             DParams::default(),
         );
         assert_eq!(full_rc, BLOSC2_ERROR_SUCCESS);
-        assert_eq!(full.unwrap().to_cbuffer().unwrap(), vec![7; 24]);
+        assert_eq!(full.unwrap().to_dense_buffer().unwrap(), vec![7; 24]);
         let (ctx_rc, ctx) = b2nd_create_ctx_c(
             meta.clone(),
             cparams.clone(),
@@ -8344,7 +8419,7 @@ mod tests {
         let ctx_nans = ctx_nans.unwrap();
         assert_eq!(ctx_nans.schunk.metalayer("owner"), Some(&b"ctx"[..]));
         assert_eq!(
-            ChunkHeader::read(ctx_nans.schunk.compressed_chunk(0).unwrap())
+            ChunkHeader::read(ctx_nans.schunk.compressed_chunk_bytes(0).unwrap())
                 .unwrap()
                 .special_type(),
             BLOSC2_SPECIAL_NAN
@@ -8352,7 +8427,7 @@ mod tests {
         let (ctx_full_rc, ctx_full) = b2nd_full_ctx_c(&ctx, &[7, 99], 2);
         assert_eq!(ctx_full_rc, BLOSC2_ERROR_SUCCESS);
         let ctx_full = ctx_full.unwrap();
-        assert_eq!(ctx_full.to_cbuffer().unwrap(), vec![7; 24]);
+        assert_eq!(ctx_full.to_dense_buffer().unwrap(), vec![7; 24]);
         assert_eq!(ctx_full.schunk.metalayer("owner"), Some(&b"ctx"[..]));
         let (short_from_cbuffer_rc, short_from_cbuffer) = b2nd_from_cbuffer_c(
             meta.clone(),
@@ -8551,9 +8626,9 @@ mod tests {
         assert_eq!(frame_c.as_ref().unwrap(), &frame);
         assert_eq!(frame_len, frame.len() as i64);
         assert!(needs_free);
-        let from_frame = b2nd_from_cframe(&frame, true).unwrap();
-        assert_eq!(from_frame.meta, meta);
-        assert_eq!(b2nd_to_cbuffer_vec(&from_frame).unwrap(), data);
+        let from_contiguous_frame = b2nd_from_cframe(&frame, true).unwrap();
+        assert_eq!(from_contiguous_frame.meta, meta);
+        assert_eq!(b2nd_to_cbuffer_vec(&from_contiguous_frame).unwrap(), data);
         let from_borrowed_frame = b2nd_from_cframe(&frame, false).unwrap();
         let (borrowed_frame_rc, borrowed_frame_c, borrowed_frame_len, borrowed_needs_free) =
             b2nd_to_cframe_c(&from_borrowed_frame);
@@ -8582,7 +8657,7 @@ mod tests {
         let mut alias_frame = b2nd_to_cframe(&alias_array);
         let copied = b2nd_from_cframe(&alias_frame, true).unwrap();
         let borrowed = b2nd_from_cframe(&alias_frame, false).unwrap();
-        let borrowed_chunk = borrowed.schunk.compressed_chunk(0).unwrap();
+        let borrowed_chunk = borrowed.schunk.compressed_chunk_bytes(0).unwrap();
         let chunk_offset =
             (borrowed_chunk.as_ptr() as usize).checked_sub(alias_frame.as_ptr() as usize);
         let chunk_offset = chunk_offset.expect("borrowed chunk pointer should be inside frame");
@@ -8592,11 +8667,11 @@ mod tests {
         alias_frame[chunk_offset] = new_chunk_byte;
         assert_eq!(b2nd_to_cbuffer_vec(&copied).unwrap(), alias_data);
         assert_eq!(
-            copied.schunk.compressed_chunk(0).unwrap()[0],
+            copied.schunk.compressed_chunk_bytes(0).unwrap()[0],
             old_chunk_byte
         );
         assert_eq!(
-            borrowed.schunk.compressed_chunk(0).unwrap()[0],
+            borrowed.schunk.compressed_chunk_bytes(0).unwrap()[0],
             new_chunk_byte
         );
 
@@ -8617,7 +8692,7 @@ mod tests {
         assert_eq!(b2nd_save(&array, &path), BLOSC2_ERROR_SUCCESS);
         assert!(path.is_dir());
         assert!(b2nd_save(&array, &path) < 0);
-        assert_eq!(b2nd_open(&path).unwrap().to_cbuffer().unwrap(), data);
+        assert_eq!(b2nd_open(&path).unwrap().to_dense_buffer().unwrap(), data);
         let append_path = dir.path().join("array-append.b2frame");
         let offset = b2nd_save_append(&array, &append_path);
         assert!(offset >= 0);
@@ -8625,7 +8700,7 @@ mod tests {
         assert_eq!(
             b2nd_open_offset(&append_path, offset)
                 .unwrap()
-                .to_cbuffer()
+                .to_dense_buffer()
                 .unwrap(),
             data
         );
@@ -8688,7 +8763,7 @@ mod tests {
         );
         assert_eq!(b2nd_get_slice_nchunks(&array, &[2, 3], &[2, 3]), (0, None));
         assert_eq!(b2nd_get_slice_nchunks(&array, &[4, 6], &[4, 6]), (0, None));
-        let empty_array = B2ndArray::from_cbuffer(
+        let empty_array = B2ndArray::from_dense_buffer(
             B2ndMeta::new(vec![0, 5], vec![0, 5], vec![0, 1], "|u1", 0).unwrap(),
             &[],
             cparams.clone(),
@@ -8787,7 +8862,7 @@ mod tests {
         assert_eq!(slice_array.shape(), &[3, 4]);
         assert_eq!(slice_array.chunkshape(), &[3, 2]);
         assert_eq!(
-            slice_array.to_cbuffer().unwrap(),
+            slice_array.to_dense_buffer().unwrap(),
             vec![8, 9, 10, 11, 14, 15, 16, 17, 20, 21, 22, 23]
         );
         let (ctx_slice_rc, ctx_slice) = b2nd_get_slice_ctx_c(&mut ctx, &array, &[1, 2], &[4, 6]);
@@ -8796,7 +8871,7 @@ mod tests {
         assert_eq!(ctx.meta.shape, vec![3, 4]);
         assert_eq!(ctx_slice.shape(), &[3, 4]);
         assert_eq!(
-            ctx_slice.to_cbuffer().unwrap(),
+            ctx_slice.to_dense_buffer().unwrap(),
             vec![8, 9, 10, 11, 14, 15, 16, 17, 20, 21, 22, 23]
         );
         assert_eq!(ctx_slice.schunk.metalayer("owner"), Some(&b"ctx"[..]));
@@ -8951,7 +9026,7 @@ mod tests {
                 expected[row * 6 + col] = data[row * 6 + col];
             }
         }
-        assert_eq!(target.to_cbuffer().unwrap(), expected);
+        assert_eq!(target.to_dense_buffer().unwrap(), expected);
 
         let selected = b2nd_get_orthogonal_selection(&array, &[vec![0, 2], vec![1, 3]]).unwrap();
         assert_eq!(selected, vec![1, 3, 13, 15]);
@@ -9056,7 +9131,7 @@ mod tests {
             BLOSC2_ERROR_SUCCESS
         );
         assert_eq!(selected_dest, vec![1, 3, 13, 15]);
-        let padded_array = B2ndArray::from_cbuffer(
+        let padded_array = B2ndArray::from_dense_buffer(
             B2ndMeta::new(vec![3, 4], vec![2, 2], vec![1, 2], "|u1", 0).unwrap(),
             &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             CParams {
@@ -9211,7 +9286,7 @@ mod tests {
         assert_eq!(target_dense[13], 52);
         assert_eq!(target_dense[15], 53);
 
-        let mut padded_target = B2ndArray::from_cbuffer(
+        let mut padded_target = B2ndArray::from_dense_buffer(
             B2ndMeta::new(vec![3, 4], vec![2, 2], vec![1, 2], "|u1", 0).unwrap(),
             &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             CParams {
@@ -9253,10 +9328,10 @@ mod tests {
             BLOSC2_ERROR_INVALID_PARAM
         );
         assert_eq!(
-            padded_target.to_cbuffer().unwrap(),
+            padded_target.to_dense_buffer().unwrap(),
             vec![9, 8, 3, 4, 7, 6, 7, 8, 9, 10, 11, 12]
         );
-        let before = padded_target.to_cbuffer().unwrap();
+        let before = padded_target.to_dense_buffer().unwrap();
         assert_eq!(
             b2nd_set_orthogonal_selection_cbuffer_c(
                 &mut padded_target,
@@ -9267,9 +9342,9 @@ mod tests {
             ),
             BLOSC2_ERROR_SUCCESS
         );
-        assert_eq!(padded_target.to_cbuffer().unwrap(), before);
+        assert_eq!(padded_target.to_dense_buffer().unwrap(), before);
 
-        let mut edge_target = B2ndArray::from_cbuffer(
+        let mut edge_target = B2ndArray::from_dense_buffer(
             B2ndMeta::new(vec![4, 2], vec![2, 2], vec![1, 2], "|u1", 0).unwrap(),
             &[1, 2, 3, 4, 5, 6, 7, 8],
             CParams {
@@ -9291,7 +9366,7 @@ mod tests {
             BLOSC2_ERROR_SUCCESS
         );
         assert_eq!(edge_dest, vec![0xff]);
-        let edge_before = edge_target.to_cbuffer().unwrap();
+        let edge_before = edge_target.to_dense_buffer().unwrap();
         assert_eq!(
             b2nd_set_orthogonal_selection_cbuffer_c(
                 &mut edge_target,
@@ -9302,7 +9377,7 @@ mod tests {
             ),
             BLOSC2_ERROR_SUCCESS
         );
-        assert_eq!(edge_target.to_cbuffer().unwrap(), edge_before);
+        assert_eq!(edge_target.to_dense_buffer().unwrap(), edge_before);
 
         let expanded = b2nd_expand_dims_final_c(&array, &[true, false, false], 3)
             .1
@@ -9688,7 +9763,7 @@ mod tests {
                 DParams::default()
             )
             .unwrap()
-            .to_cbuffer()
+            .to_dense_buffer()
             .unwrap(),
             vec![7]
         );
@@ -9706,14 +9781,18 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &[1, 2, 3, 4, 5], cparams, DParams::default()).unwrap();
-        let saved_head = array.schunk.compressed_chunk(0).unwrap().to_vec();
+            B2ndArray::from_dense_buffer(meta, &[1, 2, 3, 4, 5], cparams, DParams::default())
+                .unwrap();
+        let saved_head = array.schunk.compressed_chunk_bytes(0).unwrap().to_vec();
         let saved = replace_raw_chunk(&mut array, 1, &[4, 5, 9]);
 
         array.resize(vec![6]).unwrap();
-        assert_eq!(array.schunk.compressed_chunk(0).unwrap(), saved_head);
-        assert_ne!(array.schunk.compressed_chunk(1).unwrap(), saved.as_slice());
-        assert_eq!(array.to_cbuffer().unwrap(), vec![1, 2, 3, 4, 5, 0]);
+        assert_eq!(array.schunk.compressed_chunk_bytes(0).unwrap(), saved_head);
+        assert_ne!(
+            array.schunk.compressed_chunk_bytes(1).unwrap(),
+            saved.as_slice()
+        );
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![1, 2, 3, 4, 5, 0]);
     }
 
     #[test]
@@ -9738,7 +9817,10 @@ mod tests {
         let mut array = B2ndArray::from_schunk(schunk).unwrap();
 
         array.resize(vec![3, 3]).unwrap();
-        assert_eq!(array.to_cbuffer().unwrap(), vec![1, 2, 0, 3, 4, 0, 0, 0, 0]);
+        assert_eq!(
+            array.to_dense_buffer().unwrap(),
+            vec![1, 2, 0, 3, 4, 0, 0, 0, 0]
+        );
     }
 
     #[test]
@@ -9761,7 +9843,7 @@ mod tests {
         let mut array = B2ndArray::from_schunk(schunk).unwrap();
 
         array.resize(vec![6]).unwrap();
-        assert_eq!(array.to_cbuffer().unwrap(), vec![1, 1, 1, 1, 1, 0]);
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![1, 1, 1, 1, 1, 0]);
     }
 
     #[test]
@@ -9786,7 +9868,7 @@ mod tests {
 
         array.set_slice(&[0], &[1], &[7]).unwrap();
         array.resize(vec![6]).unwrap();
-        assert_eq!(array.to_cbuffer().unwrap(), vec![7, 2, 3, 4, 5, 0]);
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![7, 2, 3, 4, 5, 0]);
     }
 
     #[test]
@@ -9811,7 +9893,7 @@ mod tests {
 
         array.set_slice(&[3], &[5], &[7, 8]).unwrap();
         array.resize(vec![6]).unwrap();
-        assert_eq!(array.to_cbuffer().unwrap(), vec![1, 2, 3, 7, 8, 0]);
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![1, 2, 3, 7, 8, 0]);
     }
 
     #[test]
@@ -9826,13 +9908,16 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &[1, 2, 3, 4, 5, 6], cparams, DParams::default())
+            B2ndArray::from_dense_buffer(meta, &[1, 2, 3, 4, 5, 6], cparams, DParams::default())
                 .unwrap();
         let saved = replace_raw_chunk(&mut array, 1, &[4, 5, 6]);
 
         array.set_slice(&[0], &[1], &[9]).unwrap();
-        assert_eq!(array.schunk.compressed_chunk(1).unwrap(), saved.as_slice());
-        assert_eq!(array.to_cbuffer().unwrap(), vec![9, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            array.schunk.compressed_chunk_bytes(1).unwrap(),
+            saved.as_slice()
+        );
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![9, 2, 3, 4, 5, 6]);
     }
 
     #[test]
@@ -9848,27 +9933,27 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &u16_bytes(&values), cparams, DParams::default())
+            B2ndArray::from_dense_buffer(meta, &u16_bytes(&values), cparams, DParams::default())
                 .unwrap();
         array.schunk.add_metalayer("keep", b"fixed").unwrap();
 
         let selection = vec![vec![2, 0], vec![3, 1]];
         assert_eq!(
-            array.get_orthogonal_selection(&selection).unwrap(),
+            array.select_orthogonal(&selection).unwrap(),
             u16_bytes(&[11, 9, 3, 1])
         );
         assert_eq!(
             array
-                .get_orthogonal_selection_cbuffer(&selection, &[2, 2])
+                .orthogonal_selection_to_dense_buffer(&selection, &[2, 2])
                 .unwrap(),
             u16_bytes(&[11, 9, 3, 1])
         );
         assert!(array
-            .get_orthogonal_selection_cbuffer(&selection, &[2, 3])
+            .orthogonal_selection_to_dense_buffer(&selection, &[2, 3])
             .is_err());
 
         array
-            .set_orthogonal_selection_cbuffer(
+            .set_orthogonal_selection_from_dense_buffer(
                 &selection,
                 &[2, 2],
                 &u16_bytes(&[100, 101, 102, 103]),
@@ -9879,35 +9964,33 @@ mod tests {
         expected[2 * 4 + 1] = 101;
         expected[3] = 102;
         expected[1] = 103;
-        assert_eq!(array.to_cbuffer().unwrap(), u16_bytes(&expected));
+        assert_eq!(array.to_dense_buffer().unwrap(), u16_bytes(&expected));
         assert_eq!(array.schunk.metalayer("keep"), Some(&b"fixed"[..]));
 
+        assert!(array.select_orthogonal(&[vec![-1], vec![0]]).is_err());
+        assert!(array.select_orthogonal(&[vec![3], vec![0]]).is_err());
         assert!(array
-            .get_orthogonal_selection(&[vec![-1], vec![0]])
-            .is_err());
-        assert!(array.get_orthogonal_selection(&[vec![3], vec![0]]).is_err());
-        assert!(array
-            .get_orthogonal_selection_cbuffer(&selection, &[1, 3])
+            .orthogonal_selection_to_dense_buffer(&selection, &[1, 3])
             .is_err());
         assert!(array
-            .set_orthogonal_selection_cbuffer(
+            .set_orthogonal_selection_from_dense_buffer(
                 &selection,
                 &[2, 3],
                 &u16_bytes(&[100, 101, 0, 102, 103, 0]),
             )
             .is_err());
         assert!(array
-            .set_orthogonal_selection_cbuffer(
+            .set_orthogonal_selection_from_dense_buffer(
                 &selection,
                 &[2, 2],
                 &u16_bytes(&[100, 101, 102, 103, 104]),
             )
             .is_err());
 
-        let before = array.to_cbuffer().unwrap();
+        let before = array.to_dense_buffer().unwrap();
         assert_eq!(
             array
-                .get_orthogonal_selection_cbuffer(&[Vec::new(), vec![0]], &[0, 2])
+                .orthogonal_selection_to_dense_buffer(&[Vec::new(), vec![0]], &[0, 2])
                 .unwrap(),
             Vec::<u8>::new()
         );
@@ -9915,9 +9998,9 @@ mod tests {
             .set_orthogonal_selection(&[Vec::new(), vec![0]], &[])
             .unwrap();
         assert!(array
-            .set_orthogonal_selection_cbuffer(&[Vec::new(), vec![0]], &[0, 1], &[1, 2])
+            .set_orthogonal_selection_from_dense_buffer(&[Vec::new(), vec![0]], &[0, 1], &[1, 2])
             .is_err());
-        assert_eq!(array.to_cbuffer().unwrap(), before);
+        assert_eq!(array.to_dense_buffer().unwrap(), before);
     }
 
     #[test]
@@ -9933,7 +10016,7 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &u16_bytes(&values), cparams, DParams::default())
+            B2ndArray::from_dense_buffer(meta, &u16_bytes(&values), cparams, DParams::default())
                 .unwrap();
         let selection = vec![vec![2, 0], vec![3, 1]];
         let compact_len = 4 * 2;
@@ -9976,7 +10059,7 @@ mod tests {
         expected[2 * 4 + 1] = 101;
         expected[3] = 102;
         expected[1] = 103;
-        assert_eq!(array.to_cbuffer().unwrap(), u16_bytes(&expected));
+        assert_eq!(array.to_dense_buffer().unwrap(), u16_bytes(&expected));
     }
 
     #[test]
@@ -9995,18 +10078,11 @@ mod tests {
             postfilter: Some(count_orthogonal_postfilter),
             ..Default::default()
         };
-        let array = B2ndArray::from_cbuffer(meta, &values, cparams, dparams).unwrap();
+        let array = B2ndArray::from_dense_buffer(meta, &values, cparams, dparams).unwrap();
 
         ORTHOGONAL_POSTFILTER_CALLS.store(0, Ordering::SeqCst);
         assert_eq!(
-            array.get_orthogonal_selection(&[vec![1], vec![1]]).unwrap(),
-            vec![5]
-        );
-        assert_eq!(ORTHOGONAL_POSTFILTER_CALLS.load(Ordering::SeqCst), 1);
-
-        ORTHOGONAL_POSTFILTER_CALLS.store(0, Ordering::SeqCst);
-        assert_eq!(
-            array.get_slice_cbuffer(&[1, 1], &[2, 2], &[1, 1]).unwrap(),
+            array.select_orthogonal(&[vec![1], vec![1]]).unwrap(),
             vec![5]
         );
         assert_eq!(ORTHOGONAL_POSTFILTER_CALLS.load(Ordering::SeqCst), 1);
@@ -10014,8 +10090,15 @@ mod tests {
         ORTHOGONAL_POSTFILTER_CALLS.store(0, Ordering::SeqCst);
         assert_eq!(
             array
-                .get_orthogonal_selection(&[vec![1, 3], vec![1, 3]])
+                .slice_to_dense_buffer(&[1, 1], &[2, 2], &[1, 1])
                 .unwrap(),
+            vec![5]
+        );
+        assert_eq!(ORTHOGONAL_POSTFILTER_CALLS.load(Ordering::SeqCst), 1);
+
+        ORTHOGONAL_POSTFILTER_CALLS.store(0, Ordering::SeqCst);
+        assert_eq!(
+            array.select_orthogonal(&[vec![1, 3], vec![1, 3]]).unwrap(),
             vec![5, 7, 13, 15]
         );
         assert_eq!(ORTHOGONAL_POSTFILTER_CALLS.load(Ordering::SeqCst), 4);
@@ -10034,17 +10117,20 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &values, cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta, &values, cparams, DParams::default()).unwrap();
         let saved = replace_raw_chunk(&mut array, 3, &[10, 11, 14, 15]);
 
         array
             .set_orthogonal_selection(&[vec![0], vec![0]], &[99])
             .unwrap();
-        assert_eq!(array.schunk.compressed_chunk(3).unwrap(), saved.as_slice());
+        assert_eq!(
+            array.schunk.compressed_chunk_bytes(3).unwrap(),
+            saved.as_slice()
+        );
 
         let mut expected = values;
         expected[0] = 99;
-        assert_eq!(array.to_cbuffer().unwrap(), expected);
+        assert_eq!(array.to_dense_buffer().unwrap(), expected);
     }
 
     #[test]
@@ -10060,10 +10146,10 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &u16_bytes(&values), cparams, DParams::default())
+            B2ndArray::from_dense_buffer(meta, &u16_bytes(&values), cparams, DParams::default())
                 .unwrap();
 
-        array.resize_at(vec![6, 6], Some(&[2, 0])).unwrap();
+        array.resize_with_start(vec![6, 6], Some(&[2, 0])).unwrap();
 
         let mut expected = vec![0u16; 36];
         for row in 0..2 {
@@ -10077,7 +10163,7 @@ mod tests {
             }
         }
         assert_eq!(array.shape(), &[6, 6]);
-        assert_eq!(array.to_cbuffer().unwrap(), u16_bytes(&expected));
+        assert_eq!(array.to_dense_buffer().unwrap(), u16_bytes(&expected));
     }
 
     #[test]
@@ -10092,14 +10178,14 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
         let saved_tail = replace_raw_chunk(&mut array, 1, &[3, 4]);
 
-        array.resize_at(vec![6], Some(&[2])).unwrap();
+        array.resize_with_start(vec![6], Some(&[2])).unwrap();
 
         assert_eq!(array.shape(), &[6]);
-        assert_eq!(array.to_cbuffer().unwrap(), vec![1, 2, 0, 0, 3, 4]);
-        let inserted = ChunkHeader::read(array.schunk.compressed_chunk(1).unwrap()).unwrap();
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![1, 2, 0, 0, 3, 4]);
+        let inserted = ChunkHeader::read(array.schunk.compressed_chunk_bytes(1).unwrap()).unwrap();
         assert_eq!(inserted.version, BLOSC2_VERSION_FORMAT_STABLE);
         assert_eq!(inserted.versionlz, BLOSC_BLOSCLZ_VERSION_FORMAT);
         assert_eq!(inserted.flags, BLOSC_DOSHUFFLE | BLOSC_DOBITSHUFFLE);
@@ -10107,7 +10193,7 @@ mod tests {
         assert_eq!(inserted.cbytes as usize, BLOSC_EXTENDED_HEADER_LENGTH);
         assert_eq!(inserted.nbytes, 2);
         assert_eq!(
-            array.schunk.compressed_chunk(2).unwrap(),
+            array.schunk.compressed_chunk_bytes(2).unwrap(),
             saved_tail.as_slice()
         );
     }
@@ -10124,16 +10210,16 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &[1, 2, 3, 4, 5, 6], cparams, DParams::default())
+            B2ndArray::from_dense_buffer(meta, &[1, 2, 3, 4, 5, 6], cparams, DParams::default())
                 .unwrap();
         let saved_tail = replace_raw_chunk(&mut array, 2, &[5, 6]);
 
-        array.resize_at(vec![4], Some(&[2])).unwrap();
+        array.resize_with_start(vec![4], Some(&[2])).unwrap();
 
         assert_eq!(array.shape(), &[4]);
-        assert_eq!(array.to_cbuffer().unwrap(), vec![1, 2, 5, 6]);
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![1, 2, 5, 6]);
         assert_eq!(
-            array.schunk.compressed_chunk(1).unwrap(),
+            array.schunk.compressed_chunk_bytes(1).unwrap(),
             saved_tail.as_slice()
         );
     }
@@ -10150,15 +10236,15 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
         let saved_tail = replace_raw_chunk(&mut array, 1, &[3, 4]);
 
         array.insert(0, 2, &[2], &[7, 8]).unwrap();
 
         assert_eq!(array.shape(), &[6]);
-        assert_eq!(array.to_cbuffer().unwrap(), vec![1, 2, 7, 8, 3, 4]);
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![1, 2, 7, 8, 3, 4]);
         assert_eq!(
-            array.schunk.compressed_chunk(2).unwrap(),
+            array.schunk.compressed_chunk_bytes(2).unwrap(),
             saved_tail.as_slice()
         );
     }
@@ -10175,16 +10261,16 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &[1, 2, 3, 4, 5, 6], cparams, DParams::default())
+            B2ndArray::from_dense_buffer(meta, &[1, 2, 3, 4, 5, 6], cparams, DParams::default())
                 .unwrap();
         let saved_tail = replace_raw_chunk(&mut array, 2, &[5, 6]);
 
         array.delete(0, 2, 2).unwrap();
 
         assert_eq!(array.shape(), &[4]);
-        assert_eq!(array.to_cbuffer().unwrap(), vec![1, 2, 5, 6]);
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![1, 2, 5, 6]);
         assert_eq!(
-            array.schunk.compressed_chunk(1).unwrap(),
+            array.schunk.compressed_chunk_bytes(1).unwrap(),
             saved_tail.as_slice()
         );
     }
@@ -10201,9 +10287,9 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
         let before_shape = array.shape().to_vec();
-        let before_data = array.to_cbuffer().unwrap();
+        let before_data = array.to_dense_buffer().unwrap();
         let before_nchunks = array.schunk.nchunks();
 
         assert_eq!(
@@ -10212,7 +10298,7 @@ mod tests {
         );
 
         assert_eq!(array.shape(), before_shape.as_slice());
-        assert_eq!(array.to_cbuffer().unwrap(), before_data);
+        assert_eq!(array.to_dense_buffer().unwrap(), before_data);
         assert_eq!(array.schunk.nchunks(), before_nchunks);
     }
 
@@ -10229,8 +10315,8 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
-        let before_data = array.to_cbuffer().unwrap();
+            B2ndArray::from_dense_buffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
+        let before_data = array.to_dense_buffer().unwrap();
         let before_chunks = array.schunk.compressed_chunks();
         array.schunk.cparams.prefilter = Some(fail_on_selected_chunk_prefilter);
         FAIL_PREFILTER_NCHUNK.store(1, Ordering::SeqCst);
@@ -10242,7 +10328,7 @@ mod tests {
 
         FAIL_PREFILTER_NCHUNK.store(-1, Ordering::SeqCst);
         array.schunk.cparams.prefilter = None;
-        assert_eq!(array.to_cbuffer().unwrap(), before_data);
+        assert_eq!(array.to_dense_buffer().unwrap(), before_data);
         assert_eq!(array.schunk.compressed_chunks(), before_chunks);
     }
 
@@ -10259,8 +10345,8 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
-        let before_data = array.to_cbuffer().unwrap();
+            B2ndArray::from_dense_buffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
+        let before_data = array.to_dense_buffer().unwrap();
         let before_chunks = array.schunk.compressed_chunks();
         array.schunk.cparams.prefilter = Some(fail_on_selected_chunk_prefilter);
         FAIL_PREFILTER_NCHUNK.store(1, Ordering::SeqCst);
@@ -10274,7 +10360,7 @@ mod tests {
 
         FAIL_PREFILTER_NCHUNK.store(-1, Ordering::SeqCst);
         array.schunk.cparams.prefilter = None;
-        assert_eq!(array.to_cbuffer().unwrap(), before_data);
+        assert_eq!(array.to_dense_buffer().unwrap(), before_data);
         assert_eq!(array.schunk.compressed_chunks(), before_chunks);
     }
 
@@ -10290,9 +10376,9 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
         let before_shape = array.shape().to_vec();
-        let before_data = array.to_cbuffer().unwrap();
+        let before_data = array.to_dense_buffer().unwrap();
         let before_chunks = array.schunk.compressed_chunks();
         let before_nchunks = array.schunk.nchunks();
         array.schunk.cparams.prefilter = Some(always_fail_prefilter);
@@ -10304,7 +10390,7 @@ mod tests {
 
         array.schunk.cparams.prefilter = None;
         assert_eq!(array.shape(), before_shape.as_slice());
-        assert_eq!(array.to_cbuffer().unwrap(), before_data);
+        assert_eq!(array.to_dense_buffer().unwrap(), before_data);
         assert_eq!(array.schunk.nchunks(), before_nchunks);
         assert_eq!(array.schunk.compressed_chunks(), before_chunks);
     }
@@ -10321,7 +10407,7 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta.clone(), &[], cparams.clone(), DParams::default())
+            B2ndArray::from_dense_buffer(meta.clone(), &[], cparams.clone(), DParams::default())
                 .unwrap();
         let mut dest = vec![0xff; 4];
         let mut dense_dest = vec![0xff; 4];
@@ -10374,7 +10460,7 @@ mod tests {
         let slice = slice.unwrap();
         assert_eq!(ctx.meta.shape, vec![0, 1]);
         assert_eq!(slice.shape(), &[0, 1]);
-        assert_eq!(slice.to_cbuffer().unwrap(), Vec::<u8>::new());
+        assert_eq!(slice.to_dense_buffer().unwrap(), Vec::<u8>::new());
         assert_eq!(slice.schunk.metalayer("owner"), Some(&b"ctx"[..]));
 
         let (slice_rc, slice) = b2nd_get_slice_ctx_c(&mut ctx, &array, &[0, 0], &[0, 5]);
@@ -10382,7 +10468,7 @@ mod tests {
         let slice = slice.unwrap();
         assert_eq!(ctx.meta.shape, vec![0, 5]);
         assert_eq!(slice.shape(), &[0, 5]);
-        assert_eq!(slice.to_cbuffer().unwrap(), Vec::<u8>::new());
+        assert_eq!(slice.to_dense_buffer().unwrap(), Vec::<u8>::new());
         assert_eq!(slice.schunk.metalayer("owner"), Some(&b"ctx"[..]));
     }
 
@@ -10399,9 +10485,9 @@ mod tests {
         };
         let data: Vec<u8> = (0..24).collect();
         let mut array =
-            B2ndArray::from_cbuffer(meta.clone(), &data, cparams.clone(), DParams::default())
+            B2ndArray::from_dense_buffer(meta.clone(), &data, cparams.clone(), DParams::default())
                 .unwrap();
-        let before = array.to_cbuffer().unwrap();
+        let before = array.to_dense_buffer().unwrap();
         let start = [0, 100];
         let stop = [0, 101];
         let buffershape = [0, 1];
@@ -10427,7 +10513,7 @@ mod tests {
             b2nd_set_slice_cbuffer_c(&[], 0, &buffershape, &start, &stop, &mut array),
             BLOSC2_ERROR_SUCCESS
         );
-        assert_eq!(array.to_cbuffer().unwrap(), before);
+        assert_eq!(array.to_dense_buffer().unwrap(), before);
 
         let slice_meta = B2ndMeta::new(vec![99, 99], vec![2, 3], vec![1, 3], "|u1", 0).unwrap();
         let slice = b2nd_get_slice(
@@ -10440,7 +10526,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(slice.shape(), &[0, 1]);
-        assert_eq!(slice.to_cbuffer().unwrap(), Vec::<u8>::new());
+        assert_eq!(slice.to_dense_buffer().unwrap(), Vec::<u8>::new());
         let (slice_rc, slice) = b2nd_get_slice_c(
             &array,
             &start,
@@ -10473,9 +10559,9 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta, &[1, 2, 3, 4], cparams, DParams::default()).unwrap();
         let before_shape = array.shape().to_vec();
-        let before_data = array.to_cbuffer().unwrap();
+        let before_data = array.to_dense_buffer().unwrap();
         let before_nchunks = array.schunk.nchunks();
 
         assert_eq!(
@@ -10484,7 +10570,7 @@ mod tests {
         );
 
         assert_eq!(array.shape(), before_shape.as_slice());
-        assert_eq!(array.to_cbuffer().unwrap(), before_data);
+        assert_eq!(array.to_dense_buffer().unwrap(), before_data);
         assert_eq!(array.schunk.nchunks(), before_nchunks);
     }
 
@@ -10499,7 +10585,7 @@ mod tests {
             filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
             ..Default::default()
         };
-        let mut array = B2ndArray::from_cbuffer(
+        let mut array = B2ndArray::from_dense_buffer(
             meta,
             &(0..10u8).collect::<Vec<_>>(),
             cparams,
@@ -10515,7 +10601,7 @@ mod tests {
         assert_eq!(array.shape(), &[4, 5]);
         assert_eq!(array.schunk.nchunks(), 5);
         assert_eq!(
-            array.to_cbuffer().unwrap(),
+            array.to_dense_buffer().unwrap(),
             vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
     }
@@ -10532,14 +10618,14 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &[1, 2], cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta, &[1, 2], cparams, DParams::default()).unwrap();
         array.schunk.set_storage(FrameStorage::Contiguous);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("attached.b2frame");
         array.save(&path).unwrap();
         let mut opened = B2ndArray::open(&path).unwrap();
         let before_shape = opened.shape().to_vec();
-        let before_data = opened.to_cbuffer().unwrap();
+        let before_data = opened.to_dense_buffer().unwrap();
         let before_nchunks = opened.schunk.nchunks();
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
@@ -10549,18 +10635,18 @@ mod tests {
             Some("Failed to write attached frame")
         );
         assert_eq!(opened.shape(), before_shape.as_slice());
-        assert_eq!(opened.to_cbuffer().unwrap(), before_data);
+        assert_eq!(opened.to_dense_buffer().unwrap(), before_data);
         assert_eq!(opened.schunk.nchunks(), before_nchunks);
 
         std::fs::remove_dir(&path).unwrap();
         opened.schunk.update_chunk(0, &[7, 8]).unwrap();
         let reopened = B2ndArray::open(&path).unwrap();
-        assert_eq!(reopened.to_cbuffer().unwrap(), vec![7, 8]);
+        assert_eq!(reopened.to_dense_buffer().unwrap(), vec![7, 8]);
 
         std::fs::remove_file(&path).unwrap();
         opened.append(0, &[2], &[3, 4]).unwrap();
         let reopened = B2ndArray::open(&path).unwrap();
-        assert_eq!(reopened.to_cbuffer().unwrap(), vec![7, 8, 3, 4]);
+        assert_eq!(reopened.to_dense_buffer().unwrap(), vec![7, 8, 3, 4]);
     }
 
     #[test]
@@ -10573,14 +10659,14 @@ mod tests {
             filters: [0, 0, 0, 0, 0, BLOSC_SHUFFLE],
             ..Default::default()
         };
-        let mut array = B2ndArray::from_cbuffer(
+        let mut array = B2ndArray::from_dense_buffer(
             B2ndMeta::new(vec![2, 3], vec![2, 3], vec![2, 3], "|u1", 0).unwrap(),
             &[1, 2, 3, 4, 5, 6],
             cparams.clone(),
             DParams::default(),
         )
         .unwrap();
-        let first_raw = array.schunk.compressed_chunk(0).unwrap().to_vec();
+        let first_raw = array.schunk.compressed_chunk_bytes(0).unwrap().to_vec();
         let appended = [7, 8, 9, 10, 11, 12];
 
         array.append(0, &[2, 3], &appended).unwrap();
@@ -10590,13 +10676,13 @@ mod tests {
         expected.append_buffer(&appended).unwrap();
         assert_eq!(array.shape(), &[4, 3]);
         assert_eq!(array.schunk.nchunks(), 2);
-        assert_eq!(array.schunk.compressed_chunk(0).unwrap(), first_raw);
+        assert_eq!(array.schunk.compressed_chunk_bytes(0).unwrap(), first_raw);
         assert_eq!(
-            array.schunk.compressed_chunk(1).unwrap(),
-            expected.compressed_chunk(1).unwrap()
+            array.schunk.compressed_chunk_bytes(1).unwrap(),
+            expected.compressed_chunk_bytes(1).unwrap()
         );
         assert_eq!(
-            array.to_cbuffer().unwrap(),
+            array.to_dense_buffer().unwrap(),
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         );
     }
@@ -10620,7 +10706,7 @@ mod tests {
         let inserted: Vec<u8> = (0..inserted_shape.iter().product::<usize>())
             .map(|idx| (idx % 253) as u8)
             .collect();
-        let mut array = B2ndArray::from_cbuffer(
+        let mut array = B2ndArray::from_dense_buffer(
             B2ndMeta::new(vec![12, 10, 14], vec![3, 5, 9], vec![3, 4, 4], "|u1", 0).unwrap(),
             &data,
             cparams.clone(),
@@ -10630,12 +10716,12 @@ mod tests {
         array.insert(2, 9, &[12, 10, 18], &inserted).unwrap();
         assert_eq!(array.shape(), &[12, 10, 32]);
         assert_eq!(
-            array.to_cbuffer().unwrap(),
+            array.to_dense_buffer().unwrap(),
             insert_axis_expected(&data, &shape, 2, 9, 18, &inserted)
         );
         assert_eq!(
             array
-                .get_slice_cbuffer(&[0, 0, 9], &[12, 10, 27], &[12, 10, 18])
+                .slice_to_dense_buffer(&[0, 0, 9], &[12, 10, 27], &[12, 10, 18])
                 .unwrap(),
             inserted
         );
@@ -10648,7 +10734,7 @@ mod tests {
         let inserted: Vec<u8> = (0..inserted_shape.iter().product::<usize>())
             .map(|idx| (idx % 253) as u8)
             .collect();
-        let mut array = B2ndArray::from_cbuffer(
+        let mut array = B2ndArray::from_dense_buffer(
             B2ndMeta::new(
                 vec![10, 10, 5, 5],
                 vec![5, 7, 3, 3],
@@ -10665,7 +10751,7 @@ mod tests {
         array.insert(3, 3, &[10, 10, 5, 30], &inserted).unwrap();
         assert_eq!(array.shape(), &[10, 10, 5, 35]);
         assert_eq!(
-            array.to_cbuffer().unwrap(),
+            array.to_dense_buffer().unwrap(),
             insert_axis_expected(&data, &shape, 3, 3, 30, &inserted)
         );
     }
@@ -10681,7 +10767,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut array = B2ndArray::from_cbuffer(
+        let mut array = B2ndArray::from_dense_buffer(
             B2ndMeta::new(vec![10], vec![3], vec![2], "|u1", 0).unwrap(),
             &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
             cparams.clone(),
@@ -10690,14 +10776,14 @@ mod tests {
         .unwrap();
         array.delete(0, 5, 5).unwrap();
         assert_eq!(array.shape(), &[5]);
-        assert_eq!(array.to_cbuffer().unwrap(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![1, 2, 3, 4, 5]);
         assert_eq!(array.schunk.nchunks(), 2);
 
         let shape = [12usize, 10, 32];
         let data: Vec<u8> = (0..shape.iter().product::<usize>())
             .map(|idx| (idx % 251) as u8)
             .collect();
-        let mut array = B2ndArray::from_cbuffer(
+        let mut array = B2ndArray::from_dense_buffer(
             B2ndMeta::new(vec![12, 10, 32], vec![3, 5, 9], vec![3, 4, 4], "|u1", 0).unwrap(),
             &data,
             cparams.clone(),
@@ -10707,7 +10793,7 @@ mod tests {
         array.delete(2, 9, 18).unwrap();
         assert_eq!(array.shape(), &[12, 10, 14]);
         assert_eq!(
-            array.to_cbuffer().unwrap(),
+            array.to_dense_buffer().unwrap(),
             delete_axis_expected(&data, &shape, 2, 9, 18)
         );
 
@@ -10715,7 +10801,7 @@ mod tests {
         let data: Vec<u8> = (0..shape.iter().product::<usize>())
             .map(|idx| (idx % 251) as u8)
             .collect();
-        let mut array = B2ndArray::from_cbuffer(
+        let mut array = B2ndArray::from_dense_buffer(
             B2ndMeta::new(
                 vec![10, 10, 5, 35],
                 vec![5, 7, 3, 3],
@@ -10732,7 +10818,7 @@ mod tests {
         array.delete(3, 3, 30).unwrap();
         assert_eq!(array.shape(), &[10, 10, 5, 5]);
         assert_eq!(
-            array.to_cbuffer().unwrap(),
+            array.to_dense_buffer().unwrap(),
             delete_axis_expected(&data, &shape, 3, 3, 30)
         );
     }
@@ -10749,7 +10835,7 @@ mod tests {
         };
 
         let data: Vec<u8> = (0..13u8).collect();
-        let mut array = B2ndArray::from_cbuffer(
+        let mut array = B2ndArray::from_dense_buffer(
             B2ndMeta::new(vec![0], vec![3], vec![3], "|u1", 0).unwrap(),
             &[],
             cparams.clone(),
@@ -10758,7 +10844,7 @@ mod tests {
         .unwrap();
         array.append(0, &[13], &data).unwrap();
         assert_eq!(array.shape(), &[13]);
-        assert_eq!(array.to_cbuffer().unwrap(), data);
+        assert_eq!(array.to_dense_buffer().unwrap(), data);
 
         for (chunkshape, blockshape) in [
             (vec![6, 6], vec![6, 6]),
@@ -10766,7 +10852,7 @@ mod tests {
             (vec![6, 6], vec![4, 6]),
         ] {
             let data: Vec<u8> = (0..(13 * 6)).map(|idx| (idx % 251) as u8).collect();
-            let mut array = B2ndArray::from_cbuffer(
+            let mut array = B2ndArray::from_dense_buffer(
                 B2ndMeta::new(vec![0, 6], chunkshape, blockshape, "|u1", 0).unwrap(),
                 &[],
                 cparams.clone(),
@@ -10775,10 +10861,10 @@ mod tests {
             .unwrap();
             array.append(0, &[13, 6], &data).unwrap();
             assert_eq!(array.shape(), &[13, 6]);
-            assert_eq!(array.to_cbuffer().unwrap(), data);
+            assert_eq!(array.to_dense_buffer().unwrap(), data);
         }
 
-        let mut array = B2ndArray::from_cbuffer(
+        let mut array = B2ndArray::from_dense_buffer(
             B2ndMeta::new(vec![4, 2], vec![2, 3], vec![2, 3], "|u1", 0).unwrap(),
             &[1, 2, 3, 4, 5, 6, 7, 8],
             cparams.clone(),
@@ -10791,11 +10877,11 @@ mod tests {
         );
         assert_eq!(array.shape(), &[6, 2]);
         assert_eq!(
-            array.to_cbuffer().unwrap(),
+            array.to_dense_buffer().unwrap(),
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         );
 
-        let mut unaligned = B2ndArray::from_cbuffer(
+        let mut unaligned = B2ndArray::from_dense_buffer(
             B2ndMeta::new(vec![3, 2], vec![2, 3], vec![2, 3], "|u1", 0).unwrap(),
             &[1, 2, 3, 4, 5, 6],
             cparams,
@@ -10808,11 +10894,11 @@ mod tests {
         );
         assert_eq!(unaligned.shape(), &[5, 2]);
         assert_eq!(
-            unaligned.to_cbuffer().unwrap(),
+            unaligned.to_dense_buffer().unwrap(),
             vec![1, 2, 3, 4, 5, 6, 0, 0, 7, 8]
         );
 
-        let mut zero_extent = B2ndArray::from_cbuffer(
+        let mut zero_extent = B2ndArray::from_dense_buffer(
             B2ndMeta::new(vec![2, 2], vec![2, 2], vec![1, 1], "|u1", 0).unwrap(),
             &[1, 2, 3, 4],
             CParams {
@@ -10825,7 +10911,7 @@ mod tests {
         assert!(zero_extent.append(0, &[0, 2], &[9, 9]).is_err());
         assert!(zero_extent.insert(1, 1, &[2, 0], &[9, 9]).is_err());
         zero_extent.append(0, &[0, 2], &[]).unwrap();
-        assert_eq!(zero_extent.to_cbuffer().unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(zero_extent.to_dense_buffer().unwrap(), vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -10844,7 +10930,7 @@ mod tests {
             .collect();
         let inserted_shape = [2usize, 3];
         let inserted: Vec<u8> = (100..106u8).collect();
-        let mut array = B2ndArray::from_cbuffer(
+        let mut array = B2ndArray::from_dense_buffer(
             B2ndMeta::new(vec![5, 3], vec![3, 2], vec![2, 1], "|u1", 0).unwrap(),
             &data,
             cparams,
@@ -10855,14 +10941,14 @@ mod tests {
         array.insert(0, 5, &[2, 3], &inserted).unwrap();
         assert_eq!(array.shape(), &[7, 3]);
         assert_eq!(
-            array.to_cbuffer().unwrap(),
+            array.to_dense_buffer().unwrap(),
             insert_axis_expected(&data, &shape, 0, 5, 2, &inserted)
         );
         assert_eq!(array.schunk.nchunks(), 6);
 
         array.delete(0, 5, 2).unwrap();
         assert_eq!(array.shape(), &[5, 3]);
-        assert_eq!(array.to_cbuffer().unwrap(), data);
+        assert_eq!(array.to_dense_buffer().unwrap(), data);
         assert_eq!(inserted_shape.iter().product::<usize>(), inserted.len());
     }
 
@@ -10878,15 +10964,16 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &[1, 2, 3, 4, 5], cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta, &[1, 2, 3, 4, 5], cparams, DParams::default())
+                .unwrap();
         let saved_tail = replace_raw_chunk(&mut array, 1, &[4, 5, 0]);
 
         array.resize(vec![7]).unwrap();
 
         assert_eq!(array.shape(), &[7]);
-        assert_eq!(array.to_cbuffer().unwrap(), vec![1, 2, 3, 4, 5, 0, 0]);
+        assert_eq!(array.to_dense_buffer().unwrap(), vec![1, 2, 3, 4, 5, 0, 0]);
         assert_eq!(
-            array.schunk.compressed_chunk(1).unwrap(),
+            array.schunk.compressed_chunk_bytes(1).unwrap(),
             saved_tail.as_slice()
         );
         assert_eq!(array.schunk.nchunks(), 3);
@@ -10905,10 +10992,10 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &values, cparams, DParams::default()).unwrap();
+            B2ndArray::from_dense_buffer(meta, &values, cparams, DParams::default()).unwrap();
         let saved_bottom_right = replace_raw_chunk(&mut array, 3, &[10, 11, 14, 15]);
 
-        array.resize_at(vec![6, 6], Some(&[2, 2])).unwrap();
+        array.resize_with_start(vec![6, 6], Some(&[2, 2])).unwrap();
 
         let mut expected = vec![0u8; 36];
         for row in 0..2 {
@@ -10929,9 +11016,9 @@ mod tests {
         }
 
         assert_eq!(array.shape(), &[6, 6]);
-        assert_eq!(array.to_cbuffer().unwrap(), expected);
+        assert_eq!(array.to_dense_buffer().unwrap(), expected);
         assert_eq!(
-            array.schunk.compressed_chunk(8).unwrap(),
+            array.schunk.compressed_chunk_bytes(8).unwrap(),
             saved_bottom_right.as_slice()
         );
     }
@@ -10949,15 +11036,15 @@ mod tests {
             ..Default::default()
         };
         let mut array =
-            B2ndArray::from_cbuffer(meta, &u16_bytes(&values), cparams, DParams::default())
+            B2ndArray::from_dense_buffer(meta, &u16_bytes(&values), cparams, DParams::default())
                 .unwrap();
 
-        assert!(array.resize_at(vec![8, 6], Some(&[1, 0])).is_err());
-        assert!(array.resize_at(vec![8, 6], Some(&[-2, 0])).is_err());
-        assert!(array.resize_at(vec![8, 6], Some(&[2])).is_err());
-        assert!(array.resize_at(vec![8], Some(&[2, 0])).is_err());
+        assert!(array.resize_with_start(vec![8, 6], Some(&[1, 0])).is_err());
+        assert!(array.resize_with_start(vec![8, 6], Some(&[-2, 0])).is_err());
+        assert!(array.resize_with_start(vec![8, 6], Some(&[2])).is_err());
+        assert!(array.resize_with_start(vec![8], Some(&[2, 0])).is_err());
 
-        array.resize_at(vec![4, 6], Some(&[2, 0])).unwrap();
+        array.resize_with_start(vec![4, 6], Some(&[2, 0])).unwrap();
 
         let mut expected = Vec::new();
         for row in 0..2 {
@@ -10971,6 +11058,6 @@ mod tests {
             }
         }
         assert_eq!(array.shape(), &[4, 6]);
-        assert_eq!(array.to_cbuffer().unwrap(), u16_bytes(&expected));
+        assert_eq!(array.to_dense_buffer().unwrap(), u16_bytes(&expected));
     }
 }

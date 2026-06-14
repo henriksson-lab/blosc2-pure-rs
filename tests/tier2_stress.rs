@@ -285,13 +285,13 @@ fn test_100_chunks_frame_roundtrip() {
     }
 
     // Serialize to frame and back
-    let frame = schunk.to_frame();
+    let frame = schunk.to_contiguous_frame();
     assert_eq!(frame_version(&frame), BLOSC2_VERSION_FRAME_FORMAT_RC1);
     assert!(!variable_chunks_flag(&frame));
     assert!(!vlblocks_frame_flag(&frame));
     assert_c_decompresses_schunk_frame(frame.clone(), &chunk_data);
 
-    let schunk2 = Schunk::from_frame(&frame).unwrap();
+    let schunk2 = Schunk::from_contiguous_frame(&frame).unwrap();
 
     assert_eq!(schunk2.nchunks(), nchunks);
 
@@ -306,7 +306,7 @@ fn test_100_chunks_frame_roundtrip() {
     assert_eq!(frame_version(&c_frame), BLOSC2_VERSION_FRAME_FORMAT_RC1);
     assert!(!variable_chunks_flag(&c_frame));
     assert!(!vlblocks_frame_flag(&c_frame));
-    let c_frame_schunk = Schunk::from_frame(&c_frame).unwrap();
+    let c_frame_schunk = Schunk::from_contiguous_frame(&c_frame).unwrap();
     assert_eq!(c_frame_schunk.nchunks(), nchunks);
     for (idx, expected) in chunk_data.iter().enumerate() {
         assert_eq!(
@@ -374,7 +374,7 @@ fn test_variable_last_chunk() {
 
     assert_eq!(schunk.chunksize, 0);
     assert_eq!(schunk.nchunks(), 3);
-    let frame = schunk.to_frame();
+    let frame = schunk.to_contiguous_frame();
     assert_eq!(frame_version(&frame), BLOSC2_VERSION_FRAME_FORMAT_VL_BLOCKS);
     assert!(variable_chunks_flag(&frame));
     assert!(!vlblocks_frame_flag(&frame));
@@ -389,7 +389,7 @@ fn test_variable_last_chunk() {
     let mut future_version = frame.clone();
     future_version[FRAME_FLAGS_OFFSET] = (future_version[FRAME_FLAGS_OFFSET] & !FRAME_VERSION_MASK)
         | (BLOSC2_VERSION_FRAME_FORMAT + 1);
-    assert!(Schunk::from_frame(&future_version).is_err());
+    assert!(Schunk::from_contiguous_frame(&future_version).is_err());
 
     for (idx, expected) in values.iter().enumerate() {
         assert_eq!(schunk.decompress_chunk(idx as i64).unwrap(), *expected);
@@ -399,7 +399,7 @@ fn test_variable_last_chunk() {
     assert_eq!(schunk.update_chunk(2, updated_values[2]).unwrap(), 3);
     assert_eq!(schunk.chunksize, 0);
 
-    let updated_frame = schunk.to_frame();
+    let updated_frame = schunk.to_contiguous_frame();
     assert_eq!(
         frame_version(&updated_frame),
         BLOSC2_VERSION_FRAME_FORMAT_VL_BLOCKS
@@ -428,7 +428,7 @@ fn test_variable_last_chunk() {
     );
     assert!(variable_chunks_flag(&c_updated_frame));
     assert!(!vlblocks_frame_flag(&c_updated_frame));
-    let c_updated_schunk = Schunk::from_frame(&c_updated_frame).unwrap();
+    let c_updated_schunk = Schunk::from_contiguous_frame(&c_updated_frame).unwrap();
     assert_eq!(c_updated_schunk.chunksize, 0);
     assert_schunk_values(&c_updated_schunk, &updated_values);
 
@@ -438,7 +438,7 @@ fn test_variable_last_chunk() {
     let reopened = Schunk::open(path.to_str().unwrap()).unwrap();
     assert_eq!(reopened.chunksize, 0);
     assert_eq!(reopened.nchunks(), 3);
-    let reopened_frame = reopened.to_frame();
+    let reopened_frame = reopened.to_contiguous_frame();
     assert_eq!(
         frame_version(&reopened_frame),
         BLOSC2_VERSION_FRAME_FORMAT_VL_BLOCKS
@@ -448,11 +448,11 @@ fn test_variable_last_chunk() {
     assert_schunk_values(&reopened, &updated_values);
 
     let sparse_path = dir.path().join("variable_chunks_s.b2frame");
-    schunk.to_sframe_dir(&sparse_path).unwrap();
-    let reopened_sparse = Schunk::open_sframe(&sparse_path).unwrap();
+    schunk.write_sparse_frame_dir(&sparse_path).unwrap();
+    let reopened_sparse = Schunk::open_sparse_frame(&sparse_path).unwrap();
     assert_eq!(reopened_sparse.chunksize, 0);
     assert_eq!(reopened_sparse.nchunks(), 3);
-    let reopened_sparse_frame = reopened_sparse.to_frame();
+    let reopened_sparse_frame = reopened_sparse.to_contiguous_frame();
     assert_eq!(
         frame_version(&reopened_sparse_frame),
         BLOSC2_VERSION_FRAME_FORMAT_VL_BLOCKS
@@ -473,7 +473,7 @@ fn test_variable_last_chunk() {
         assert_eq!(fixed.append_buffer(value).unwrap(), idx as i64 + 1);
     }
     assert_eq!(fixed.chunksize, 4);
-    let fixed_frame = fixed.to_frame();
+    let fixed_frame = fixed.to_contiguous_frame();
     assert_eq!(frame_version(&fixed_frame), BLOSC2_VERSION_FRAME_FORMAT_RC1);
     assert!(!variable_chunks_flag(&fixed_frame));
     assert!(!vlblocks_frame_flag(&fixed_frame));
@@ -490,7 +490,7 @@ fn test_variable_last_chunk() {
     fixed.to_file(fixed_path.to_str().unwrap()).unwrap();
     let reopened_fixed = Schunk::open(fixed_path.to_str().unwrap()).unwrap();
     assert_eq!(reopened_fixed.chunksize, 4);
-    let reopened_fixed_frame = reopened_fixed.to_frame();
+    let reopened_fixed_frame = reopened_fixed.to_contiguous_frame();
     assert_eq!(
         frame_version(&reopened_fixed_frame),
         BLOSC2_VERSION_FRAME_FORMAT_RC1
@@ -500,10 +500,10 @@ fn test_variable_last_chunk() {
     assert_schunk_values(&reopened_fixed, &fixed_values);
 
     let fixed_sparse_path = dir.path().join("fixed_chunks_s.b2frame");
-    fixed.to_sframe_dir(&fixed_sparse_path).unwrap();
-    let reopened_fixed_sparse = Schunk::open_sframe(&fixed_sparse_path).unwrap();
+    fixed.write_sparse_frame_dir(&fixed_sparse_path).unwrap();
+    let reopened_fixed_sparse = Schunk::open_sparse_frame(&fixed_sparse_path).unwrap();
     assert_eq!(reopened_fixed_sparse.chunksize, 4);
-    let reopened_fixed_sparse_frame = reopened_fixed_sparse.to_frame();
+    let reopened_fixed_sparse_frame = reopened_fixed_sparse.to_contiguous_frame();
     assert_eq!(
         frame_version(&reopened_fixed_sparse_frame),
         BLOSC2_VERSION_FRAME_FORMAT_RC1
@@ -528,7 +528,7 @@ fn test_variable_last_chunk() {
         3
     );
     assert_eq!(fixed_with_short_tail.chunksize, full_chunk.len());
-    let fixed_with_short_tail_frame = fixed_with_short_tail.to_frame();
+    let fixed_with_short_tail_frame = fixed_with_short_tail.to_contiguous_frame();
     assert_eq!(
         frame_version(&fixed_with_short_tail_frame),
         BLOSC2_VERSION_FRAME_FORMAT_RC1
@@ -552,7 +552,7 @@ fn test_variable_last_chunk() {
         partial_tail
     );
 
-    let reopened_short_tail = Schunk::from_frame(&fixed_with_short_tail_frame).unwrap();
+    let reopened_short_tail = Schunk::from_contiguous_frame(&fixed_with_short_tail_frame).unwrap();
     assert_eq!(reopened_short_tail.chunksize, 10_000);
     assert_eq!(reopened_short_tail.nchunks(), 3);
     assert_eq!(
@@ -573,7 +573,8 @@ fn test_variable_last_chunk() {
     );
     assert!(!variable_chunks_flag(&c_fixed_with_short_tail_frame));
     assert!(!vlblocks_frame_flag(&c_fixed_with_short_tail_frame));
-    let c_fixed_with_short_tail = Schunk::from_frame(&c_fixed_with_short_tail_frame).unwrap();
+    let c_fixed_with_short_tail =
+        Schunk::from_contiguous_frame(&c_fixed_with_short_tail_frame).unwrap();
     assert_eq!(c_fixed_with_short_tail.chunksize, 10_000);
     assert_eq!(c_fixed_with_short_tail.nchunks(), 3);
     assert_eq!(
@@ -593,7 +594,7 @@ fn test_c_compress_all_codecs_filters_splitmodes_rust_decompress() {
         for filter in FILTERS {
             for splitmode in SPLITMODES {
                 let c_chunk = c_compress(&data, compcode, 4, splitmode, filter);
-                let restored = blosc2_pure_rs::compress::decompress(&c_chunk).unwrap_or_else(|e| {
+                let restored = blosc2_pure_rs::compress::decompress_chunk(&c_chunk).unwrap_or_else(|e| {
                     panic!(
                         "Rust decompress failed for codec={compcode} filter={filter} splitmode={splitmode}: {e}"
                     )
@@ -659,9 +660,10 @@ fn test_c_compress_large_random_filters_splitmodes_rust_decompress() {
     for filter in FILTERS {
         for splitmode in SPLITMODES {
             let c_chunk = c_compress(&data, BLOSC_LZ4, 4, splitmode, filter);
-            let restored = blosc2_pure_rs::compress::decompress(&c_chunk).unwrap_or_else(|e| {
-                panic!("Rust decompress failed for filter={filter} splitmode={splitmode}: {e}")
-            });
+            let restored =
+                blosc2_pure_rs::compress::decompress_chunk(&c_chunk).unwrap_or_else(|e| {
+                    panic!("Rust decompress failed for filter={filter} splitmode={splitmode}: {e}")
+                });
             assert_eq!(
                 data, restored,
                 "C→Rust large random mismatch for filter={filter} splitmode={splitmode}"
@@ -734,22 +736,22 @@ fn test_b2nd_random_multi_chunk_frame_file_and_c_roundtrip() {
         ..Default::default()
     };
 
-    let array = B2ndArray::from_cbuffer(meta, &data, cparams, DParams::default()).unwrap();
+    let array = B2ndArray::from_dense_buffer(meta, &data, cparams, DParams::default()).unwrap();
     assert_eq!(array.schunk.nchunks(), 135);
-    assert_eq!(array.to_cbuffer().unwrap(), data);
+    assert_eq!(array.to_dense_buffer().unwrap(), data);
 
-    let mut frame = array.to_frame();
-    let from_frame = B2ndArray::from_frame(&frame).unwrap();
-    assert_eq!(from_frame.meta.shape, shape);
-    assert_eq!(from_frame.meta.chunkshape, chunkshape);
-    assert_eq!(from_frame.meta.blockshape, blockshape);
-    assert_eq!(from_frame.to_cbuffer().unwrap(), data);
+    let mut frame = array.to_contiguous_frame();
+    let from_contiguous_frame = B2ndArray::from_contiguous_frame(&frame).unwrap();
+    assert_eq!(from_contiguous_frame.meta.shape, shape);
+    assert_eq!(from_contiguous_frame.meta.chunkshape, chunkshape);
+    assert_eq!(from_contiguous_frame.meta.blockshape, blockshape);
+    assert_eq!(from_contiguous_frame.to_dense_buffer().unwrap(), data);
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("stress.b2nd");
     array.save(&path).unwrap();
     let from_file = B2ndArray::open(&path).unwrap();
-    assert_eq!(from_file.to_cbuffer().unwrap(), data);
+    assert_eq!(from_file.to_dense_buffer().unwrap(), data);
 
     unsafe {
         let mut c_array: *mut ffi::b2nd_array_t = std::ptr::null_mut();

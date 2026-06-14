@@ -238,19 +238,22 @@ fn bench_chunks(c: &mut Criterion) {
         ("zstd_t4", BLOSC_ZSTD),
     ] {
         let params = cparams(compcode, 4, BLOSC_SHUFFLE, BENCH_NTHREADS);
-        let compressed = compress::compress(&signal, &params).unwrap();
+        let compressed = compress::compress_chunk(&signal, &params).unwrap();
 
         group.bench_function(format!("{name}/compress"), |b| {
             b.iter(|| {
-                black_box(compress::compress(black_box(&signal), black_box(&params)).unwrap())
+                black_box(compress::compress_chunk(black_box(&signal), black_box(&params)).unwrap())
             });
         });
 
         group.bench_function(format!("{name}/decompress"), |b| {
             b.iter(|| {
                 black_box(
-                    compress::decompress_with_threads(black_box(&compressed), params.nthreads)
-                        .unwrap(),
+                    compress::decompress_chunk_with_threads(
+                        black_box(&compressed),
+                        params.nthreads,
+                    )
+                    .unwrap(),
                 )
             });
         });
@@ -275,19 +278,24 @@ fn bench_dictionary_chunks(c: &mut Criterion) {
             ("zstd", BLOSC_ZSTD),
         ] {
             let params = dict_cparams(compcode, 1, BLOSC_NOFILTER, BENCH_NTHREADS);
-            let compressed = compress::compress(data, &params).unwrap();
+            let compressed = compress::compress_chunk(data, &params).unwrap();
 
             group.bench_function(format!("{dataset}/{name}/compress"), |b| {
                 b.iter(|| {
-                    black_box(compress::compress(black_box(data), black_box(&params)).unwrap())
+                    black_box(
+                        compress::compress_chunk(black_box(data), black_box(&params)).unwrap(),
+                    )
                 });
             });
 
             group.bench_function(format!("{dataset}/{name}/decompress"), |b| {
                 b.iter(|| {
                     black_box(
-                        compress::decompress_with_threads(black_box(&compressed), params.nthreads)
-                            .unwrap(),
+                        compress::decompress_chunk_with_threads(
+                            black_box(&compressed),
+                            params.nthreads,
+                        )
+                        .unwrap(),
                     )
                 });
             });
@@ -315,7 +323,7 @@ fn bench_schunk_frame(c: &mut Criterion) {
     for chunk in &chunks {
         schunk.append_buffer(chunk).unwrap();
     }
-    let frame = schunk.to_frame();
+    let frame = schunk.to_contiguous_frame();
 
     let mut group = c.benchmark_group("schunk_frame");
     group.throughput(Throughput::Bytes(data.len() as u64));
@@ -330,12 +338,12 @@ fn bench_schunk_frame(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("to_frame", |b| {
-        b.iter(|| black_box(schunk.to_frame()));
+    group.bench_function("to_contiguous_frame", |b| {
+        b.iter(|| black_box(schunk.to_contiguous_frame()));
     });
 
-    group.bench_function("from_frame", |b| {
-        b.iter(|| black_box(Schunk::from_frame(black_box(&frame)).unwrap()));
+    group.bench_function("from_contiguous_frame", |b| {
+        b.iter(|| black_box(Schunk::from_contiguous_frame(black_box(&frame)).unwrap()));
     });
 
     group.bench_function("decompress_all", |b| {

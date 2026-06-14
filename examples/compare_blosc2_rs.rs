@@ -111,10 +111,10 @@ mod enabled {
 
     fn bench_rust(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> (usize, f64, f64) {
         let cparams = rust_cparams(codec, filter, nthreads);
-        let compressed = compress::compress(data, &cparams).unwrap();
+        let compressed = compress::compress_chunk(data, &cparams).unwrap();
         if !compress_only() {
             let restored =
-                compress::decompress_with_threads(&compressed, nthreads.try_into().unwrap())
+                compress::decompress_chunk_with_threads(&compressed, nthreads.try_into().unwrap())
                     .unwrap();
             assert_eq!(restored, data);
         }
@@ -124,7 +124,7 @@ mod enabled {
         if !decompress_only() {
             for _ in 0..iters {
                 let start = Instant::now();
-                let out = compress::compress(data, &cparams).unwrap();
+                let out = compress::compress_chunk(data, &cparams).unwrap();
                 c_times.push(start.elapsed().as_secs_f64());
                 std::hint::black_box(out);
             }
@@ -134,9 +134,11 @@ mod enabled {
         if !compress_only() {
             for _ in 0..iters {
                 let start = Instant::now();
-                let out =
-                    compress::decompress_with_threads(&compressed, nthreads.try_into().unwrap())
-                        .unwrap();
+                let out = compress::decompress_chunk_with_threads(
+                    &compressed,
+                    nthreads.try_into().unwrap(),
+                )
+                .unwrap();
                 d_times.push(start.elapsed().as_secs_f64());
                 std::hint::black_box(out);
             }
@@ -159,7 +161,7 @@ mod enabled {
 
     fn rust_compressed(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> Vec<u8> {
         let cparams = rust_cparams(codec, filter, nthreads);
-        compress::compress(data, &cparams).unwrap()
+        compress::compress_chunk(data, &cparams).unwrap()
     }
 
     fn bench_rust_compress_speed(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> f64 {
@@ -168,7 +170,7 @@ mod enabled {
         let mut c_times = Vec::with_capacity(iters);
         for _ in 0..iters {
             let start = Instant::now();
-            let out = compress::compress(data, &cparams).unwrap();
+            let out = compress::compress_chunk(data, &cparams).unwrap();
             c_times.push(start.elapsed().as_secs_f64());
             std::hint::black_box(out);
         }
@@ -177,15 +179,17 @@ mod enabled {
 
     fn bench_rust_decompress_chunk(data: &[u8], compressed: &[u8], nthreads: usize) -> f64 {
         let restored =
-            compress::decompress_with_threads(compressed, nthreads.try_into().unwrap()).unwrap();
+            compress::decompress_chunk_with_threads(compressed, nthreads.try_into().unwrap())
+                .unwrap();
         assert_eq!(restored, data);
 
         let iters = iterations();
         let mut d_times = Vec::with_capacity(iters);
         for _ in 0..iters {
             let start = Instant::now();
-            let out = compress::decompress_with_threads(compressed, nthreads.try_into().unwrap())
-                .unwrap();
+            let out =
+                compress::decompress_chunk_with_threads(compressed, nthreads.try_into().unwrap())
+                    .unwrap();
             d_times.push(start.elapsed().as_secs_f64());
             std::hint::black_box(out);
         }
@@ -194,9 +198,9 @@ mod enabled {
 
     fn bench_rust_into(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> (usize, f64) {
         let cparams = rust_cparams(codec, filter, nthreads);
-        let compressed = compress::compress(data, &cparams).unwrap();
+        let compressed = compress::compress_chunk(data, &cparams).unwrap();
         let mut restored = vec![0u8; data.len()];
-        let written = compress::decompress_into_with_threads(
+        let written = compress::decompress_chunk_into_with_threads(
             &compressed,
             &mut restored,
             nthreads.try_into().unwrap(),
@@ -210,7 +214,7 @@ mod enabled {
         let mut out = vec![0u8; data.len()];
         for _ in 0..iters {
             let start = Instant::now();
-            let written = compress::decompress_into_with_threads(
+            let written = compress::decompress_chunk_into_with_threads(
                 &compressed,
                 &mut out,
                 nthreads.try_into().unwrap(),
@@ -225,7 +229,7 @@ mod enabled {
 
     fn bench_blosc1_into(data: &[u8], codec: u8, filter: u8, nthreads: usize) -> (usize, f64) {
         let cparams = rust_cparams(codec, filter, nthreads);
-        let compressed = compress::compress(data, &cparams).unwrap();
+        let compressed = compress::compress_chunk(data, &cparams).unwrap();
         let mut restored = vec![0u8; data.len()];
         let written = compress::blosc1_decompress(&compressed, &mut restored).unwrap();
         assert_eq!(written, data.len());
@@ -373,7 +377,7 @@ mod enabled {
     }
 
     fn rust_decode_check(data: &[u8], compressed: &[u8], nthreads: usize) -> DecodeCheck {
-        match compress::decompress_with_threads(compressed, nthreads.try_into().unwrap()) {
+        match compress::decompress_chunk_with_threads(compressed, nthreads.try_into().unwrap()) {
             Ok(restored) if restored == data => DecodeCheck::Ok,
             Ok(_) => DecodeCheck::Mismatch,
             Err(_) => DecodeCheck::Error,

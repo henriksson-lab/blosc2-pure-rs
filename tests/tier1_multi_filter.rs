@@ -335,7 +335,7 @@ fn test_pipeline_delta_shuffle_roundtrip() {
     let filter_array = [0, 0, 0, 0, BLOSC_DELTA, BLOSC_SHUFFLE];
     let meta = [0u8; BLOSC2_MAX_FILTERS];
 
-    let result_buf = filters::pipeline_forward(
+    let result_buf = filters::apply_filter_pipeline_for_compression(
         &data,
         &mut buf1,
         &mut buf2,
@@ -358,7 +358,7 @@ fn test_pipeline_delta_shuffle_roundtrip() {
     let mut rbuf1 = filtered.to_vec();
     let mut rbuf2 = vec![0u8; bsize];
 
-    let restored_buf = filters::pipeline_backward(
+    let restored_buf = filters::apply_filter_pipeline_for_decompression(
         &mut rbuf1,
         &mut rbuf2,
         bsize,
@@ -393,7 +393,7 @@ fn test_pipeline_shuffle_only_roundtrip() {
     let filter_array = [0, 0, 0, 0, 0, BLOSC_SHUFFLE];
     let meta = [0u8; BLOSC2_MAX_FILTERS];
 
-    let result_buf = filters::pipeline_forward(
+    let result_buf = filters::apply_filter_pipeline_for_compression(
         &data,
         &mut buf1,
         &mut buf2,
@@ -411,7 +411,7 @@ fn test_pipeline_shuffle_only_roundtrip() {
 
     let mut rbuf1 = filtered.to_vec();
     let mut rbuf2 = vec![0u8; bsize];
-    let restored_buf = filters::pipeline_backward(
+    let restored_buf = filters::apply_filter_pipeline_for_decompression(
         &mut rbuf1,
         &mut rbuf2,
         bsize,
@@ -446,7 +446,7 @@ fn test_pipeline_bitshuffle_only_roundtrip() {
     let filter_array = [0, 0, 0, 0, 0, BLOSC_BITSHUFFLE];
     let meta = [0u8; BLOSC2_MAX_FILTERS];
 
-    let result_buf = filters::pipeline_forward(
+    let result_buf = filters::apply_filter_pipeline_for_compression(
         &data,
         &mut buf1,
         &mut buf2,
@@ -464,7 +464,7 @@ fn test_pipeline_bitshuffle_only_roundtrip() {
 
     let mut rbuf1 = filtered.to_vec();
     let mut rbuf2 = vec![0u8; bsize];
-    let restored_buf = filters::pipeline_backward(
+    let restored_buf = filters::apply_filter_pipeline_for_decompression(
         &mut rbuf1,
         &mut rbuf2,
         bsize,
@@ -521,7 +521,7 @@ fn test_pipeline_trunc_prec_stack_matches_c_decode() {
     let filters = [0, 0, 0, BLOSC_TRUNC_PREC, BLOSC_SHUFFLE, BLOSC_BITSHUFFLE];
     let filters_meta = [0, 0, 0, 20, 0, 0];
 
-    let current = filters::pipeline_forward(
+    let current = filters::apply_filter_pipeline_for_compression(
         &data,
         &mut buf1,
         &mut buf2,
@@ -539,7 +539,7 @@ fn test_pipeline_trunc_prec_stack_matches_c_decode() {
         buf2.clone()
     };
     let mut rbuf2 = vec![0u8; bsize];
-    let restored_buf = filters::pipeline_backward(
+    let restored_buf = filters::apply_filter_pipeline_for_decompression(
         &mut rbuf1,
         &mut rbuf2,
         bsize,

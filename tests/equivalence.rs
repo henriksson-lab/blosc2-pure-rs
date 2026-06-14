@@ -923,8 +923,8 @@ fn test_frame_simple_memory_and_file_roundtrip() {
         );
     }
 
-    let frame = schunk.to_frame();
-    let schunk_from_memory = Schunk::from_frame(&frame).unwrap();
+    let frame = schunk.to_contiguous_frame();
+    let schunk_from_memory = Schunk::from_contiguous_frame(&frame).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     let frame_path = dir.path().join("frame_simple.b2frame");
