@@ -3,3 +3,17 @@ Cargo.lock
 compress_file_ref
 decompress_file_ref
 *.b2frame
+
+# Vendored original C source — bundled into the published crate via Cargo.toml `include`,
+# but kept out of git history.
+/c-blosc2
+/backup.c-blosc2
+
+# Local build artifacts, compiled helpers, and scratch
+/.tmp
+/.codex
+/bench_compress
+/c_compress_1t
+/c_compress_codec
+/c_decompress_1t
+__pycache__/
