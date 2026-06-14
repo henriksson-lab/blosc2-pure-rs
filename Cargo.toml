@@ -1,6 +1,6 @@
 [package]
 name = "blosc2-pure-rs"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Rust implementation of the Blosc2 high-performance compression library"
 license = "BSD-3-Clause"
@@ -72,7 +72,7 @@ plugin-zfp = ["dep:zfp-rs"]
 zlib-rs = ["flate2/zlib-rs"]
 # Compatibility feature for explicitly selecting the miniz_oxide-backed path.
 zlib-miniz = ["flate2/rust_backend"]
-# (lz4hc-sys feature removed in v0.3.0 — pure-Rust LZ4HC is always available via lz4-pure-rs.)
+# (lz4hc-sys feature removed in v0.2.3 — pure-Rust LZ4HC is always available via lz4-pure-rs.)
 # Internal feature for development testing against C-Blosc2. Not part of the
 # public API. Uses BLOSC2_C_SOURCE_DIR or repo-local c-blosc2/ as the C source.
 _ffi = ["dep:cmake", "dep:bindgen"]
