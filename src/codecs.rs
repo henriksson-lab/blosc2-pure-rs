@@ -13,7 +13,7 @@ use crate::b2nd::B2ndMeta;
 use crate::constants::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{c_char, c_uint, c_void, CStr};
+use std::ffi::{c_char, c_void, CStr};
 use std::sync::{OnceLock, RwLock};
 #[cfg(feature = "plugin-zfp")]
 use zfp_rs::{
@@ -22,7 +22,10 @@ use zfp_rs::{
 };
 use zstd_pure_rs::common::error::{ErrorCode, ERROR};
 use zstd_pure_rs::common::xxhash::XXH64_state_t;
-use zstd_pure_rs::decompress::zstd_ddict::{ZSTD_DDict, ZSTD_DDict_dictContent, ZSTD_createDDict};
+use zstd_pure_rs::decompress::zstd_ddict::{
+    ZSTD_DDict, ZSTD_DDict_dictBuffer, ZSTD_DDict_dictContent, ZSTD_DDict_entropyPresent,
+    ZSTD_createDDict, ZSTD_getDictID_fromDDict,
+};
 use zstd_pure_rs::decompress::zstd_decompress::{
     ZSTD_decompressFrame_withOpStart, ZSTD_loadDEntropy,
 };
@@ -34,79 +37,6 @@ pub type Blosc2PrefilterCb = Option<unsafe extern "C" fn(params: *mut c_void) ->
 
 /// Opaque C-ABI postfilter callback slot in `blosc2_dparams`.
 pub type Blosc2PostfilterCb = Option<unsafe extern "C" fn(params: *mut c_void) -> i32>;
-
-unsafe extern "C" {
-    #[link_name = "ZSTD_createCCtx"]
-    fn c_zstd_create_cctx() -> *mut c_void;
-    #[link_name = "ZSTD_freeCCtx"]
-    fn c_zstd_free_cctx(cctx: *mut c_void) -> usize;
-    #[link_name = "ZSTD_compressCCtx"]
-    fn c_zstd_compress_cctx(
-        cctx: *mut c_void,
-        dst: *mut c_void,
-        dst_capacity: usize,
-        src: *const c_void,
-        src_size: usize,
-        compression_level: i32,
-    ) -> usize;
-    #[link_name = "ZSTD_createCDict"]
-    fn c_zstd_create_cdict(
-        dict_buffer: *const c_void,
-        dict_size: usize,
-        compression_level: i32,
-    ) -> *mut c_void;
-    #[link_name = "ZSTD_freeCDict"]
-    fn c_zstd_free_cdict(cdict: *mut c_void) -> usize;
-    #[link_name = "ZSTD_compress_usingCDict"]
-    fn c_zstd_compress_using_cdict(
-        cctx: *mut c_void,
-        dst: *mut c_void,
-        dst_capacity: usize,
-        src: *const c_void,
-        src_size: usize,
-        cdict: *const c_void,
-    ) -> usize;
-    #[link_name = "ZSTD_isError"]
-    fn c_zstd_is_error(code: usize) -> c_uint;
-}
-
-struct CZstdCCtx {
-    ptr: *mut c_void,
-}
-
-impl CZstdCCtx {
-    fn new() -> Option<Self> {
-        let ptr = unsafe { c_zstd_create_cctx() };
-        (!ptr.is_null()).then_some(Self { ptr })
-    }
-}
-
-impl Drop for CZstdCCtx {
-    fn drop(&mut self) {
-        unsafe {
-            c_zstd_free_cctx(self.ptr);
-        }
-    }
-}
-
-struct CZstdCDict {
-    ptr: *mut c_void,
-}
-
-impl CZstdCDict {
-    fn new(dict: &[u8], clevel: i32) -> Option<Self> {
-        let ptr = unsafe { c_zstd_create_cdict(dict.as_ptr().cast(), dict.len(), clevel) };
-        (!ptr.is_null()).then_some(Self { ptr })
-    }
-}
-
-impl Drop for CZstdCDict {
-    fn drop(&mut self) {
-        unsafe {
-            c_zstd_free_cdict(self.ptr);
-        }
-    }
-}
 
 /// Signature for a user-defined compression function registered via
 /// [`register_codec`].
@@ -583,8 +513,7 @@ static USER_CODECS: OnceLock<RwLock<HashMap<u8, UserCodec>>> = OnceLock::new();
 static USER_CODEC_ORDER: OnceLock<RwLock<Vec<u8>>> = OnceLock::new();
 
 thread_local! {
-    static C_ZSTD_CCTX: RefCell<Option<CZstdCCtx>> = const { RefCell::new(None) };
-    static C_ZSTD_DICT_CCTX: RefCell<Option<CZstdCCtx>> = const { RefCell::new(None) };
+    static ZSTD_CCTX: RefCell<Option<Box<ZSTD_CCtx>>> = const { RefCell::new(None) };
     static ZSTD_DICT_DCTX: RefCell<Box<ZSTD_DCtx>> = RefCell::new(ZSTD_createDCtx());
     static ZSTD_DCTX: RefCell<(Box<ZSTD_DCtx>, ZSTD_decoder_entropy_rep, XXH64_state_t)> =
         RefCell::new((
@@ -1631,68 +1560,40 @@ fn blosc_clevel_to_zstd(clevel: u8) -> i32 {
     }
 }
 
-/// Zstd compression of a single block, using a thread-local context to
-/// avoid repeated allocations across calls.
+/// Normalize a pure-Rust zstd compressor return code to the blosc convention
+/// (positive byte count, or 0 on any error / overflow).
+fn zstd_normalize_result(n: Option<usize>) -> i32 {
+    match n {
+        Some(n) if !ERR_isError(n) && n <= i32::MAX as usize => n as i32,
+        _ => 0,
+    }
+}
+
+/// Zstd compression of a single block, using a thread-local pure-Rust context
+/// to avoid repeated allocations across calls.
 fn zstd_compress(src: &[u8], dest: &mut [u8], clevel: u8) -> i32 {
-    let n = C_ZSTD_CCTX.with(|slot| {
+    let n = ZSTD_CCTX.with(|slot| -> Option<usize> {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
-            *slot = CZstdCCtx::new();
+            *slot = ZSTD_createCCtx();
         }
-        let Some(cctx) = slot.as_ref() else {
-            return 0;
-        };
-        unsafe {
-            c_zstd_compress_cctx(
-                cctx.ptr,
-                dest.as_mut_ptr().cast(),
-                dest.len(),
-                src.as_ptr().cast(),
-                src.len(),
-                blosc_clevel_to_zstd(clevel),
-            )
-        }
+        let cctx = slot.as_mut()?;
+        Some(ZSTD_compressCCtx(cctx, dest, src, blosc_clevel_to_zstd(clevel)))
     });
-    if c_zstd_code_is_error(n) || n > i32::MAX as usize {
-        0
-    } else {
-        n as i32
-    }
+    zstd_normalize_result(n)
 }
 
 /// Zstd compression of a single block, seeded with a preset dictionary.
 fn zstd_compress_with_dict(src: &[u8], dest: &mut [u8], _clevel: u8, dict: &[u8]) -> i32 {
-    let Some(cdict) = CZstdCDict::new(dict, 1) else {
-        return 0;
-    };
-    let n = C_ZSTD_DICT_CCTX.with(|slot| {
+    let n = ZSTD_CCTX.with(|slot| -> Option<usize> {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
-            *slot = CZstdCCtx::new();
+            *slot = ZSTD_createCCtx();
         }
-        let Some(cctx) = slot.as_ref() else {
-            return 0;
-        };
-        unsafe {
-            c_zstd_compress_using_cdict(
-                cctx.ptr,
-                dest.as_mut_ptr().cast(),
-                dest.len(),
-                src.as_ptr().cast(),
-                src.len(),
-                cdict.ptr,
-            )
-        }
+        let cctx = slot.as_mut()?;
+        Some(ZSTD_compress_usingDict(cctx, dest, src, dict, 1))
     });
-    if c_zstd_code_is_error(n) || n > i32::MAX as usize {
-        0
-    } else {
-        n as i32
-    }
-}
-
-fn c_zstd_code_is_error(code: usize) -> bool {
-    unsafe { c_zstd_is_error(code) != 0 }
+    zstd_normalize_result(n)
 }
 
 /// Decompress a single zstd-encoded block via a thread-local decoder context.
@@ -1756,7 +1657,8 @@ fn zstd_decompress_using_ddict_with_active_entropy(
     ddict: &ZSTD_DDict,
 ) -> usize {
     let frame_dict_id = ZSTD_getDictID_fromFrame(src);
-    if frame_dict_id != 0 && ddict.dictID != 0 && frame_dict_id != ddict.dictID {
+    let ddict_id = ZSTD_getDictID_fromDDict(ddict);
+    if frame_dict_id != 0 && ddict_id != 0 && frame_dict_id != ddict_id {
         return ERROR(ErrorCode::DictionaryWrong);
     }
 
@@ -1776,10 +1678,10 @@ fn zstd_decompress_using_ddict_with_active_entropy(
     }
     let content = ZSTD_DDict_dictContent(ddict);
     dctx.stream_dict = content.to_vec();
-    dctx.dictID = ddict.dictID;
-    if ddict.entropyPresent != 0 {
+    dctx.dictID = ddict_id;
+    if ZSTD_DDict_entropyPresent(ddict) != 0 {
         let mut rep = [0u32; 3];
-        let rc = ZSTD_loadDEntropy(dctx, &mut rep, &ddict.dictBuffer);
+        let rc = ZSTD_loadDEntropy(dctx, &mut rep, ZSTD_DDict_dictBuffer(ddict));
         if ERR_isError(rc) {
             return rc;
         }

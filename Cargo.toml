@@ -1,6 +1,6 @@
 [package]
 name = "blosc2-pure-rs"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "Rust implementation of the Blosc2 high-performance compression library"
 license = "BSD-3-Clause"
@@ -15,7 +15,6 @@ include = [
     "/benches/**/*.rs",
     "/docs/**/*.md",
     "/examples/**/*.rs",
-    "/tests/**/*.rs",
     "/tools/bench_against_c_blosc2.py",
     "/tools/bench_real_manifest.delta_regression.toml",
     "/tools/bench_real_manifest.example.toml",
@@ -26,12 +25,9 @@ include = [
     "/Cargo.toml",
     "/README.md",
     "/LICENSE.txt",
-    # Only the vendored zstd that build.rs compiles for byte-identical dictionary
-    # training ships in the crate. The original C-Blosc2 source (blosc/, plugins/,
-    # include/, cmake) is for the internal `_ffi` test feature only and is not shipped.
-    "/c-blosc2/LICENSE.txt",
-    "/c-blosc2/LICENSES/**",
-    "/c-blosc2/internal-complibs/zstd-1.5.7/**",
+    # No C sources ship: the crate is pure Rust by default. The vendored c-blosc2/
+    # tree is only needed for the internal `_ffi` test feature, sourced from the repo
+    # checkout or BLOSC2_C_SOURCE_DIR rather than the published package.
 ]
 
 [lib]
@@ -77,7 +73,7 @@ clap = { version = "4", features = ["derive"], optional = true }
 rayon = "1"
 lz4-pure = { package = "lz4-pure-rs", version = "0.1" }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-zstd-pure-rs = "0.1"
+zstd-pure-rs = { version = "0.1", git = "https://github.com/henriksson-lab/zstd-pure-rs" }
 zfp-rs = { version = "0.1.1", optional = true }
 
 [dev-dependencies]
@@ -143,3 +139,4 @@ bindgen = { version = "0.72", optional = true }
 [profile.release-dbg]
 inherits = "release"
 debug = true
+
