@@ -3139,7 +3139,7 @@ fn compress_block_with_scratch(
         &cparams.filters_meta,
         typesize,
         block_start,
-        delta_ref_storage.as_deref(),
+        delta_ref_storage,
         Some(filters::FilterPipelineContext {
             cparams: Some(&filter_cparams),
             dparams: None,
@@ -3281,16 +3281,16 @@ fn filter_prefix_through_active_ordinal(
     prefix
 }
 
-fn delta_reference_block(
-    src: &[u8],
+fn delta_reference_block<'a>(
+    src: &'a [u8],
     cparams: &CParams,
     _blocksize: usize,
     _tid: i32,
-) -> Result<Option<Vec<u8>>, &'static str> {
+) -> Result<Option<&'a [u8]>, &'static str> {
     if delta_filter_slot(&cparams.filters).is_none() {
         return Ok(None);
     }
-    Ok(Some(src.to_vec()))
+    Ok(Some(src))
 }
 
 struct PrefilteredBlock<'a> {
@@ -3622,7 +3622,7 @@ fn filtered_blocks_for_dict(
             &cparams.filters_meta,
             typesize,
             block_start,
-            delta_ref_storage.as_deref(),
+            delta_ref_storage,
             Some(filters::FilterPipelineContext {
                 cparams: Some(&filter_cparams),
                 dparams: None,
@@ -3719,7 +3719,7 @@ fn source_alias_filtered_block(
         &cparams.filters_meta,
         typesize,
         block_start,
-        delta_ref_storage.as_deref(),
+        delta_ref_storage,
         Some(filters::FilterPipelineContext {
             cparams: Some(&filter_cparams),
             dparams: None,
@@ -3986,15 +3986,19 @@ fn compress_chunk_with_output_limit(
             bstarts_len,
             &zstd_sample_sizes,
         ) {
-            let filtered_blocks = filtered_blocks_for_dict(
-                src,
-                cparams,
-                blocksize,
-                nblocks,
-                typesize,
-                filters_are_noop,
-                false,
-            )?;
+            let filtered_blocks = if c_mutates_filter_source {
+                filtered_blocks_for_dict(
+                    src,
+                    cparams,
+                    blocksize,
+                    nblocks,
+                    typesize,
+                    filters_are_noop,
+                    false,
+                )?
+            } else {
+                training_blocks
+            };
             let dict_section_len = 4 + dict.len();
             let table_and_dict_end = header_len
                 .checked_add(bstarts_len)
@@ -4070,81 +4074,32 @@ fn compress_chunk_with_output_limit(
     let mut any_literal_stream = false;
     let mut output;
 
-    if use_parallel && nblocks == 2 {
-        let threads = effective_nthreads(cparams.nthreads, nblocks);
-        let (block0, block1) = with_thread_pool(threads, || {
-            rayon::join(
-                || {
-                    with_compress_scratch(blocksize, |buf1, buf2, compress_buf, prefilter_buf| {
-                        let (len, z, l) = compress_block_with_scratch(
-                            src,
-                            &src[..blocksize.min(nbytes as usize)],
-                            0,
-                            blocksize,
-                            false,
-                            cparams,
-                            dont_split,
-                            typesize,
-                            buf1,
-                            buf2,
-                            compress_buf,
-                            prefilter_buf,
-                            rayon::current_thread_index().unwrap_or(0) as i32,
-                            None,
-                        )?;
-                        Ok((compress_buf[..len].to_vec(), z, l))
-                    })
-                },
-                || {
-                    with_compress_scratch(blocksize, |buf1, buf2, compress_buf, prefilter_buf| {
-                        let start = blocksize;
-                        let end = (start + blocksize).min(nbytes as usize);
-                        let (len, z, l) = compress_block_with_scratch(
-                            src,
-                            &src[start..end],
-                            start,
-                            blocksize,
-                            end - start < blocksize,
-                            cparams,
-                            dont_split,
-                            typesize,
-                            buf1,
-                            buf2,
-                            compress_buf,
-                            prefilter_buf,
-                            rayon::current_thread_index().unwrap_or(1) as i32,
-                            None,
-                        )?;
-                        Ok((compress_buf[..len].to_vec(), z, l))
-                    })
-                },
-            )
-        });
-        let compressed_blocks = [block0?, block1?];
-        let total_compressed: usize = compressed_blocks.iter().map(|(b, _, _)| b.len()).sum();
-        let total_len = header_len + bstarts_len + total_compressed;
-        check_output_budget(total_len, output_limit)?;
-        output = uninit_vec(total_len);
-        output_pos = header_len + bstarts_len;
-        all_zero_runs = true;
-
-        for (block_idx, (block_data, block_all_zero, block_has_literal)) in
-            compressed_blocks.iter().enumerate()
-        {
-            let bstart_offset = header_len + block_idx * 4;
-            output[bstart_offset..bstart_offset + 4]
-                .copy_from_slice(&(output_pos as i32).to_le_bytes());
-            output[output_pos..output_pos + block_data.len()].copy_from_slice(block_data);
-            output_pos += block_data.len();
-            if !block_all_zero {
-                all_zero_runs = false;
-            }
-            if *block_has_literal {
-                any_literal_stream = true;
-            }
+    if use_parallel {
+        struct ParallelBlockMeta {
+            len: usize,
+            all_zero: bool,
+            has_literal: bool,
         }
-    } else if use_parallel {
-        let compressed_blocks: Vec<OnceLock<Result<(Vec<u8>, bool, bool), &'static str>>> =
+
+        let mut slot_offsets = Vec::with_capacity(nblocks);
+        let mut slot_lens = Vec::with_capacity(nblocks);
+        let mut arena_len = table_end;
+        for block_idx in 0..nblocks {
+            let start = block_idx * blocksize;
+            let end = (start + blocksize).min(nbytes as usize);
+            let bsize = end - start;
+            let is_leftover = block_idx == nblocks - 1 && bsize < blocksize;
+            let slot_len = stored_block_len(dont_split, is_leftover, typesize, bsize);
+            slot_offsets.push(arena_len);
+            slot_lens.push(slot_len);
+            arena_len = arena_len
+                .checked_add(slot_len)
+                .ok_or("Invalid compressed block size")?;
+        }
+
+        output = uninit_vec(arena_len);
+        let output_addr = output.as_mut_ptr() as usize;
+        let block_metas: Vec<OnceLock<Result<ParallelBlockMeta, &'static str>>> =
             (0..nblocks).map(|_| OnceLock::new()).collect();
         let next_block = AtomicI32::new(0);
         let threads = effective_nthreads(cparams.nthreads, nblocks);
@@ -4152,7 +4107,9 @@ fn compress_chunk_with_output_limit(
             rayon::scope(|scope| {
                 for _ in 0..threads as usize {
                     let next_block = &next_block;
-                    let compressed_blocks = &compressed_blocks;
+                    let block_metas = &block_metas;
+                    let slot_offsets = &slot_offsets;
+                    let slot_lens = &slot_lens;
                     scope.spawn(move |_| {
                         with_compress_scratch(
                             blocksize,
@@ -4181,10 +4138,26 @@ fn compress_chunk_with_output_limit(
                                     rayon::current_thread_index().unwrap_or(0) as i32,
                                     None,
                                 )
-                                .map(|(len, z, l)| (compress_buf[..len].to_vec(), z, l));
-                                compressed_blocks[block_idx]
-                                    .set(compressed)
-                                    .expect("parallel block slot written more than once");
+                                .map(
+                                    |(len, all_zero, has_literal)| {
+                                        let slot_len = slot_lens[block_idx];
+                                        debug_assert!(len <= slot_len);
+                                        unsafe {
+                                            let slot = std::slice::from_raw_parts_mut(
+                                                (output_addr as *mut u8)
+                                                    .add(slot_offsets[block_idx]),
+                                                slot_len,
+                                            );
+                                            slot[..len].copy_from_slice(&compress_buf[..len]);
+                                        }
+                                        ParallelBlockMeta {
+                                            len,
+                                            all_zero,
+                                            has_literal,
+                                        }
+                                    },
+                                );
+                                let _ = block_metas[block_idx].set(compressed);
                             },
                         );
                     });
@@ -4192,7 +4165,7 @@ fn compress_chunk_with_output_limit(
             });
         });
 
-        let compressed_blocks: Vec<(Vec<u8>, bool, bool)> = compressed_blocks
+        let block_metas: Vec<ParallelBlockMeta> = block_metas
             .into_iter()
             .map(|slot| {
                 slot.into_inner()
@@ -4200,28 +4173,29 @@ fn compress_chunk_with_output_limit(
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let total_compressed: usize = compressed_blocks.iter().map(|(b, _, _)| b.len()).sum();
+        let total_compressed: usize = block_metas.iter().map(|meta| meta.len).sum();
         let total_len = header_len + bstarts_len + total_compressed;
         check_output_budget(total_len, output_limit)?;
-        output = uninit_vec(total_len);
         output_pos = header_len + bstarts_len;
         all_zero_runs = true;
 
-        for (block_idx, (block_data, block_all_zero, block_has_literal)) in
-            compressed_blocks.iter().enumerate()
-        {
+        for (block_idx, block_meta) in block_metas.iter().enumerate() {
             let bstart_offset = header_len + block_idx * 4;
             output[bstart_offset..bstart_offset + 4]
                 .copy_from_slice(&(output_pos as i32).to_le_bytes());
-            output[output_pos..output_pos + block_data.len()].copy_from_slice(block_data);
-            output_pos += block_data.len();
-            if !block_all_zero {
+            let slot_start = slot_offsets[block_idx];
+            if slot_start != output_pos && block_meta.len > 0 {
+                output.copy_within(slot_start..slot_start + block_meta.len, output_pos);
+            }
+            output_pos += block_meta.len;
+            if !block_meta.all_zero {
                 all_zero_runs = false;
             }
-            if *block_has_literal {
+            if block_meta.has_literal {
                 any_literal_stream = true;
             }
         }
+        output.truncate(total_len);
     } else {
         // Serial path: pre-allocate buffers once, write directly to output
         let max_compressed = nbytes as usize + header_len + bstarts_len + nblocks * 32;
@@ -4378,7 +4352,7 @@ fn compress_chunk_with_output_limit(
                     &cparams.filters_meta,
                     typesize,
                     block_start,
-                    delta_ref_storage.as_deref(),
+                    delta_ref_storage,
                     Some(filters::FilterPipelineContext {
                         cparams: Some(&filter_cparams),
                         dparams: None,
@@ -5142,9 +5116,6 @@ fn decompress_block_into(
     tid: i32,
 ) -> Result<(), &'static str> {
     let bsize = dest.len();
-    if scratch1.len() < bsize || scratch2.len() < bsize {
-        return Err("Scratch buffer too small");
-    }
 
     let typesize = header.typesize as usize;
     let dont_split = header.dont_split();
@@ -5190,6 +5161,9 @@ fn decompress_block_into(
     let filters_are_noop =
         filters_effectively_noop(&header.filters, &header.filters_meta, typesize);
     let single_shuffle = single_shuffle_filter(&header.filters, &header.filters_meta, typesize);
+    if !filters_are_noop && (scratch1.len() < bsize || scratch2.len() < bsize) {
+        return Err("Scratch buffer too small");
+    }
 
     let filtered = if filters_are_noop {
         &mut dest[..bsize]
@@ -7609,6 +7583,8 @@ fn decompress_chunk_into_with_header(
     }
 
     let dict = embedded_codec_dictionary(chunk, header)?;
+    let filters_are_noop =
+        filters_effectively_noop(&header.filters, &header.filters_meta, header.typesize as usize);
 
     // Check if delta filter is used (needs sequential block 0 first)
     let has_delta = header.filters.contains(&BLOSC_DELTA);
@@ -7677,8 +7653,8 @@ fn decompress_chunk_into_with_header(
             },
         )?;
     } else if dparams.nthreads > 1 && nblocks > 1 {
-        // Parallel decompression (no delta filter). Dynamically assign blocks
-        // so workers stay balanced when compressed block costs vary.
+        // Parallel decompression (no delta filter). Match C's static schedule
+        // for the common unmasked case; keep dynamic scheduling for maskout.
         let threads = effective_nthreads(dparams.nthreads, nblocks);
         let next_block = AtomicUsize::new(0);
         let output_addr = output.as_mut_ptr() as usize;
@@ -7686,13 +7662,50 @@ fn decompress_chunk_into_with_header(
 
         with_thread_pool(threads, || {
             rayon::scope(|scope| {
-                for _ in 0..threads as usize {
+                for worker_idx in 0..threads as usize {
                     let next_block = &next_block;
                     let first_err = &first_err;
                     scope.spawn(move |_| {
-                        let result = with_decompress_scratch(
-                            blocksize,
-                            |scratch1, scratch2| -> Result<(), &'static str> {
+                        let run = |scratch1: &mut [u8],
+                                   scratch2: &mut [u8]|
+                         -> Result<(), &'static str> {
+                            let mut decompress_one = |block_idx: usize| {
+                                let block_start = block_idx * blocksize;
+                                let block_end = (block_start + blocksize).min(nbytes);
+                                let bsize = block_end - block_start;
+                                let is_leftover = block_idx == nblocks - 1 && bsize < blocksize;
+                                let block_out = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        (output_addr as *mut u8).add(block_start),
+                                        bsize,
+                                    )
+                                };
+                                decompress_block_into(
+                                    chunk,
+                                    block_idx,
+                                    block_start,
+                                    block_out,
+                                    blocksize,
+                                    is_leftover,
+                                    header,
+                                    None,
+                                    dict,
+                                    dparams,
+                                    scratch1,
+                                    scratch2,
+                                    rayon::current_thread_index().unwrap_or(0) as i32,
+                                )?;
+                                Ok(())
+                            };
+
+                            if maskout.is_none() {
+                                let blocks_per_thread = nblocks.div_ceil(threads as usize);
+                                let start = worker_idx * blocks_per_thread;
+                                let end = (start + blocks_per_thread).min(nblocks);
+                                for block_idx in start..end {
+                                    decompress_one(block_idx)?;
+                                }
+                            } else {
                                 loop {
                                     let block_idx = next_block.fetch_add(1, Ordering::Relaxed);
                                     if block_idx >= nblocks {
@@ -7701,35 +7714,18 @@ fn decompress_chunk_into_with_header(
                                     if block_is_masked(maskout, block_idx) {
                                         continue;
                                     }
-                                    let block_start = block_idx * blocksize;
-                                    let block_end = (block_start + blocksize).min(nbytes);
-                                    let bsize = block_end - block_start;
-                                    let is_leftover = block_idx == nblocks - 1 && bsize < blocksize;
-                                    let block_out = unsafe {
-                                        std::slice::from_raw_parts_mut(
-                                            (output_addr as *mut u8).add(block_start),
-                                            bsize,
-                                        )
-                                    };
-                                    decompress_block_into(
-                                        chunk,
-                                        block_idx,
-                                        block_start,
-                                        block_out,
-                                        blocksize,
-                                        is_leftover,
-                                        header,
-                                        None,
-                                        dict,
-                                        dparams,
-                                        scratch1,
-                                        scratch2,
-                                        rayon::current_thread_index().unwrap_or(0) as i32,
-                                    )?;
+                                    decompress_one(block_idx)?;
                                 }
-                                Ok(())
-                            },
-                        );
+                            }
+                            Ok(())
+                        };
+                        let result = if filters_are_noop {
+                            let mut scratch1 = [];
+                            let mut scratch2 = [];
+                            run(&mut scratch1, &mut scratch2)
+                        } else {
+                            with_decompress_scratch(blocksize, run)
+                        };
 
                         if let Err(err) = result {
                             let mut slot = first_err.lock().unwrap();
@@ -7749,9 +7745,8 @@ fn decompress_chunk_into_with_header(
     } else {
         // Sequential decompression: reuse scratch buffers and write finished
         // blocks directly into the final output buffer.
-        with_decompress_scratch(
-            blocksize,
-            |scratch1, scratch2| -> Result<(), &'static str> {
+        let mut run =
+            |scratch1: &mut [u8], scratch2: &mut [u8]| -> Result<(), &'static str> {
                 for block_idx in 0..nblocks {
                     if block_is_masked(maskout, block_idx) {
                         continue;
@@ -7778,8 +7773,14 @@ fn decompress_chunk_into_with_header(
                     )?;
                 }
                 Ok(())
-            },
-        )?;
+            };
+        if filters_are_noop {
+            let mut scratch1 = [];
+            let mut scratch2 = [];
+            run(&mut scratch1, &mut scratch2)?;
+        } else {
+            with_decompress_scratch(blocksize, run)?;
+        }
     }
 
     Ok(nbytes)

@@ -512,7 +512,29 @@ pub fn is_static_global_codec_enabled(compcode: u8) -> bool {
 static USER_CODECS: OnceLock<RwLock<HashMap<u8, UserCodec>>> = OnceLock::new();
 static USER_CODEC_ORDER: OnceLock<RwLock<Vec<u8>>> = OnceLock::new();
 
+struct Lz4Stream(*mut lz4_pure::sys::LZ4StreamEncode);
+
+impl Drop for Lz4Stream {
+    fn drop(&mut self) {
+        unsafe {
+            lz4_pure::sys::LZ4_freeStream(self.0);
+        }
+    }
+}
+
+struct Lz4hcStream(*mut lz4_pure::sys::LZ4StreamHC);
+
+impl Drop for Lz4hcStream {
+    fn drop(&mut self) {
+        unsafe {
+            lz4_pure::sys::LZ4_freeStreamHC(self.0);
+        }
+    }
+}
+
 thread_local! {
+    static LZ4_STREAM: RefCell<Option<Lz4Stream>> = const { RefCell::new(None) };
+    static LZ4HC_STREAM: RefCell<Option<Lz4hcStream>> = const { RefCell::new(None) };
     static ZSTD_CCTX: RefCell<Option<Box<ZSTD_CCtx>>> = const { RefCell::new(None) };
     static ZSTD_DICT_DCTX: RefCell<Box<ZSTD_DCtx>> = RefCell::new(ZSTD_createDCtx());
     static ZSTD_DCTX: RefCell<(Box<ZSTD_DCtx>, ZSTD_decoder_entropy_rep, XXH64_state_t)> =
@@ -1407,7 +1429,7 @@ fn len_as_c_int(len: usize) -> Option<lz4_pure::sys::c_int> {
 /// LZ4 fast-mode compression seeded with a preset dictionary.
 fn lz4_compress_with_dict(clevel: u8, src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
     use lz4_pure::sys::{
-        c_char, LZ4_compress_fast_continue, LZ4_createStream, LZ4_freeStream, LZ4_loadDict,
+        c_char, LZ4_compress_fast_continue, LZ4_createStream, LZ4_loadDict,
     };
 
     let Some(src_len) = len_as_c_int(src.len()) else {
@@ -1421,30 +1443,40 @@ fn lz4_compress_with_dict(clevel: u8, src: &[u8], dest: &mut [u8], dict: &[u8]) 
     };
     let accel = lz4_acceleration(clevel);
 
-    unsafe {
-        let stream = LZ4_createStream();
+    LZ4_STREAM.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            let stream = unsafe { LZ4_createStream() };
+            if stream.is_null() {
+                return 0;
+            }
+            *slot = Some(Lz4Stream(stream));
+        }
+        let stream = slot.as_mut().map(|stream| stream.0).unwrap_or(std::ptr::null_mut());
         if stream.is_null() {
             return 0;
         }
-        LZ4_loadDict(stream, dict.as_ptr() as *const c_char, dict_len);
-        let written = LZ4_compress_fast_continue(
-            stream,
-            src.as_ptr() as *const c_char,
-            dest.as_mut_ptr() as *mut c_char,
-            src_len,
-            dest_len,
-            accel,
-        );
-        LZ4_freeStream(stream);
+        unsafe {
+            LZ4_loadDict(stream, dict.as_ptr() as *const c_char, dict_len);
+        }
+        let written = unsafe {
+            LZ4_compress_fast_continue(
+                stream,
+                src.as_ptr() as *const c_char,
+                dest.as_mut_ptr() as *mut c_char,
+                src_len,
+                dest_len,
+                accel,
+            )
+        };
         written
-    }
+    })
 }
 
 /// LZ4HC high-compression-mode compression seeded with a preset dictionary.
 fn lz4hc_compress_with_dict(clevel: u8, src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
     use lz4_pure::sys::{
-        c_char, LZ4_compress_HC_continue, LZ4_createStreamHC, LZ4_freeStreamHC, LZ4_loadDictHC,
-        LZ4_resetStreamHC_fast,
+        c_char, LZ4_compress_HC_continue, LZ4_createStreamHC, LZ4_loadDictHC, LZ4_resetStreamHC_fast,
     };
 
     if let Some(error) = lz4hc_2gb_limit_result(src.len()) {
@@ -1460,23 +1492,34 @@ fn lz4hc_compress_with_dict(clevel: u8, src: &[u8], dest: &mut [u8], dict: &[u8]
         return 0;
     };
 
-    unsafe {
-        let stream = LZ4_createStreamHC();
+    LZ4HC_STREAM.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            let stream = unsafe { LZ4_createStreamHC() };
+            if stream.is_null() {
+                return 0;
+            }
+            *slot = Some(Lz4hcStream(stream));
+        }
+        let stream = slot.as_mut().map(|stream| stream.0).unwrap_or(std::ptr::null_mut());
         if stream.is_null() {
             return 0;
         }
-        LZ4_resetStreamHC_fast(stream, i32::from(clevel));
-        LZ4_loadDictHC(stream, dict.as_ptr() as *const c_char, dict_len);
-        let written = LZ4_compress_HC_continue(
-            stream,
-            src.as_ptr() as *const c_char,
-            dest.as_mut_ptr() as *mut c_char,
-            src_len,
-            dest_len,
-        );
-        LZ4_freeStreamHC(stream);
+        unsafe {
+            LZ4_resetStreamHC_fast(stream, i32::from(clevel));
+            LZ4_loadDictHC(stream, dict.as_ptr() as *const c_char, dict_len);
+        }
+        let written = unsafe {
+            LZ4_compress_HC_continue(
+                stream,
+                src.as_ptr() as *const c_char,
+                dest.as_mut_ptr() as *mut c_char,
+                src_len,
+                dest_len,
+            )
+        };
         written
-    }
+    })
 }
 
 /// Decompress an LZ4 block produced against a preset dictionary.
