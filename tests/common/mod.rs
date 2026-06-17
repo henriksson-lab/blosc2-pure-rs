@@ -123,9 +123,41 @@ fn reset_c_blosc2_process_globals() {
         // pointer can leak into the next guard.  Then re-install the same
         // callback that C's test_common.h would install for BLOSC_TEST_CALLBACK.
         let _ = ffi::blosc2_set_nthreads(1);
+        reset_c_blosc2_global_context();
         ffi::blosc2_set_threads_callback(
             c_blosc2_test_threads_callback(),
             std::ptr::null_mut::<c_void>(),
         );
     }
+}
+
+unsafe fn reset_c_blosc2_global_context() {
+    let mut cparams: ffi::blosc2_cparams = std::mem::zeroed();
+    cparams.compcode = ffi::BLOSC_BLOSCLZ as u8;
+    cparams.typesize = 1;
+    cparams.nthreads = 1;
+    cparams.splitmode = ffi::BLOSC_FORWARD_COMPAT_SPLIT as i32;
+
+    let mut chunk = [0u8; ffi::BLOSC_EXTENDED_HEADER_LENGTH as usize];
+    let csize = unsafe {
+        ffi::blosc2_chunk_zeros(
+            cparams,
+            1,
+            chunk.as_mut_ptr().cast::<c_void>(),
+            chunk.len() as i32,
+        )
+    };
+    assert_eq!(csize, chunk.len() as i32);
+
+    let mut out = [0xa5u8; 1];
+    let dsize = unsafe {
+        ffi::blosc2_decompress(
+            chunk.as_ptr().cast::<c_void>(),
+            csize,
+            out.as_mut_ptr().cast::<c_void>(),
+            out.len() as i32,
+        )
+    };
+    assert_eq!(dsize, out.len() as i32);
+    assert_eq!(out, [0]);
 }

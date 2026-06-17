@@ -173,10 +173,10 @@ impl Blosc2CParams {
             schunk: schunk as *mut c_void,
             filters: ctx.filters,
             filters_meta: ctx.filters_meta,
-            // Rust prefilter callbacks are not ABI-compatible with C-Blosc2
-            // prefilter function pointers, so expose no raw callback pointer.
+            // Rust prefilter callbacks and user data are not ABI-compatible with
+            // C-Blosc2 prefilter pointers, so expose no raw prefilter state.
             prefilter: std::ptr::null_mut(),
-            preparams: ctx.preparams as *mut c_void,
+            preparams: std::ptr::null_mut(),
             tuner_params: std::ptr::null_mut(),
             tuner_id: ctx.tuner_id,
             instr_codec: ctx.instr_codec,
@@ -233,10 +233,10 @@ impl Blosc2DParams {
         Self {
             nthreads: ctx.nthreads,
             schunk: schunk as *mut c_void,
-            // Rust postfilter callbacks are not ABI-compatible with C-Blosc2
-            // postfilter function pointers, so expose no raw callback pointer.
+            // Rust postfilter callbacks and user data are not ABI-compatible with
+            // C-Blosc2 postfilter pointers, so expose no raw postfilter state.
             postfilter: std::ptr::null_mut(),
-            postparams: ctx.postparams as *mut c_void,
+            postparams: std::ptr::null_mut(),
             typesize: ctx.typesize,
         }
     }
@@ -4348,7 +4348,7 @@ mod tests {
         assert_eq!(C_ABI_BACKWARD_SCHUNK.load(Ordering::SeqCst), 0x1234);
         assert_eq!(C_ABI_FORWARD_USE_DICT.load(Ordering::SeqCst), 1);
         assert_eq!(C_ABI_FORWARD_PREFILTER.load(Ordering::SeqCst), 0);
-        assert_eq!(C_ABI_FORWARD_PREPARAMS.load(Ordering::SeqCst), 0xfeed);
+        assert_eq!(C_ABI_FORWARD_PREPARAMS.load(Ordering::SeqCst), 0);
         assert_eq!(C_ABI_FORWARD_TUNER_ID.load(Ordering::SeqCst), 0x123);
         assert!(C_ABI_FORWARD_INSTR_CODEC.load(Ordering::SeqCst));
         assert_eq!(
@@ -4356,7 +4356,7 @@ mod tests {
             0xc0decafe
         );
         assert_eq!(C_ABI_BACKWARD_POSTFILTER.load(Ordering::SeqCst), 0);
-        assert_eq!(C_ABI_BACKWARD_POSTPARAMS.load(Ordering::SeqCst), 0xbeef);
+        assert_eq!(C_ABI_BACKWARD_POSTPARAMS.load(Ordering::SeqCst), 0);
     }
 
     #[test]

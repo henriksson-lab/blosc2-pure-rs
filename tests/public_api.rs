@@ -144,15 +144,12 @@ const API_MATRIX: &[ApiRow] = &[
     covered!("blosc2_getitem_ctx" => "blosc2_getitem_ctx_c"),
     covered!("blosc2_get_blosc2_cparams_defaults"),
     covered!("blosc2_get_blosc2_dparams_defaults"),
-    covered!("blosc2_schunk_from_buffer"),
     partial!(
-        "blosc2_schunk_open",
-        "Rust open eagerly loads into an owned Schunk; C keeps a no-copy file-backed frame, whose closest Rust equivalent is blosc2_schunk_open_lazy(_c)."
+        "blosc2_schunk_from_buffer",
+        "The owned-buffer adapter models C copy=false ownership transfer; the borrowed-slice adapter rejects copy=false because safe Rust cannot transfer ownership from &[u8]."
     ),
-    partial!(
-        "blosc2_schunk_open_offset",
-        "Rust open_frame_at eagerly loads into an owned Schunk; C keeps a no-copy file-backed frame, whose closest Rust equivalent is blosc2_schunk_open_lazy_offset(_c)."
-    ),
+    covered!("blosc2_schunk_open"),
+    covered!("blosc2_schunk_open_offset"),
     covered!("blosc2_schunk_to_buffer"),
     covered!("blosc2_schunk_to_file"),
     covered!("blosc2_schunk_append_file"),

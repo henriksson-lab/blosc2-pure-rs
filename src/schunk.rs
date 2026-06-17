@@ -161,8 +161,8 @@ impl BorrowedFrameChunks {
             return None;
         }
         let ptr = self.ptr as *const u8;
-        // The pointer is either into owned_frame, or into caller memory for
-        // from_borrowed_contiguous_frame's crate-local compatibility path.
+        // The pointer is into owned_frame. Borrowed caller memory is not stored
+        // here because a safe Rust &[u8] cannot model C ownership transfer.
         Some(unsafe { std::slice::from_raw_parts(ptr.add(start), end - start) })
     }
 
@@ -3335,19 +3335,6 @@ impl Schunk {
         self.attached_frame_len = None;
     }
 
-    /// Deserialize from a contiguous frame buffer while borrowing regular
-    /// compressed chunks from the caller's frame.
-    pub(crate) fn from_borrowed_contiguous_frame(data: &[u8]) -> Result<Self, String> {
-        let mut schunk = frame::read_frame(data)?;
-        schunk.borrowed_frame = Some(BorrowedFrameChunks {
-            ptr: data.as_ptr() as usize,
-            len: data.len(),
-            ranges: frame::borrowed_chunk_ranges(data, &schunk)?,
-            owned_frame: None,
-        });
-        Ok(schunk)
-    }
-
     /// Deserialize from an owned contiguous frame buffer while keeping regular
     /// chunks backed by that frame.
     pub fn from_owned_contiguous_frame(data: Vec<u8>) -> Result<Self, String> {
@@ -3882,9 +3869,9 @@ pub fn blosc2_schunk_from_buffer_vec(frame: &[u8]) -> Result<Schunk, String> {
 
 /// C-name adapter for [`Schunk::from_contiguous_frame`].
 ///
-/// With `copy == false`, this mirrors the C API by keeping compressed chunks
-/// borrowed from `frame`; callers must keep the frame bytes alive and immutable
-/// for as long as the returned [`Schunk`] is used.
+/// A borrowed Rust slice cannot transfer ownership like C `copy=false`, so
+/// callers that need no-copy C ownership semantics must use
+/// [`blosc2_schunk_from_buffer_owned`].
 pub fn blosc2_schunk_from_buffer(frame: &[u8], len: i64, copy: bool) -> Result<Schunk, String> {
     if len < 0 {
         return Err("Invalid frame length".into());
@@ -3904,7 +3891,7 @@ pub fn blosc2_schunk_from_buffer(frame: &[u8], len: i64, copy: bool) -> Result<S
         schunk.detach_frame_metadata();
         Ok(schunk)
     } else {
-        Schunk::from_borrowed_contiguous_frame(frame)
+        Err("copy=false requires owned frame buffer".into())
     }
 }
 
@@ -3962,34 +3949,40 @@ pub fn blosc2_schunk_from_buffer_owned_c(
     }
 }
 
-/// C-name adapter for [`Schunk::open`].
-pub fn blosc2_schunk_open(path: &str) -> Result<Schunk, String> {
-    Schunk::open(path)
+/// C-name adapter for lazy on-disk frame opening.
+pub fn blosc2_schunk_open(path: &str) -> Result<LazySchunk, String> {
+    Schunk::open_lazy_frame(path)
 }
 
-/// C-style status adapter for [`Schunk::open`].
-pub fn blosc2_schunk_open_c(path: &str) -> (i32, Option<Schunk>) {
-    match Schunk::open(path) {
+/// C-style status adapter for lazy on-disk frame opening.
+pub fn blosc2_schunk_open_c(path: &str) -> (i32, Option<LazySchunk>) {
+    match Schunk::open_lazy_frame(path) {
         Ok(schunk) => (BLOSC2_ERROR_SUCCESS, Some(schunk)),
         Err(err) => (schunk_string_error_code(&err), None),
     }
 }
 
-/// C-name adapter for [`Schunk::open_frame_at`].
-pub fn blosc2_schunk_open_offset(path: impl AsRef<Path>, offset: i64) -> Result<Schunk, String> {
+/// C-name adapter for lazy on-disk frame opening at an offset.
+pub fn blosc2_schunk_open_offset(
+    path: impl AsRef<Path>,
+    offset: i64,
+) -> Result<LazySchunk, String> {
     if offset < 0 {
         return Err("Invalid frame offset".into());
     }
-    Schunk::open_frame_at(path, offset as u64)
+    Schunk::open_lazy_frame_at(path, offset as u64)
 }
 
-/// C-style status adapter for [`Schunk::open_frame_at`].
-pub fn blosc2_schunk_open_offset_c(path: impl AsRef<Path>, offset: i64) -> (i32, Option<Schunk>) {
+/// C-style status adapter for lazy on-disk frame opening at an offset.
+pub fn blosc2_schunk_open_offset_c(
+    path: impl AsRef<Path>,
+    offset: i64,
+) -> (i32, Option<LazySchunk>) {
     let offset = match u64::try_from(offset) {
         Ok(offset) => offset,
         Err(_) => return (BLOSC2_ERROR_FILE_OPEN, None),
     };
-    match Schunk::open_frame_at(path, offset) {
+    match Schunk::open_lazy_frame_at(path, offset) {
         Ok(schunk) => (BLOSC2_ERROR_SUCCESS, Some(schunk)),
         Err(err) => (schunk_string_error_code(&err), None),
     }
@@ -4597,6 +4590,9 @@ fn schunk_c_slice_nchunks(schunk: &Schunk, start: usize, stop: usize) -> (i32, O
     if stop < start {
         return (BLOSC2_ERROR_INVALID_PARAM, None);
     }
+    if schunk.variable_chunks {
+        return (BLOSC2_ERROR_INVALID_PARAM, None);
+    }
     let typesize = match usize::try_from(schunk.cparams.typesize) {
         Ok(typesize) if typesize > 0 => typesize,
         _ => return (BLOSC2_ERROR_INVALID_PARAM, None),
@@ -4696,6 +4692,9 @@ pub fn blosc2_schunk_get_slice_buffer(
     stop: usize,
     dest: &mut [u8],
 ) -> i32 {
+    if schunk.variable_chunks {
+        return BLOSC2_ERROR_INVALID_PARAM;
+    }
     let (byte_start, byte_len) =
         match item_slice_to_byte_range(start, stop, schunk.cparams.typesize as usize) {
             Ok(range) => range,
@@ -4794,6 +4793,9 @@ pub fn blosc2_schunk_set_slice_buffer(
     stop: usize,
     data: &[u8],
 ) -> i32 {
+    if schunk.variable_chunks {
+        return BLOSC2_ERROR_INVALID_PARAM;
+    }
     let (_, byte_len) =
         match item_slice_to_byte_range(start, stop, schunk.cparams.typesize as usize) {
             Ok(range) => range,
@@ -5127,7 +5129,10 @@ fn schunk_string_error_code(err: &str) -> i32 {
         || err.contains("Permission denied")
     {
         BLOSC2_ERROR_FILE_OPEN
-    } else if err.contains("Invalid frame length") || err.contains("Invalid frame offset") {
+    } else if err.contains("Invalid frame length")
+        || err.contains("Invalid frame offset")
+        || err.contains("copy=false requires owned frame buffer")
+    {
         BLOSC2_ERROR_INVALID_PARAM
     } else {
         schunk_error_code(err)
@@ -9861,7 +9866,11 @@ mod tests {
         );
         assert_eq!(restored.decompress_all().unwrap(), b"chunk-zerochunk-one");
         assert_eq!(
-            blosc2_schunk_from_buffer(&frame, frame_len, false)
+            blosc2_schunk_from_buffer_c(&frame, frame_len, false).0,
+            BLOSC2_ERROR_INVALID_PARAM
+        );
+        assert_eq!(
+            blosc2_schunk_from_buffer_owned(frame.clone().into_owned(), frame_len, false)
                 .unwrap()
                 .decompress_all()
                 .unwrap(),
@@ -11925,7 +11934,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_buffer_copy_false_uses_borrowed_frame_backing() {
+    fn test_from_buffer_copy_false_requires_owned_frame_backing() {
         let mut source = Schunk::new(CParams::default(), DParams::default());
         source.append_buffer(b"borrowed-alpha").unwrap();
         source.append_buffer(b"borrowed-bravo").unwrap();
@@ -11933,23 +11942,14 @@ mod tests {
         let frame_start = frame.as_ptr() as usize;
         let frame_end = frame_start + frame.len();
 
-        let borrowed = blosc2_schunk_from_buffer(&frame, frame.len() as i64, false).unwrap();
-        let chunk = borrowed.compressed_chunk_bytes(1).unwrap();
-        let chunk_ptr = chunk.as_ptr() as usize;
-        assert!((frame_start..frame_end).contains(&chunk_ptr));
-        assert_eq!(
-            borrowed.decompress_all().unwrap(),
-            b"borrowed-alphaborrowed-bravo"
-        );
-        let (borrowed_frame_len, borrowed_frame, borrowed_needs_free) =
-            blosc2_schunk_to_buffer(&borrowed);
-        let borrowed_frame = borrowed_frame.unwrap();
-        assert_eq!(borrowed_frame_len, frame.len() as i64);
-        assert_eq!(borrowed.frame_len().unwrap(), frame.len() as i64);
-        assert_eq!(blosc2_schunk_frame_len(&borrowed), frame.len() as i64);
-        assert!(!borrowed_needs_free);
-        assert!(matches!(borrowed_frame, Cow::Borrowed(_)));
-        assert_eq!(borrowed_frame.as_ref(), frame.as_slice());
+        match blosc2_schunk_from_buffer(&frame, frame.len() as i64, false) {
+            Ok(_) => panic!("borrowed copy=false frame should be rejected"),
+            Err(err) => assert_eq!(err, "copy=false requires owned frame buffer"),
+        }
+        let (borrowed_rc, borrowed) =
+            blosc2_schunk_from_buffer_c(&frame, frame.len() as i64, false);
+        assert_eq!(borrowed_rc, BLOSC2_ERROR_INVALID_PARAM);
+        assert!(borrowed.is_none());
 
         let owned =
             blosc2_schunk_from_buffer_owned(frame.clone(), frame.len() as i64, false).unwrap();
@@ -12302,10 +12302,6 @@ mod tests {
         assert!(matches!(opened_chunk.unwrap(), Cow::Owned(_)));
 
         let frame = source.to_contiguous_frame();
-        let borrowed = blosc2_schunk_from_buffer(&frame, frame.len() as i64, false).unwrap();
-        let (_, borrowed_chunk, borrowed_needs_free) = blosc2_schunk_get_chunk(&borrowed, 0);
-        assert!(!borrowed_needs_free);
-        assert!(matches!(borrowed_chunk.unwrap(), Cow::Borrowed(_)));
         let owned_frame =
             blosc2_schunk_from_buffer_owned(frame.clone(), frame.len() as i64, false).unwrap();
         let (_, owned_chunk, owned_needs_free) = blosc2_schunk_get_chunk(&owned_frame, 0);

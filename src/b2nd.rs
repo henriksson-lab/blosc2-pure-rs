@@ -761,8 +761,7 @@ pub fn b2nd_from_schunk_c(schunk: Schunk) -> (i32, Option<B2ndArray>) {
 /// C-name alias for [`B2ndArray::from_contiguous_frame`].
 pub fn b2nd_from_cframe(frame: &[u8], copy: bool) -> Result<B2ndArray, String> {
     if !copy {
-        return B2ndArray::from_schunk(Schunk::from_borrowed_contiguous_frame(frame)?)
-            .map_err(str::to_string);
+        return Err("copy=false requires owned frame buffer".into());
     }
     B2ndArray::from_contiguous_frame(frame)
 }
@@ -2016,6 +2015,8 @@ fn b2nd_frame_error_code(err: &str) -> i32 {
             | "Missing caterva metalayer"
     ) {
         BLOSC2_ERROR_METALAYER_NOT_FOUND
+    } else if err == "copy=false requires owned frame buffer" {
+        BLOSC2_ERROR_INVALID_PARAM
     } else {
         BLOSC2_ERROR_FAILURE
     }
@@ -8629,13 +8630,10 @@ mod tests {
         let from_contiguous_frame = b2nd_from_cframe(&frame, true).unwrap();
         assert_eq!(from_contiguous_frame.meta, meta);
         assert_eq!(b2nd_to_cbuffer_vec(&from_contiguous_frame).unwrap(), data);
-        let from_borrowed_frame = b2nd_from_cframe(&frame, false).unwrap();
-        let (borrowed_frame_rc, borrowed_frame_c, borrowed_frame_len, borrowed_needs_free) =
-            b2nd_to_cframe_c(&from_borrowed_frame);
-        assert_eq!(borrowed_frame_rc, BLOSC2_ERROR_SUCCESS);
-        assert_eq!(borrowed_frame_c.as_ref().unwrap(), &frame);
-        assert_eq!(borrowed_frame_len, frame.len() as i64);
-        assert!(!borrowed_needs_free);
+        match b2nd_from_cframe(&frame, false) {
+            Ok(_) => panic!("borrowed copy=false frame should be rejected"),
+            Err(err) => assert_eq!(err, "copy=false requires owned frame buffer"),
+        }
         let (from_frame_rc, from_frame_c) =
             b2nd_from_cframe_c(&[frame.as_slice(), &[0]].concat(), frame.len() as i64, true);
         assert_eq!(from_frame_rc, BLOSC2_ERROR_SUCCESS);
@@ -8654,34 +8652,18 @@ mod tests {
         let alias_array =
             b2nd_from_cbuffer(meta.clone(), &alias_data, alias_cparams, DParams::default())
                 .unwrap();
-        let mut alias_frame = b2nd_to_cframe(&alias_array);
+        let alias_frame = b2nd_to_cframe(&alias_array);
         let copied = b2nd_from_cframe(&alias_frame, true).unwrap();
-        let borrowed = b2nd_from_cframe(&alias_frame, false).unwrap();
-        let borrowed_chunk = borrowed.schunk.compressed_chunk_bytes(0).unwrap();
-        let chunk_offset =
-            (borrowed_chunk.as_ptr() as usize).checked_sub(alias_frame.as_ptr() as usize);
-        let chunk_offset = chunk_offset.expect("borrowed chunk pointer should be inside frame");
-        assert!(chunk_offset < alias_frame.len());
-        let old_chunk_byte = borrowed_chunk[0];
-        let new_chunk_byte = old_chunk_byte.wrapping_add(1);
-        alias_frame[chunk_offset] = new_chunk_byte;
         assert_eq!(b2nd_to_cbuffer_vec(&copied).unwrap(), alias_data);
-        assert_eq!(
-            copied.schunk.compressed_chunk_bytes(0).unwrap()[0],
-            old_chunk_byte
-        );
-        assert_eq!(
-            borrowed.schunk.compressed_chunk_bytes(0).unwrap()[0],
-            new_chunk_byte
-        );
+        match b2nd_from_cframe(&alias_frame, false) {
+            Ok(_) => panic!("borrowed copy=false frame should be rejected"),
+            Err(err) => assert_eq!(err, "copy=false requires owned frame buffer"),
+        }
 
         let (from_frame_view_rc, from_frame_view_c) =
             b2nd_from_cframe_c(&frame, frame.len() as i64, false);
-        assert_eq!(from_frame_view_rc, BLOSC2_ERROR_SUCCESS);
-        assert_eq!(
-            b2nd_to_cbuffer_vec(&from_frame_view_c.unwrap()).unwrap(),
-            data
-        );
+        assert_eq!(from_frame_view_rc, BLOSC2_ERROR_INVALID_PARAM);
+        assert!(from_frame_view_c.is_none());
         assert_eq!(b2nd_free_option_c(None), BLOSC2_ERROR_NULL_POINTER);
         assert_eq!(
             b2nd_free_option_c(Some(array.clone())),
