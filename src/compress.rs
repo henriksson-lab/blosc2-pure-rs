@@ -727,7 +727,10 @@ fn with_decompress_scratch<T>(blocksize: usize, f: impl FnOnce(&mut [u8], &mut [
     })
 }
 
-/// Borrow four thread-local scratch buffers (sized for `blocksize`) for the duration of `f`.
+/// Borrow thread-local compression scratch buffers for the duration of `f`.
+///
+/// Filter buffers grow lazily inside the block compressor so no-filter and
+/// single-shuffle paths do not retain unused per-worker block-sized buffers.
 fn with_compress_scratch<T>(
     blocksize: usize,
     f: impl FnOnce(&mut Vec<u8>, &mut Vec<u8>, &mut Vec<u8>, &mut Vec<u8>) -> T,
@@ -735,12 +738,6 @@ fn with_compress_scratch<T>(
     COMPRESS_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
         let (buf1, buf2, compress_buf, prefilter_buf) = &mut *scratch;
-        if buf1.len() < blocksize {
-            buf1.resize(blocksize, 0);
-        }
-        if buf2.len() < blocksize {
-            buf2.resize(blocksize, 0);
-        }
         let min_compress_buf = blocksize + (blocksize / 255) + 64;
         ensure_scratch_len_uninit(compress_buf, min_compress_buf);
         f(buf1, buf2, compress_buf, prefilter_buf)

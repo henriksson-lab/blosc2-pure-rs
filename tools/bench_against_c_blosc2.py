@@ -550,11 +550,46 @@ def write_outputs(rows: list[dict[str, object]], output_dir: Path) -> None:
                 status=status,
             )
         )
-    failures = [
+    issue_rows = [
         row
         for row in rows
         if row["status"] != "ok" or row["verified"] in (False, "False", "false")
     ]
+    known_reference_limitations = [
+        row for row in issue_rows if row["failure_class"] == "c_reference_dict_frame_rejected"
+    ]
+    failures = [
+        row for row in issue_rows if row["failure_class"] != "c_reference_dict_frame_rejected"
+    ]
+    if known_reference_limitations:
+        summary_lines.extend(
+            [
+                "",
+                "## Known Reference Limitations",
+                "",
+                "| dataset | impl | mode | frame | codec | filter | dict | typesize | threads | class | status | verified | stderr |",
+                "|---|---|---|---|---|---|---:|---:|---:|---|---|---|---|",
+            ]
+        )
+        for row in known_reference_limitations:
+            stderr = str(row["stderr"]).replace("\n", " ")[:160]
+            summary_lines.append(
+                "| {dataset} | {impl} | {mode} | {frame} | {codec} | {filter} | {dict} | {typesize} | {threads} | {class_} | {status} | {verified} | {stderr} |".format(
+                    dataset=row["dataset"],
+                    impl=row["impl"],
+                    mode=row["mode"],
+                    frame=row["frame_impl"],
+                    codec=row["codec"],
+                    filter=row["filter"],
+                    dict="yes" if row["use_dict"] else "no",
+                    typesize=row["typesize"],
+                    threads=row["nthreads"],
+                    class_=row["failure_class"],
+                    status=row["status"],
+                    verified=row["verified"],
+                    stderr=stderr,
+                )
+            )
     if failures:
         summary_lines.extend(
             [

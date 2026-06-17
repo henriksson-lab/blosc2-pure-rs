@@ -299,6 +299,15 @@ impl LazySchunk {
         self.read_chunk_bytes(nchunk)
     }
 
+    /// Read a compressed chunk into caller-owned storage, reusing its allocation.
+    pub fn compressed_chunk_bytes_into<'a>(
+        &self,
+        nchunk: i64,
+        chunk: &'a mut Vec<u8>,
+    ) -> Result<&'a [u8], String> {
+        self.read_chunk_bytes_into(nchunk, chunk)
+    }
+
     pub fn lazy_chunk(&self, nchunk: i64) -> Result<Vec<u8>, String> {
         self.read_lazy_chunk(nchunk)
     }
@@ -406,6 +415,16 @@ impl LazySchunk {
     }
 
     fn read_chunk_bytes(&self, nchunk: i64) -> Result<Vec<u8>, String> {
+        let mut chunk = Vec::new();
+        self.read_chunk_bytes_into(nchunk, &mut chunk)?;
+        Ok(chunk)
+    }
+
+    fn read_chunk_bytes_into<'a>(
+        &self,
+        nchunk: i64,
+        chunk: &'a mut Vec<u8>,
+    ) -> Result<&'a [u8], String> {
         if nchunk < 0 {
             return Err("Chunk index out of range".into());
         }
@@ -414,15 +433,16 @@ impl LazySchunk {
             .get(nchunk as usize)
             .ok_or_else(|| "Chunk index out of range".to_string())?;
         if let Some(special) = chunk_ref.special {
-            return synthetic_special_chunk_for_params(special, chunk_ref.nbytes, &self.cparams);
+            *chunk = synthetic_special_chunk_for_params(special, chunk_ref.nbytes, &self.cparams)?;
+            return Ok(chunk);
         }
         use std::io::{Read, Seek, SeekFrom};
         if self.sframe {
             let mut file =
                 std::fs::File::open(sframe_chunk_path_for_id(&self.path, chunk_ref.offset)?)
                     .map_err(|e| format!("Failed to open sparse frame chunk: {e}"))?;
-            let mut chunk = vec![0u8; chunk_ref.cbytes];
-            file.read_exact(&mut chunk)
+            chunk.resize(chunk_ref.cbytes, 0);
+            file.read_exact(chunk.as_mut_slice())
                 .map_err(|e| format!("Failed to read sparse frame chunk: {e}"))?;
             compress::validate_chunk(&chunk).map_err(|err| format!("Invalid frame: {err}"))?;
             return Ok(chunk);
@@ -431,8 +451,8 @@ impl LazySchunk {
             .map_err(|e| format!("Failed to open frame file: {e}"))?;
         file.seek(SeekFrom::Start(chunk_ref.offset))
             .map_err(|e| format!("Failed to seek to chunk: {e}"))?;
-        let mut chunk = vec![0u8; chunk_ref.cbytes];
-        file.read_exact(&mut chunk)
+        chunk.resize(chunk_ref.cbytes, 0);
+        file.read_exact(chunk.as_mut_slice())
             .map_err(|e| format!("Failed to read chunk: {e}"))?;
         compress::validate_chunk(&chunk).map_err(|err| format!("Invalid frame: {err}"))?;
         Ok(chunk)

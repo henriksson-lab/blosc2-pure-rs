@@ -322,9 +322,10 @@ fn write_lazy_decompressed_chunks_c_style<W: Write>(
     writer: &mut W,
 ) -> io::Result<()> {
     let mut data = vec![0u8; schunk.chunksize];
+    let mut chunk = Vec::new();
     for i in 0..schunk.nchunks() {
         let chunk = schunk
-            .compressed_chunk_bytes(i)
+            .compressed_chunk_bytes_into(i, &mut chunk)
             .map_err(|_| io::Error::other("Decompression error.  Error code: -1"))?;
         let (chunk_nbytes, _, _) = compress::chunk_sizes(&chunk)
             .map_err(|_| io::Error::other("Decompression error.  Error code: -1"))?;
