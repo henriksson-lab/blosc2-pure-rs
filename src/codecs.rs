@@ -1372,13 +1372,23 @@ pub fn decompress_block_with_dict(compcode: u8, src: &[u8], dest: &mut [u8], dic
 
 /// LZ4 fast-mode compression of a single block.
 fn lz4_compress(clevel: u8, src: &[u8], dest: &mut [u8]) -> i32 {
-    use lz4_pure::block::CompressionMode;
+    use lz4_pure::sys::LZ4_compress_fast;
 
+    let Some(src_len) = len_as_c_int(src.len()) else {
+        return 0;
+    };
+    let Some(dest_len) = len_as_c_int(dest.len()) else {
+        return 0;
+    };
     let accel = lz4_acceleration(clevel);
-    match lz4_pure::block::compress_to_buffer(src, Some(CompressionMode::FAST(accel)), false, dest)
-    {
-        Ok(n) => n as i32,
-        Err(_) => 0,
+    unsafe {
+        LZ4_compress_fast(
+            src.as_ptr() as *const c_char,
+            dest.as_mut_ptr() as *mut c_char,
+            src_len,
+            dest_len,
+            accel,
+        )
     }
 }
 
@@ -1392,18 +1402,26 @@ fn lz4_acceleration(clevel: u8) -> i32 {
 /// LZ4HC high-compression-mode compression of a single block, parameterized
 /// by `clevel` (mapped directly to the LZ4HC compression level).
 fn lz4hc_compress(clevel: u8, src: &[u8], dest: &mut [u8]) -> i32 {
-    use lz4_pure::block::CompressionMode;
+    use lz4_pure::sys::LZ4_compress_HC;
+
     if let Some(error) = lz4hc_2gb_limit_result(src.len()) {
         return error;
     }
-    match lz4_pure::block::compress_to_buffer(
-        src,
-        Some(CompressionMode::HIGHCOMPRESSION(i32::from(clevel))),
-        false,
-        dest,
-    ) {
-        Ok(n) => n as i32,
-        Err(_) => 0,
+    let Some(src_len) = len_as_c_int(src.len()) else {
+        return 0;
+    };
+    let Some(dest_len) = len_as_c_int(dest.len()) else {
+        return 0;
+    };
+
+    unsafe {
+        LZ4_compress_HC(
+            src.as_ptr() as *const c_char,
+            dest.as_mut_ptr() as *mut c_char,
+            src_len,
+            dest_len,
+            i32::from(clevel),
+        )
     }
 }
 
@@ -1428,9 +1446,7 @@ fn len_as_c_int(len: usize) -> Option<lz4_pure::sys::c_int> {
 
 /// LZ4 fast-mode compression seeded with a preset dictionary.
 fn lz4_compress_with_dict(clevel: u8, src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
-    use lz4_pure::sys::{
-        c_char, LZ4_compress_fast_continue, LZ4_createStream, LZ4_loadDict,
-    };
+    use lz4_pure::sys::{c_char, LZ4_compress_fast_continue, LZ4_createStream, LZ4_loadDict};
 
     let Some(src_len) = len_as_c_int(src.len()) else {
         return 0;
@@ -1452,7 +1468,10 @@ fn lz4_compress_with_dict(clevel: u8, src: &[u8], dest: &mut [u8], dict: &[u8]) 
             }
             *slot = Some(Lz4Stream(stream));
         }
-        let stream = slot.as_mut().map(|stream| stream.0).unwrap_or(std::ptr::null_mut());
+        let stream = slot
+            .as_mut()
+            .map(|stream| stream.0)
+            .unwrap_or(std::ptr::null_mut());
         if stream.is_null() {
             return 0;
         }
@@ -1476,7 +1495,8 @@ fn lz4_compress_with_dict(clevel: u8, src: &[u8], dest: &mut [u8], dict: &[u8]) 
 /// LZ4HC high-compression-mode compression seeded with a preset dictionary.
 fn lz4hc_compress_with_dict(clevel: u8, src: &[u8], dest: &mut [u8], dict: &[u8]) -> i32 {
     use lz4_pure::sys::{
-        c_char, LZ4_compress_HC_continue, LZ4_createStreamHC, LZ4_loadDictHC, LZ4_resetStreamHC_fast,
+        c_char, LZ4_compress_HC_continue, LZ4_createStreamHC, LZ4_loadDictHC,
+        LZ4_resetStreamHC_fast,
     };
 
     if let Some(error) = lz4hc_2gb_limit_result(src.len()) {
@@ -1501,7 +1521,10 @@ fn lz4hc_compress_with_dict(clevel: u8, src: &[u8], dest: &mut [u8], dict: &[u8]
             }
             *slot = Some(Lz4hcStream(stream));
         }
-        let stream = slot.as_mut().map(|stream| stream.0).unwrap_or(std::ptr::null_mut());
+        let stream = slot
+            .as_mut()
+            .map(|stream| stream.0)
+            .unwrap_or(std::ptr::null_mut());
         if stream.is_null() {
             return 0;
         }
@@ -1621,7 +1644,12 @@ fn zstd_compress(src: &[u8], dest: &mut [u8], clevel: u8) -> i32 {
             *slot = ZSTD_createCCtx();
         }
         let cctx = slot.as_mut()?;
-        Some(ZSTD_compressCCtx(cctx, dest, src, blosc_clevel_to_zstd(clevel)))
+        Some(ZSTD_compressCCtx(
+            cctx,
+            dest,
+            src,
+            blosc_clevel_to_zstd(clevel),
+        ))
     });
     zstd_normalize_result(n)
 }

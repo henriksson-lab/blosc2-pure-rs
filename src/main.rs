@@ -312,7 +312,10 @@ fn apply_lazy_decompression_nthreads_override(schunk: &mut LazySchunk, nthreads:
 fn write_lazy_decompressed_chunks_direct(schunk: &LazySchunk, output: &Path) -> io::Result<()> {
     let mut foutput =
         File::create(output).map_err(|_| io::Error::other("Output file cannot be open."))?;
-    let result = write_lazy_decompressed_chunks_c_style(schunk, &mut foutput);
+    let mut frame_file = schunk
+        .open_reusable_frame_file()
+        .map_err(|_| io::Error::other("Decompression error.  Error code: -1"))?;
+    let result = write_lazy_decompressed_chunks_c_style(schunk, &mut foutput, &mut frame_file);
     let _ = foutput.flush();
     result
 }
@@ -320,12 +323,13 @@ fn write_lazy_decompressed_chunks_direct(schunk: &LazySchunk, output: &Path) -> 
 fn write_lazy_decompressed_chunks_c_style<W: Write>(
     schunk: &LazySchunk,
     writer: &mut W,
+    frame_file: &mut Option<File>,
 ) -> io::Result<()> {
     let mut data = vec![0u8; schunk.chunksize];
     let mut chunk = Vec::new();
     for i in 0..schunk.nchunks() {
         let chunk = schunk
-            .compressed_chunk_bytes_into(i, &mut chunk)
+            .compressed_chunk_bytes_into_with_file(i, &mut chunk, frame_file.as_mut())
             .map_err(|_| io::Error::other("Decompression error.  Error code: -1"))?;
         let (chunk_nbytes, _, _) = compress::chunk_sizes(&chunk)
             .map_err(|_| io::Error::other("Decompression error.  Error code: -1"))?;

@@ -27,7 +27,10 @@ fn c_compress(data: &[u8], compcode: u8, clevel: u8) -> Vec<u8> {
         ffi::blosc2_free_ctx(cctx);
         r
     };
-    assert!(csize > 0, "C compress failed codec={compcode} clevel={clevel}");
+    assert!(
+        csize > 0,
+        "C compress failed codec={compcode} clevel={clevel}"
+    );
     out.truncate(csize as usize);
     out
 }
@@ -82,7 +85,8 @@ fn lz4_compressed_bytes_match_c() {
                     .map(|p| p as i64)
                     .unwrap_or(-1);
                 assert_eq!(
-                    r, c,
+                    r,
+                    c,
                     "codec={compcode} clevel={clevel} data={name}: \
                      rust={} bytes, c={} bytes, first diff at offset {first_diff}",
                     r.len(),

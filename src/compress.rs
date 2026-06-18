@@ -274,6 +274,13 @@ fn supported_core_or_static_codec(compcode: u8) -> bool {
     ) || codecs::is_static_global_codec_enabled(compcode)
 }
 
+fn core_builtin_codec(compcode: u8) -> bool {
+    matches!(
+        compcode,
+        BLOSC_BLOSCLZ | BLOSC_LZ4 | BLOSC_LZ4HC | BLOSC_ZLIB | BLOSC_ZSTD
+    )
+}
+
 fn unsupported_global_filter_for_cparams(filter: u8, cparams: &CParams) -> Option<&'static str> {
     if filters::global_filter_requires_b2nd_metadata(filter) && cparams.b2nd_metalayer.is_none() {
         Some("Filter pipeline failed")
@@ -692,8 +699,7 @@ fn ensure_scratch_len_uninit(buf: &mut Vec<u8>, len: usize) {
 fn uninit_vec(len: usize) -> Vec<u8> {
     let mut buf = Vec::with_capacity(len);
     unsafe {
-        // SAFETY: callers pass this buffer to decompression routines that write
-        // every byte before any successful return exposes it.
+        // SAFETY: callers overwrite the relevant regions before reading them.
         buf.set_len(len);
     }
     buf
@@ -2262,6 +2268,10 @@ fn filters_effectively_noop(
         .all(|(&filter, &meta)| filter_is_noop(filter, meta, typesize))
 }
 
+fn filters_all_nofilter(filters: &[u8; BLOSC2_MAX_FILTERS]) -> bool {
+    filters.iter().all(|&filter| filter == BLOSC_NOFILTER)
+}
+
 /// Emit a memcpy chunk (header + raw payload) when the parameters allow and the budget is sufficient.
 fn maybe_memcpy_fallback_for_budget(
     src: &[u8],
@@ -3049,6 +3059,26 @@ fn compress_block_with_scratch(
     tid: i32,
     block_output_limit: Option<usize>,
 ) -> Result<(usize, bool, bool), &'static str> {
+    if cparams.prefilter.is_none()
+        && core_builtin_codec(cparams.compcode)
+        && filters_all_nofilter(&cparams.filters)
+    {
+        return compress_pre_filtered_block_with_scratch(
+            block_data,
+            src.as_ptr(),
+            cparams,
+            dont_split,
+            typesize,
+            is_leftover,
+            None,
+            block_start,
+            blocksize,
+            (block_start / blocksize) as i32,
+            compress_buf,
+            block_output_limit,
+        );
+    }
+
     let mut skip_filters = false;
     let mut force_zero_run = false;
     let block_data = if let Some(filtered) = apply_prefilter(
@@ -3473,26 +3503,6 @@ fn compress_pre_filtered_block_with_scratch(
         let payload_pos = header_pos + 4;
         ensure_scratch_len_uninit(result, payload_pos + max_out);
 
-        let cparams_context = codec_cparams_context(cparams, blocksize as i32);
-        let codec_context = codecs::CodecCallbackContext {
-            compcode: cparams.compcode,
-            complib: None,
-            meta: cparams.compcode_meta,
-            clevel: cparams.clevel,
-            cparams: Some(&cparams_context),
-            dparams: None,
-            chunk: codecs::CodecChunkContext {
-                schunk: cparams.schunk,
-                nchunk: cparams.nchunk,
-                nblock,
-                chunk_source: chunk_source as usize,
-                block_offset: block_start,
-                blocksize,
-                bsize,
-            },
-            b2nd_metalayer: cparams.b2nd_metalayer.as_deref(),
-            user_data: cparams.prefilter_user_data,
-        };
         let cbytes = match dict {
             Some(dict) => codecs::compress_block_with_dict(
                 cparams.compcode,
@@ -3501,14 +3511,42 @@ fn compress_pre_filtered_block_with_scratch(
                 &mut result[payload_pos..payload_pos + max_out],
                 dict,
             ),
-            None => codecs::compress_block_with_context(
+            None if core_builtin_codec(cparams.compcode) => codecs::compress_block(
                 cparams.compcode,
                 cparams.clevel,
-                cparams.compcode_meta,
                 stream_data,
                 &mut result[payload_pos..payload_pos + max_out],
-                Some(codec_context),
             ),
+            None => {
+                let cparams_context = codec_cparams_context(cparams, blocksize as i32);
+                let codec_context = codecs::CodecCallbackContext {
+                    compcode: cparams.compcode,
+                    complib: None,
+                    meta: cparams.compcode_meta,
+                    clevel: cparams.clevel,
+                    cparams: Some(&cparams_context),
+                    dparams: None,
+                    chunk: codecs::CodecChunkContext {
+                        schunk: cparams.schunk,
+                        nchunk: cparams.nchunk,
+                        nblock,
+                        chunk_source: chunk_source as usize,
+                        block_offset: block_start,
+                        blocksize,
+                        bsize,
+                    },
+                    b2nd_metalayer: cparams.b2nd_metalayer.as_deref(),
+                    user_data: cparams.prefilter_user_data,
+                };
+                codecs::compress_block_with_context(
+                    cparams.compcode,
+                    cparams.clevel,
+                    cparams.compcode_meta,
+                    stream_data,
+                    &mut result[payload_pos..payload_pos + max_out],
+                    Some(codec_context),
+                )
+            }
         };
 
         if cbytes < 0 {
@@ -4101,63 +4139,62 @@ fn compress_chunk_with_output_limit(
         let output_addr = output.as_mut_ptr() as usize;
         let block_metas: Vec<OnceLock<Result<ParallelBlockMeta, &'static str>>> =
             (0..nblocks).map(|_| OnceLock::new()).collect();
-        let next_block = AtomicI32::new(0);
         let threads = effective_nthreads(cparams.nthreads, nblocks);
         with_thread_pool(threads, || {
             rayon::scope(|scope| {
-                for _ in 0..threads as usize {
-                    let next_block = &next_block;
+                let threads_usize = threads as usize;
+                for worker_idx in 0..threads_usize {
                     let block_metas = &block_metas;
                     let slot_offsets = &slot_offsets;
                     let slot_lens = &slot_lens;
+                    let range_start = nblocks * worker_idx / threads_usize;
+                    let range_end = nblocks * (worker_idx + 1) / threads_usize;
                     scope.spawn(move |_| {
                         with_compress_scratch(
                             blocksize,
-                            |buf1, buf2, compress_buf, prefilter_buf| loop {
-                                let block_idx = next_block.fetch_add(1, Ordering::Relaxed) as usize;
-                                if block_idx >= nblocks {
-                                    break;
+                            |buf1, buf2, compress_buf, prefilter_buf| {
+                                for block_idx in range_start..range_end {
+                                    let start = block_idx * blocksize;
+                                    let end = (start + blocksize).min(nbytes as usize);
+                                    let is_leftover =
+                                        block_idx == nblocks - 1 && (end - start) < blocksize;
+                                    let compressed = compress_block_with_scratch(
+                                        src,
+                                        &src[start..end],
+                                        start,
+                                        blocksize,
+                                        is_leftover,
+                                        cparams,
+                                        dont_split,
+                                        typesize,
+                                        buf1,
+                                        buf2,
+                                        compress_buf,
+                                        prefilter_buf,
+                                        worker_idx as i32,
+                                        None,
+                                    )
+                                    .map(
+                                        |(len, all_zero, has_literal)| {
+                                            let slot_len = slot_lens[block_idx];
+                                            debug_assert!(len <= slot_len);
+                                            unsafe {
+                                                let slot = std::slice::from_raw_parts_mut(
+                                                    (output_addr as *mut u8)
+                                                        .add(slot_offsets[block_idx]),
+                                                    slot_len,
+                                                );
+                                                slot[..len].copy_from_slice(&compress_buf[..len]);
+                                            }
+                                            ParallelBlockMeta {
+                                                len,
+                                                all_zero,
+                                                has_literal,
+                                            }
+                                        },
+                                    );
+                                    let _ = block_metas[block_idx].set(compressed);
                                 }
-                                let start = block_idx * blocksize;
-                                let end = (start + blocksize).min(nbytes as usize);
-                                let is_leftover =
-                                    block_idx == nblocks - 1 && (end - start) < blocksize;
-                                let compressed = compress_block_with_scratch(
-                                    src,
-                                    &src[start..end],
-                                    start,
-                                    blocksize,
-                                    is_leftover,
-                                    cparams,
-                                    dont_split,
-                                    typesize,
-                                    buf1,
-                                    buf2,
-                                    compress_buf,
-                                    prefilter_buf,
-                                    rayon::current_thread_index().unwrap_or(0) as i32,
-                                    None,
-                                )
-                                .map(
-                                    |(len, all_zero, has_literal)| {
-                                        let slot_len = slot_lens[block_idx];
-                                        debug_assert!(len <= slot_len);
-                                        unsafe {
-                                            let slot = std::slice::from_raw_parts_mut(
-                                                (output_addr as *mut u8)
-                                                    .add(slot_offsets[block_idx]),
-                                                slot_len,
-                                            );
-                                            slot[..len].copy_from_slice(&compress_buf[..len]);
-                                        }
-                                        ParallelBlockMeta {
-                                            len,
-                                            all_zero,
-                                            has_literal,
-                                        }
-                                    },
-                                );
-                                let _ = block_metas[block_idx].set(compressed);
                             },
                         );
                     });
@@ -7583,8 +7620,11 @@ fn decompress_chunk_into_with_header(
     }
 
     let dict = embedded_codec_dictionary(chunk, header)?;
-    let filters_are_noop =
-        filters_effectively_noop(&header.filters, &header.filters_meta, header.typesize as usize);
+    let filters_are_noop = filters_effectively_noop(
+        &header.filters,
+        &header.filters_meta,
+        header.typesize as usize,
+    );
 
     // Check if delta filter is used (needs sequential block 0 first)
     let has_delta = header.filters.contains(&BLOSC_DELTA);
@@ -7745,35 +7785,34 @@ fn decompress_chunk_into_with_header(
     } else {
         // Sequential decompression: reuse scratch buffers and write finished
         // blocks directly into the final output buffer.
-        let mut run =
-            |scratch1: &mut [u8], scratch2: &mut [u8]| -> Result<(), &'static str> {
-                for block_idx in 0..nblocks {
-                    if block_is_masked(maskout, block_idx) {
-                        continue;
-                    }
-                    let block_start = block_idx * blocksize;
-                    let block_end = (block_start + blocksize).min(nbytes);
-                    let bsize = block_end - block_start;
-                    let is_leftover = block_idx == nblocks - 1 && bsize < blocksize;
-
-                    decompress_block_into(
-                        chunk,
-                        block_idx,
-                        block_start,
-                        &mut output[block_start..block_end],
-                        blocksize,
-                        is_leftover,
-                        header,
-                        None,
-                        dict,
-                        dparams,
-                        scratch1,
-                        scratch2,
-                        0,
-                    )?;
+        let mut run = |scratch1: &mut [u8], scratch2: &mut [u8]| -> Result<(), &'static str> {
+            for block_idx in 0..nblocks {
+                if block_is_masked(maskout, block_idx) {
+                    continue;
                 }
-                Ok(())
-            };
+                let block_start = block_idx * blocksize;
+                let block_end = (block_start + blocksize).min(nbytes);
+                let bsize = block_end - block_start;
+                let is_leftover = block_idx == nblocks - 1 && bsize < blocksize;
+
+                decompress_block_into(
+                    chunk,
+                    block_idx,
+                    block_start,
+                    &mut output[block_start..block_end],
+                    blocksize,
+                    is_leftover,
+                    header,
+                    None,
+                    dict,
+                    dparams,
+                    scratch1,
+                    scratch2,
+                    0,
+                )?;
+            }
+            Ok(())
+        };
         if filters_are_noop {
             let mut scratch1 = [];
             let mut scratch2 = [];
@@ -14374,7 +14413,10 @@ mod tests {
         let ddict = zstd_pure_rs::decompress::zstd_ddict::ZSTD_createDDict(dict).unwrap();
         let content = zstd_pure_rs::decompress::zstd_ddict::ZSTD_DDict_dictContent(&ddict);
         assert!(content.len() <= 512);
-        assert_eq!(&dict[..4], &zstd_pure_rs::decompress::zstd_decompress::ZSTD_MAGIC_DICTIONARY.to_le_bytes());
+        assert_eq!(
+            &dict[..4],
+            &zstd_pure_rs::decompress::zstd_decompress::ZSTD_MAGIC_DICTIONARY.to_le_bytes()
+        );
         assert_eq!(decompress(&compressed).unwrap(), data);
     }
 
@@ -14406,7 +14448,10 @@ mod tests {
             .unwrap();
         assert!(dict.len() > 512);
         assert!(dict.len() <= BLOSC2_MAXDICTSIZE);
-        assert_eq!(&dict[..4], &zstd_pure_rs::decompress::zstd_decompress::ZSTD_MAGIC_DICTIONARY.to_le_bytes());
+        assert_eq!(
+            &dict[..4],
+            &zstd_pure_rs::decompress::zstd_decompress::ZSTD_MAGIC_DICTIONARY.to_le_bytes()
+        );
         assert_eq!(decompress(&compressed).unwrap(), data);
     }
 
@@ -14421,7 +14466,10 @@ mod tests {
         samples.extend_from_slice(&trailer);
 
         let dict = train_zstd_dictionary(&samples, 200_000, &sample_sizes).unwrap();
-        assert_eq!(&dict[..4], &zstd_pure_rs::decompress::zstd_decompress::ZSTD_MAGIC_DICTIONARY.to_le_bytes());
+        assert_eq!(
+            &dict[..4],
+            &zstd_pure_rs::decompress::zstd_decompress::ZSTD_MAGIC_DICTIONARY.to_le_bytes()
+        );
         let ddict = zstd_pure_rs::decompress::zstd_ddict::ZSTD_createDDict(&dict).unwrap();
         let content = zstd_pure_rs::decompress::zstd_ddict::ZSTD_DDict_dictContent(&ddict);
         assert!(!content.contains(&0xfe));

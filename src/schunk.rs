@@ -308,6 +308,29 @@ impl LazySchunk {
         self.read_chunk_bytes_into(nchunk, chunk)
     }
 
+    /// Open a reusable frame file handle for sequential contiguous-frame reads.
+    ///
+    /// Sparse frames store each materialized chunk in a separate file, so they
+    /// intentionally keep using per-chunk opens and return `None`.
+    pub fn open_reusable_frame_file(&self) -> Result<Option<std::fs::File>, String> {
+        if self.sframe {
+            return Ok(None);
+        }
+        std::fs::File::open(&self.path)
+            .map(Some)
+            .map_err(|e| format!("Failed to open frame file: {e}"))
+    }
+
+    /// Read a compressed chunk using a caller-owned frame file when possible.
+    pub fn compressed_chunk_bytes_into_with_file<'a>(
+        &self,
+        nchunk: i64,
+        chunk: &'a mut Vec<u8>,
+        frame_file: Option<&mut std::fs::File>,
+    ) -> Result<&'a [u8], String> {
+        self.read_chunk_bytes_into_with_file(nchunk, chunk, frame_file)
+    }
+
     pub fn lazy_chunk(&self, nchunk: i64) -> Result<Vec<u8>, String> {
         self.read_lazy_chunk(nchunk)
     }
@@ -425,6 +448,15 @@ impl LazySchunk {
         nchunk: i64,
         chunk: &'a mut Vec<u8>,
     ) -> Result<&'a [u8], String> {
+        self.read_chunk_bytes_into_with_file(nchunk, chunk, None)
+    }
+
+    fn read_chunk_bytes_into_with_file<'a>(
+        &self,
+        nchunk: i64,
+        chunk: &'a mut Vec<u8>,
+        frame_file: Option<&mut std::fs::File>,
+    ) -> Result<&'a [u8], String> {
         if nchunk < 0 {
             return Err("Chunk index out of range".into());
         }
@@ -447,8 +479,14 @@ impl LazySchunk {
             compress::validate_chunk(&chunk).map_err(|err| format!("Invalid frame: {err}"))?;
             return Ok(chunk);
         }
-        let mut file = std::fs::File::open(&self.path)
-            .map_err(|e| format!("Failed to open frame file: {e}"))?;
+        let mut owned_file;
+        let file = if let Some(file) = frame_file {
+            file
+        } else {
+            owned_file = std::fs::File::open(&self.path)
+                .map_err(|e| format!("Failed to open frame file: {e}"))?;
+            &mut owned_file
+        };
         file.seek(SeekFrom::Start(chunk_ref.offset))
             .map_err(|e| format!("Failed to seek to chunk: {e}"))?;
         chunk.resize(chunk_ref.cbytes, 0);
