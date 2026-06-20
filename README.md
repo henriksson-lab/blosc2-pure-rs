@@ -6,6 +6,7 @@ Blosc2 is a block-oriented compressor optimized for binary data such as numerica
 
 **Beware that translation is immature technology. Check that this crate works on your data to avoid data loss**
 
+* 2026-06-21: Tested on new zstd
 * 2026-06-14: More audit. Possibly converged. Some differences in speed stem from dependencies that need to be fixed
 * 2026-06-02: Further audit
 * 2026-05-20: New audit approach - many smaller(?) issues fixed, but further auditing needed 
@@ -424,6 +425,10 @@ cargo run --release --example bench_blosclz_gap --features _ffi
 The workload is the examples' default 10 MiB `float32` signal-with-noise buffer at `clevel=5`
 and `typesize=4`. Ratios are pure Rust speed divided by C-Blosc2 wrapper speed.
 
+The Zstd rows below were re-measured on June 20, 2026 (20 iterations per case) after
+switching the `zstd-pure-rs` dependency to the `0.1.2` crates.io release; the other rows
+are from the June 12, 2026 run.
+
 #### Full Comparison
 
 | Case | Threads | Size pure/C | Compress pure/C (MB/s) | Compress ratio | Decompress pure/C (MB/s) | Decompress ratio |
@@ -431,11 +436,11 @@ and `typesize=4`. Ratios are pure Rust speed divided by C-Blosc2 wrapper speed.
 | BloscLZ, no filter | 1 | 10486432 / 10486432 | 1810.2 / 997.8 | **1.81x** | 10830.5 / 11200.4 | 0.97x |
 | BloscLZ, shuffle | 1 | 8024160 / 8033115 | 907.5 / 665.5 | **1.36x** | 3505.9 / 5008.7 | 0.70x |
 | LZ4, shuffle | 1 | 7823630 / 7823630 | 715.0 / 567.2 | **1.26x** | 2704.4 / 2680.0 | **1.01x** |
-| Zstd, shuffle | 1 | 7259575 / 7259575 | 88.2 / 93.4 | 0.94x | 1687.2 / 1773.0 | 0.95x |
+| Zstd, shuffle | 1 | 7259575 / 7259575 | 78.3 / 92.3 | 0.85x | 1345.3 / 1713.5 | 0.79x |
 | BloscLZ, no filter | 4 | 10486432 / 10486432 | 1945.6 / 2066.7 | 0.94x | 15681.1 / 12500.8 | **1.25x** |
 | BloscLZ, shuffle | 4 | 8024160 / 8033115 | 2138.8 / 2110.7 | **1.01x** | 7734.5 / 5812.7 | **1.33x** |
 | LZ4, shuffle | 4 | 7823630 / 7823630 | 1688.9 / 1901.3 | 0.89x | 5455.1 / 3025.2 | **1.80x** |
-| Zstd, shuffle | 4 | 7259575 / 7259575 | 329.7 / 347.8 | 0.95x | 5533.9 / 2265.8 | **2.44x** |
+| Zstd, shuffle | 4 | 7259575 / 7259575 | 271.6 / 333.5 | 0.81x | 4356.1 / 2134.1 | **2.04x** |
 
 #### Focused BloscLZ Comparison
 
@@ -507,4 +512,4 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ## License
 
-BSD 3-Clause (same as the original C-Blosc2 license)
+BSD 3-Clause

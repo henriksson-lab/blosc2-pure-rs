@@ -73,7 +73,7 @@ clap = { version = "4", features = ["derive"], optional = true }
 rayon = "1"
 lz4-pure = { package = "lz4-pure-rs", version = "0.1" }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-zstd-pure-rs = { version = "0.1", git = "https://github.com/henriksson-lab/zstd-pure-rs" }
+zstd-pure-rs = "0.1"
 zfp-rs = { version = "0.1.1", optional = true }
 
 [dev-dependencies]
