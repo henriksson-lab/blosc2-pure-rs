@@ -400,14 +400,15 @@ but not expected to match C frame bytes exactly.
 
 The current practical result is:
 
-| Implementation | Compressed size | Max RSS range | Wall-clock range |
-|----------------|----------------:|--------------:|-----------------:|
-| C reference helper | 39.4 MB | 5.2-5.5 MiB | 2.48-4.33 s |
-| Pure Rust CLI | 39.4 MB | 5.1-5.7 MiB | 2.15-4.74 s |
+| Implementation | Compressed size | Max RSS range | RSS vs C | Wall-clock range |
+|----------------|----------------:|--------------:|---------:|-----------------:|
+| C reference helper | 39.4 MB | 5.2-5.5 MiB | 1.00x | 2.48-4.33 s |
+| Pure Rust CLI | 39.4 MB | 5.1-5.7 MiB | 0.93-1.10x | 2.15-4.74 s |
 
 The machine was under variable load during this run, and C itself varied by more
 than 70% between adjacent samples. Treat the table as an RSS/parity smoke check,
-not as a stable throughput claim. Earlier unloaded samples on the same corpus
+not as a stable throughput claim. The RSS ratio is Rust max RSS divided by C max
+RSS, using the observed ranges above. Earlier unloaded samples on the same corpus
 were much faster for both programs and showed Rust RSS near C while compression
 remained the main area for tuning.
 
