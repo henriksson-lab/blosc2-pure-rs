@@ -6,6 +6,7 @@ Blosc2 is a block-oriented compressor optimized for binary data such as numerica
 
 **Beware that translation is immature technology. Check that this crate works on your data to avoid data loss**
 
+* 2026-08-01: CI added
 * 2026-06-21: Tested on new zstd
 * 2026-06-14: More audit. Possibly converged. Some differences in speed stem from dependencies that need to be fixed
 * 2026-06-02: Further audit
@@ -126,6 +127,17 @@ Options:
 Chunk-size guidance: keep the default for general file compression unless you have workload-specific measurements showing a better setting.
 
 ## Real-data Rust vs C-Blosc2 benchmarks
+
+Original benchmark baseline: the vendored `c-blosc2/` source is commit
+`22e744e03c9e` (`git describe`: `v3.0.0.rc1-7-g22e744e0`).
+
+Latest rerun for the rustification benchmark roll-up: 2026-07-14 at Rust repo
+commit `ac69a07b19679b3eefcc1e7ab8a3da5a47a8a18a`, using the quick
+C-Blosc2 matrix over staged publish-local manifest inputs. All 384 trial rows
+completed with status `ok`; the aggregate excludes pairs where one wall time
+rounded to zero and reports mean C/Rust speedup 0.90x and mean Rust/C RSS ratio
+1.31 across 94 comparable nonzero paired rows. The raw rows are tracked in
+`pres_rustification/benchmarks/blosc2-rs.tsv`.
 
 Use `tools/bench_against_c_blosc2.py` to compare this Rust CLI against original
 C-Blosc2 on real files. The harness measures process wall time and max RSS with
